@@ -1,0 +1,14 @@
+# Runtime/song-specific data
+input*/
+output*/
+/out/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

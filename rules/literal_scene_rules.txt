@@ -1,0 +1,12 @@
+Current-block fact rules:
+- First identify the literal event described by the current block.
+- The image_prompt and video_prompt must depict that current-block event.
+- Preserve the actual acting subject, affected object, cause, and emotional result from the current block.
+- Do not replace the current block's acting subject with a recurring character from global context.
+- Do not replace the current block's action with a motif from global or local context.
+- If the current block says A did X to B, the visual action must show A doing X to B.
+- Recurring characters may appear only if they are explicitly present, implied as observers, or useful as secondary visual continuity.
+- If a character/object appears in global context but is not the current actor, keep it secondary or omit it.
+- Previous generated summaries are only for visual continuity and must not decide what happens in the current block.
+- If the current block has a cause-and-reaction structure, show both cause and reaction when possible.
+- The scene_summary must describe the literal current-block event, not a generic global motif.

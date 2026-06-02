@@ -1,0 +1,25 @@
+Create a compact visual bible for a music video.
+
+VISUAL STYLE:
+{{VIDEO_STYLE}}
+
+FULL SONG LYRICS:
+{{ALL_LYRICS}}
+
+Return ONLY valid JSON with exactly these keys:
+{
+  "song_summary": "short summary of the whole song's story and emotional arc",
+  "main_characters": ["..."],
+  "recurring_locations": ["..."],
+  "recurring_props": ["..."],
+  "visual_motifs": ["..."],
+  "tone": "...",
+  "continuity_rules": ["..."],
+  "avoid": ["visible text", "letters", "captions", "subtitles", "signs", "logos", "watermarks"]
+}
+
+Rules:
+- Keep it compact.
+- Do not quote the lyrics.
+- Do not invent visible written text.
+- Focus on reusable visual context for intro, verse clips and outro.

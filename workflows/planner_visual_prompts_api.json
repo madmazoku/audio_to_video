@@ -1,0 +1,55 @@
+{
+  "1": {
+    "inputs": {
+      "model_path": "G:\\Git\\ComfyUI\\models\\text_encoders\\qwen3-4b-abl-q4_0.gguf",
+      "max_ctx": 4096,
+      "gpu_layers": 31,
+      "n_threads": 8,
+      "is_locked": true
+    },
+    "class_type": "GGUFLoader",
+    "_meta": {
+      "title": "LLM-GGUF Loader"
+    }
+  },
+  "2": {
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "system_prompt": "You are a visual prompt planner for an automated music video pipeline. Return ONLY valid JSON. Do not use markdown. Do not add explanations. Convert a poem/song verse and a visual style description into clean prompts for image and video generation. Never copy the original verse into image_prompt or video_prompt. Never ask the image/video model to render text, letters, captions, signs, calligraphy, subtitles, banners, labels, or logos. The actual subtitles are added later by ffmpeg.",
+      "user_prompt": "PLACEHOLDER_USER_PROMPT",
+      "model_type": "LLM-GGUF",
+      "temperature": 0.25,
+      "max_length": 1536,
+      "is_memory": "disable",
+      "is_locked": "disable",
+      "main_brain": "enable",
+      "historical_record": "",
+      "conversation_rounds": 1,
+      "is_enable": true,
+      "stream": false,
+      "is_enable_system_role": "enable"
+    },
+    "class_type": "LLM_local",
+    "_meta": {
+      "title": "Local LLM visual planner"
+    }
+  },
+  "3": {
+    "inputs": {
+      "text": [
+        "2",
+        0
+      ],
+      "path": "G:\\Git\\ComfyUI\\!BASHO\\out\\plans\\plan_000_raw.json",
+      "create_dirs": true,
+      "encoding": "utf-8"
+    },
+    "class_type": "Basic data handling: PathSaveStringFile",
+    "_meta": {
+      "title": "Save LLM plan text"
+    }
+  }
+}

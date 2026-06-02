@@ -1,0 +1,9 @@
+{
+  "width": 1280,
+  "height": 720,
+  "fps": 24,
+  "recommended_workflow_seconds": 20,
+  "max_workflow_seconds": 30,
+  "instrumental_gap_min_seconds": 8.0,
+  "instrumental_gap_min_ratio_of_median_verse": 0.5
+}

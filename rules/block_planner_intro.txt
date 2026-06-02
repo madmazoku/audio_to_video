@@ -1,0 +1,57 @@
+Create visual generation prompts for one short music-video timeline block.
+
+PRIORITY 0 — VISUAL STYLE, mandatory:
+{{VIDEO_STYLE}}
+
+PRIORITY 1 — GLOBAL SONG CONTEXT, low priority:
+Use this only for recurring world, characters, tone, motifs and visual continuity.
+Do not cram every global motif into the current shot.
+{{GLOBAL_CONTEXT_JSON}}
+
+PRIORITY 2 — LOCAL CONTEXT, medium priority:
+Use this only for continuity, transition logic and neighboring scene awareness.
+Do not let local context override the current block.
+{{LOCAL_CONTEXT}}
+
+PRIORITY 3 — CURRENT BLOCK, highest priority:
+This is the block you must depict now.
+Block index: {{BLOCK_INDEX}}
+Block kind: {{BLOCK_KIND}}
+
+{{CURRENT_BLOCK}}
+
+PREVIOUS GENERATED VISUAL SUMMARIES:
+Use only for continuity of established visuals.
+{{CONTINUITY}}
+
+{{LITERAL_SCENE_RULES}}
+
+Priority rules:
+- If global context, local context, continuity, and current block conflict, follow the current block.
+- For verse blocks, depict the current verse/block mainly, not the whole song.
+- Global context may influence style, world, recurring design, and optional background details only.
+- Local context may influence transitions and continuity only.
+- Do not copy raw lyrics into image_prompt or video_prompt.
+- Do not ask the image/video model to render visible text.
+- Choose only a few relevant props for the block. Do not include every recurring prop.
+
+Task:
+Return ONLY a valid JSON object with exactly these keys:
+{
+  "scene_summary": "one sentence summary of the literal current-block visual event",
+  "image_prompt": "prompt for still starting image, in English, no raw lyrics, no visible text",
+  "video_prompt": "prompt for animating the image, in English, no raw lyrics, no visible text",
+  "negative_prompt": "comma-separated things to avoid"
+}
+
+Rules:
+- image_prompt and video_prompt must be in English.
+- Preserve the supplied visual style.
+- Do not include subtitles, captions, signs, banners, calligraphy, written words, letters, logos, or watermarks in image/video prompts.
+- negative_prompt must include: text, letters, captions, subtitles, signs, calligraphy, logo, watermark, manuscript page, poster layout.
+
+Additional intro-block rule:
+- This is the opening instrumental intro before lyrics.
+- Establish the whole song's world, main characters, mood, and visual motifs.
+- Do not depict one specific later verse event too literally.
+- Avoid making the intro's action dominate the first verse block later.
