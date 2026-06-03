@@ -1,13 +1,4 @@
 {
-  "255": {
-    "inputs": {
-      "image": "pasted/image (4).png"
-    },
-    "class_type": "LoadImage",
-    "_meta": {
-      "title": "Load Image"
-    }
-  },
   "257": {
     "inputs": {
       "noise": [
@@ -59,7 +50,7 @@
       "resize_type.crop": "center",
       "scale_method": "lanczos",
       "input": [
-        "1009",
+        "9000",
         0
       ]
     },
@@ -316,22 +307,6 @@
     "class_type": "LTXVSeparateAVLatent",
     "_meta": {
       "title": "LTXVSeparateAVLatent"
-    }
-  },
-  "291": {
-    "inputs": {
-      "samples": [
-        "289",
-        1
-      ],
-      "audio_vae": [
-        "389",
-        0
-      ]
-    },
-    "class_type": "LTXVAudioVAEDecode",
-    "_meta": {
-      "title": "LTXV Audio VAE Decode"
     }
   },
   "292": {
@@ -727,15 +702,6 @@
       "title": "Load LoRA"
     }
   },
-  "354": {
-    "inputs": {
-      "model_name": "MelBandRoformer_fp32.safetensors"
-    },
-    "class_type": "MelBandRoFormerModelLoader",
-    "_meta": {
-      "title": "Mel-Band RoFormer Model Loader"
-    }
-  },
   "362": {
     "inputs": {
       "any_02": [
@@ -758,35 +724,6 @@
     "class_type": "Any Switch (rgthree)",
     "_meta": {
       "title": "Switch Audio Latent"
-    }
-  },
-  "367": {
-    "inputs": {
-      "any_02": [
-        "291",
-        0
-      ],
-      "any_03": [
-        "384",
-        0
-      ]
-    },
-    "class_type": "Any Switch (rgthree)",
-    "_meta": {
-      "title": "Switch Audio"
-    }
-  },
-  "368": {
-    "inputs": {
-      "output": "",
-      "input": [
-        "362",
-        0
-      ]
-    },
-    "class_type": "Display Int (rgthree)",
-    "_meta": {
-      "title": "Selected Frame Count"
     }
   },
   "378": {
@@ -900,219 +837,10 @@
       "title": "SimpleCalculatorKJ"
     }
   },
-  "405": {
+  "9000": {
+    "class_type": "LoadImage",
     "inputs": {
-      "source": [
-        "312",
-        0
-      ]
-    },
-    "class_type": "PreviewAny",
-    "_meta": {
-      "title": "Prompt Preview"
-    }
-  },
-  "1022": {
-    "inputs": {
-      "noise_seed": 235310156673614
-    },
-    "class_type": "RandomNoise",
-    "_meta": {
-      "title": "RandomNoise"
-    }
-  },
-  "1006": {
-    "inputs": {
-      "model": [
-        "1001",
-        0
-      ],
-      "conditioning": [
-        "1025",
-        0
-      ]
-    },
-    "class_type": "BasicGuider",
-    "_meta": {
-      "title": "BasicGuider"
-    }
-  },
-  "1009": {
-    "inputs": {
-      "samples": [
-        "1021",
-        0
-      ],
-      "vae": [
-        "1010",
-        0
-      ]
-    },
-    "class_type": "VAEDecode",
-    "_meta": {
-      "title": "VAEDecode"
-    }
-  },
-  "1021": {
-    "inputs": {
-      "noise": [
-        "1022",
-        0
-      ],
-      "guider": [
-        "1006",
-        0
-      ],
-      "sampler": [
-        "1023",
-        0
-      ],
-      "sigmas": [
-        "1024",
-        0
-      ],
-      "latent_image": [
-        "1007",
-        0
-      ]
-    },
-    "class_type": "SamplerCustomAdvanced",
-    "_meta": {
-      "title": "SamplerCustomAdvanced"
-    }
-  },
-  "1010": {
-    "inputs": {
-      "vae_name": "full_encoder_small_decoder.safetensors"
-    },
-    "class_type": "VAELoader",
-    "_meta": {
-      "title": "VAELoader"
-    }
-  },
-  "1011": {
-    "inputs": {
-      "images": [
-        "1009",
-        0
-      ],
-      "filename_prefix": "basho/generated_start_image"
-    },
-    "class_type": "SaveImage",
-    "_meta": {
-      "title": "SaveImage"
-    }
-  },
-  "1023": {
-    "inputs": {
-      "sampler_name": "euler"
-    },
-    "class_type": "KSamplerSelect",
-    "_meta": {
-      "title": "KSamplerSelect"
-    }
-  },
-  "1024": {
-    "inputs": {
-      "steps": 30,
-      "width": 1280,
-      "height": 720
-    },
-    "class_type": "Flux2Scheduler",
-    "_meta": {
-      "title": "Flux2Scheduler"
-    }
-  },
-  "1007": {
-    "inputs": {
-      "width": 1280,
-      "height": 720,
-      "batch_size": 1
-    },
-    "class_type": "EmptyLatentImage",
-    "_meta": {
-      "title": "EmptyLatentImage"
-    }
-  },
-  "1027": {
-    "inputs": {
-      "lora_name": "MS_Nude_Style_Flux_V2.safetensors",
-      "strength_model": 0.0
-    },
-    "class_type": "LoraLoaderModelOnly",
-    "_meta": {
-      "title": "LoraLoaderModelOnly"
-    }
-  },
-  "1026": {
-    "inputs": {
-      "model": [
-        "1027",
-        0
-      ],
-      "lora_name": "aidmaNSFWunlock-FLUX-V0.2.safetensors",
-      "strength_model": 0.0
-    },
-    "class_type": "LoraLoaderModelOnly",
-    "_meta": {
-      "title": "LoraLoaderModelOnly"
-    }
-  },
-  "1025": {
-    "inputs": {
-      "conditioning": [
-        "1004",
-        0
-      ],
-      "guidance": 3.5
-    },
-    "class_type": "FluxGuidance",
-    "_meta": {
-      "title": "FluxGuidance"
-    }
-  },
-  "1004": {
-    "inputs": {
-      "clip": [
-        "1002",
-        0
-      ],
-      "text": "__IMAGE_PROMPT__"
-    },
-    "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIPTextEncode"
-    }
-  },
-  "1029": {
-    "inputs": {
-      "clip_name": "qwen3-4b-abl-q4_0.gguf",
-      "type": "flux2"
-    },
-    "class_type": "CLIPLoaderGGUF",
-    "_meta": {
-      "title": "CLIPLoaderGGUF"
-    }
-  },
-  "1001": {
-    "inputs": {
-      "unet_name": "flux2_dev_fp8mixed.safetensors",
-      "weight_dtype": "default"
-    },
-    "class_type": "UNETLoader",
-    "_meta": {
-      "title": "UNETLoader"
-    }
-  },
-  "1002": {
-    "inputs": {
-      "clip_name": "mistral_3_small_flux2_bf16.safetensors",
-      "type": "flux2",
-      "device": "default"
-    },
-    "class_type": "CLIPLoader",
-    "_meta": {
-      "title": "CLIPLoader"
+      "image": "__START_IMAGE__"
     }
   }
 }

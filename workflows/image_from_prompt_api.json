@@ -1,0 +1,171 @@
+{
+  "1001": {
+    "inputs": {
+      "unet_name": "flux2_dev_fp8mixed.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNETLoader"
+    }
+  },
+  "1002": {
+    "inputs": {
+      "clip_name": "mistral_3_small_flux2_bf16.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "CLIPLoader"
+    }
+  },
+  "1004": {
+    "inputs": {
+      "clip": [
+        "1002",
+        0
+      ],
+      "text": "__IMAGE_PROMPT__"
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIPTextEncode"
+    }
+  },
+  "1006": {
+    "inputs": {
+      "model": [
+        "1001",
+        0
+      ],
+      "conditioning": [
+        "1025",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "BasicGuider"
+    }
+  },
+  "1007": {
+    "inputs": {
+      "width": 1280,
+      "height": 720,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "EmptyLatentImage"
+    }
+  },
+  "1009": {
+    "inputs": {
+      "samples": [
+        "1021",
+        0
+      ],
+      "vae": [
+        "1010",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAEDecode"
+    }
+  },
+  "1010": {
+    "inputs": {
+      "vae_name": "full_encoder_small_decoder.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "VAELoader"
+    }
+  },
+  "1011": {
+    "inputs": {
+      "images": [
+        "1009",
+        0
+      ],
+      "filename_prefix": "basho/generated_start_image"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "SaveImage"
+    }
+  },
+  "1021": {
+    "inputs": {
+      "noise": [
+        "1022",
+        0
+      ],
+      "guider": [
+        "1006",
+        0
+      ],
+      "sampler": [
+        "1023",
+        0
+      ],
+      "sigmas": [
+        "1024",
+        0
+      ],
+      "latent_image": [
+        "1007",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "1022": {
+    "inputs": {
+      "noise_seed": 235310156673614
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "1023": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "1024": {
+    "inputs": {
+      "steps": 30,
+      "width": 1280,
+      "height": 720
+    },
+    "class_type": "Flux2Scheduler",
+    "_meta": {
+      "title": "Flux2Scheduler"
+    }
+  },
+  "1025": {
+    "inputs": {
+      "conditioning": [
+        "1004",
+        0
+      ],
+      "guidance": 3.5
+    },
+    "class_type": "FluxGuidance",
+    "_meta": {
+      "title": "FluxGuidance"
+    }
+  }
+}
