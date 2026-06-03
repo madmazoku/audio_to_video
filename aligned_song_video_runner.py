@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import time
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,12 +29,16 @@ VIDEO_MAX_SECONDS = 30
 # Prompt planning context policy.
 LOCAL_CONTEXT_RADIUS = 2
 
-VIDEO_N = {
+IMAGE_N = {
     "image_prompt": "1004",
     "image_latent": "1007",
     "image_scheduler": "1024",
     "image_noise": "1022",
     "image_save": "1011",
+}
+
+VIDEO_N = {
+    "start_image": "9000",
     "video_prompt": "393",
     "video_negative": "328",
     "video_seconds": "322",
@@ -528,6 +533,10 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         "max_workflow_seconds": (int, float),
         "instrumental_gap_min_seconds": (int, float),
         "instrumental_gap_min_ratio_of_median_verse": (int, float),
+        "local_context_radius": int,
+        "range_visual_preroll_seconds": (int, float),
+        "subtitle_line_preroll_seconds": (int, float),
+        "min_karaoke_unit_seconds": (int, float),
     }
 
     for key, expected_type in required.items():
@@ -543,6 +552,10 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
     config["max_workflow_seconds"] = float(config["max_workflow_seconds"])
     config["instrumental_gap_min_seconds"] = float(config["instrumental_gap_min_seconds"])
     config["instrumental_gap_min_ratio_of_median_verse"] = float(config["instrumental_gap_min_ratio_of_median_verse"])
+    config["local_context_radius"] = int(config["local_context_radius"])
+    config["range_visual_preroll_seconds"] = float(config["range_visual_preroll_seconds"])
+    config["subtitle_line_preroll_seconds"] = float(config["subtitle_line_preroll_seconds"])
+    config["min_karaoke_unit_seconds"] = float(config["min_karaoke_unit_seconds"])
     config["_source"] = source
     return config
 
@@ -1005,7 +1018,7 @@ def split_centiseconds_evenly(total_cs: int, parts: int) -> List[int]:
     return [base + 1 if i < rem else base for i in range(parts)]
 
 
-def build_char_karaoke_text(text: str, total_duration: float) -> str:
+def build_char_karaoke_text(text: str, total_duration: float, min_unit: float = 0.01) -> str:
     """Build char-level ASS karaoke tags over a known time range.
 
     Letters and digits receive timing tags. Spaces and punctuation are kept in
@@ -1014,11 +1027,12 @@ def build_char_karaoke_text(text: str, total_duration: float) -> str:
     """
     escaped = ass_escape(text)
     timed_indices = [i for i, ch in enumerate(escaped) if is_karaoke_timed_char(ch)]
+    total_cs = centiseconds(max(min_unit, total_duration))
 
     if not timed_indices:
-        return r"{\k" + str(centiseconds(max(0.1, total_duration))) + "}" + escaped
+        return r"{\k" + str(total_cs) + "}" + escaped
 
-    durations = split_centiseconds_evenly(centiseconds(max(0.1, total_duration)), len(timed_indices))
+    durations = split_centiseconds_evenly(total_cs, len(timed_indices))
     duration_by_index = dict(zip(timed_indices, durations))
 
     out: List[str] = []
@@ -1031,18 +1045,54 @@ def build_char_karaoke_text(text: str, total_duration: float) -> str:
     return "".join(out)
 
 
-def build_word_karaoke_line(line: Dict[str, Any], shift: float) -> str:
-    pieces: List[str] = []
+def build_word_karaoke_line(
+    line: Dict[str, Any],
+    shift: float,
+    event_start: Optional[float] = None,
+    min_unit: float = 0.01,
+) -> str:
+    """Build word-level karaoke while preserving gaps between word timestamps.
 
-    for w in line.get("words", []):
-        duration = max(0.05, float(w["end"]) - float(w["start"]))
-        pieces.append(build_char_karaoke_text(str(w["text"]), duration))
+    event_start is the ASS Dialogue start after shift. Silent karaoke gaps are
+    inserted before words so the line can appear earlier in unsung state.
+    """
+    words = line.get("words", []) or []
+    if not words:
+        line_start = float(line["start"]) - shift
+        line_end = float(line["end"]) - shift
+        if event_start is None:
+            event_start = line_start
+        lead = max(0.0, line_start - event_start)
+        body = build_char_karaoke_text(str(line["text"]), max(min_unit, line_end - line_start), min_unit)
+        return (r"{\k" + str(centiseconds(lead)) + "}" if lead > 0 else "") + body
+
+    if event_start is None:
+        event_start = min(float(w.get("start", line["start"])) for w in words) - shift
+
+    pieces: List[str] = []
+    current = event_start
+
+    for i, w in enumerate(words):
+        ws = float(w.get("start", line["start"])) - shift
+        we = float(w.get("end", ws + min_unit)) - shift
+        ws = max(event_start, ws)
+        we = max(ws + min_unit, we)
+
+        if i > 0:
+            pieces.append(" ")
+
+        gap = max(0.0, ws - current)
+        if gap > 0:
+            pieces.append(r"{\k" + str(centiseconds(gap)) + "}")
+
+        pieces.append(build_char_karaoke_text(str(w.get("text", "")), max(min_unit, we - ws), min_unit))
+        current = max(current, we)
 
     if pieces:
-        return " ".join(pieces)
+        return "".join(pieces)
 
-    line_duration = max(0.1, float(line["end"]) - float(line["start"]))
-    return build_char_karaoke_text(str(line["text"]), line_duration)
+    line_duration = max(min_unit, float(line["end"]) - float(line["start"]))
+    return build_char_karaoke_text(str(line["text"]), line_duration, min_unit)
 
 
 
@@ -1247,7 +1297,13 @@ def build_ass_subtitles(
     mode: str,
     style_section: str,
     style_map: Dict[int, Dict[str, str]],
+    config: Optional[Dict[str, Any]] = None,
+    timing_report_path: Optional[Path] = None,
 ) -> None:
+    config = config or {}
+    subtitle_preroll = max(0.0, float(config.get("subtitle_line_preroll_seconds", 0.0)))
+    min_unit = max(0.01, float(config.get("min_karaoke_unit_seconds", 0.01)))
+
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -1262,32 +1318,72 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
     verse_to_block: Dict[int, int] = {}
+    block_by_index: Dict[int, Dict[str, Any]] = {}
     for block in blocks:
+        block_by_index[int(block["block_index"])] = block
         if block.get("kind") == "verse":
             verse_to_block[int(block["verse_index"])] = int(block["block_index"])
 
     events: List[str] = []
+    timing_report: List[Dict[str, Any]] = []
+    previous_event_end = 0.0
 
     for verse in verses:
         verse_index = int(verse.get("index", 0))
         block_index = verse_to_block.get(verse_index, verse_index)
+        block = block_by_index.get(block_index, {})
+        block_visual_start = float(block.get("start", verse.get("start", 0.0))) - shift
         styles = style_map.get(block_index, {"line": "default_line"})
 
         for line in verse["lines"]:
-            start = max(0.0, float(line["start"]) - shift)
-            end = max(start + 0.1, float(line["end"]) - shift)
+            raw_line_start = float(line["start"]) - shift
+            raw_line_end = float(line["end"]) - shift
             style = styles["line"]
 
-            if mode == "word" and line.get("words"):
-                text = build_word_karaoke_line(line, shift)
-            else:
-                duration = max(0.1, end - start)
-                text = build_char_karaoke_text(str(line["text"]), duration)
+            word_times = [
+                float(w.get("start", line["start"])) - shift
+                for w in (line.get("words", []) or [])
+            ]
+            karaoke_start = min(word_times) if word_times else raw_line_start
+            display_start = max(
+                0.0,
+                block_visual_start,
+                previous_event_end,
+                karaoke_start - subtitle_preroll,
+            )
+            end = max(display_start + 0.1, raw_line_end)
 
-            events.append(f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},{style},,0,0,0,,{text}")
+            if mode == "word" and line.get("words"):
+                text = build_word_karaoke_line(line, shift, display_start, min_unit)
+            else:
+                lead = max(0.0, raw_line_start - display_start)
+                body = build_char_karaoke_text(str(line["text"]), max(min_unit, raw_line_end - raw_line_start), min_unit)
+                text = (r"{\k" + str(centiseconds(lead)) + "}" if lead > 0 else "") + body
+
+            events.append(f"Dialogue: 0,{ass_timestamp(display_start)},{ass_timestamp(end)},{style},,0,0,0,,{text}")
+            timing_report.append({
+                "verse_index": verse_index,
+                "block_index": block_index,
+                "line_index": line.get("index"),
+                "block_visual_start": block_visual_start,
+                "line_display_start": display_start,
+                "karaoke_start": karaoke_start,
+                "line_end": end,
+                "subtitle_leadin": max(0.0, karaoke_start - display_start),
+                "block_visual_preroll": float(block.get("visual_preroll", 0.0)),
+                "text": str(line.get("text", "")),
+            })
+            previous_event_end = end
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+
+    if timing_report_path is not None:
+        write_json(timing_report_path, {
+            "subtitle_line_preroll_seconds": subtitle_preroll,
+            "min_karaoke_unit_seconds": min_unit,
+            "events": timing_report,
+        })
 
 
 def ffmpeg_sub_path(path: Path) -> str:
@@ -1456,13 +1552,15 @@ def run_comfy_planner(
     comfy_url: str,
     plans_dir: Path,
     continuity: List[Dict[str, str]],
+    plan_suffix: str = "",
 ) -> Dict[str, str]:
     plans_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = plans_dir / f"plan_{index:03d}_raw.json"
-    clean_path = plans_dir / f"plan_{index:03d}.json"
-    request_path = plans_dir / f"plan_{index:03d}_request.txt"
-    request_json_path = plans_dir / f"plan_{index:03d}_request.json"
-    template_debug_path = plans_dir / f"plan_{index:03d}_template.txt"
+    base_name = f"plan_{index:03d}{plan_suffix}"
+    raw_path = plans_dir / f"{base_name}_raw.json"
+    clean_path = plans_dir / f"{base_name}.json"
+    request_path = plans_dir / f"{base_name}_request.txt"
+    request_json_path = plans_dir / f"{base_name}_request.json"
+    template_debug_path = plans_dir / f"{base_name}_template.txt"
 
     if raw_path.exists():
         raw_path.unlink()
@@ -1495,7 +1593,7 @@ def run_comfy_planner(
     pid, client_id = queue_prompt(wf, comfy_url)
     log(f"  [planner] prompt_id={pid}")
     h = wait_history(pid, comfy_url, wf, client_id)
-    check_history_status(h, plans_dir / f"planner_history_{index:03d}.json")
+    check_history_status(h, plans_dir / f"{base_name}_history.json")
 
     if not raw_path.exists():
         raise RuntimeError(f"Planner did not write plan file: {raw_path}")
@@ -1652,22 +1750,23 @@ def format_verse_context(verse: Dict[str, Any], label: str) -> str:
 
 
 def build_local_context(verses: List[Dict[str, Any]], verse_index: int, radius: int = LOCAL_CONTEXT_RADIUS) -> str:
+    count = max(1, int(radius))
     if verse_index <= 0:
-        early = verses[:max(1, radius + 1)]
+        early = verses[:count]
         return "Intro local context: early song setup and first verses.\n" + "\n\n".join(
             format_verse_context(v, "Verse") for v in early
         )
 
     total = len(verses)
     if verse_index > total:
-        late = verses[max(0, total - radius - 1):]
+        late = verses[max(0, total - count):]
         return "Outro/instrumental local context: final song resolution and nearby verses.\n" + "\n\n".join(
             format_verse_context(v, "Verse") for v in late
         )
 
     pos = verse_index - 1
-    start = max(0, pos - radius)
-    end = min(total, pos + radius + 1)
+    start = max(0, pos - count)
+    end = min(total, pos + count + 1)
     parts: List[str] = []
     for i in range(start, end):
         label = "CURRENT VERSE" if i == pos else "previous/next context"
@@ -1718,11 +1817,268 @@ def build_current_block_instruction(block: Dict[str, Any], verses: List[Dict[str
 
 
 
-def patch_video_workflow(
+
+def comfy_block_part_subdir(run_id: str, block_index: int, sub_index: int) -> str:
+    return f"aligned_song/{run_id}/block_{block_index:03d}/part_{sub_index:03d}"
+
+
+def extract_last_frame(video_path: Path, out_png: Path, ffmpeg: str) -> None:
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    run_cmd([
+        ffmpeg,
+        "-y",
+        "-sseof", "-0.10",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        str(out_png),
+    ])
+    if not out_png.exists() or out_png.stat().st_size <= 0:
+        raise RuntimeError(f"Failed to extract last frame: {out_png}")
+
+
+def upload_image_to_comfy(image_path: Path, comfy_url: str, subfolder: str) -> str:
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image to upload not found: {image_path}")
+
+    with image_path.open("rb") as f:
+        r = requests.post(
+            comfy_url.rstrip("/") + "/upload/image",
+            files={"image": (image_path.name, f, "image/png")},
+            data={"subfolder": subfolder, "overwrite": "true", "type": "input"},
+            timeout=120,
+        )
+    try:
+        r.raise_for_status()
+    except Exception:
+        log("ComfyUI /upload/image error:")
+        log(r.text[:4000])
+        raise
+
+    data = r.json()
+    name = data.get("name") or image_path.name
+    returned_subfolder = data.get("subfolder")
+    if returned_subfolder:
+        return f"{returned_subfolder}/{name}".replace("\\", "/")
+    if subfolder:
+        return f"{subfolder}/{name}".replace("\\", "/")
+    return str(name)
+
+
+def timed_line_segments_for_block(block: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if str(block.get("kind")) != "verse":
+        return []
+
+    verse = block.get("verse") or {}
+    start = float(block["start"])
+    end = float(block["end"])
+    segments: List[Dict[str, Any]] = []
+
+    for line in verse.get("lines", []):
+        raw_start = float(line.get("start", start))
+        raw_end = float(line.get("end", end))
+        ls = max(start, raw_start)
+        le = min(end, raw_end)
+        if le <= start or ls >= end or le <= ls:
+            continue
+
+        segments.append({
+            "start": ls,
+            "end": le,
+            "text": str(line.get("text", "")),
+            "words": line.get("words", []),
+        })
+
+    return segments
+
+
+def subrange_text_for_block(block: Dict[str, Any], sub_start: float, sub_end: float) -> str:
+    if str(block.get("kind")) != "verse":
+        return ""
+
+    pieces: List[str] = []
+    for seg in timed_line_segments_for_block(block):
+        midpoint = (float(seg["start"]) + float(seg["end"])) / 2.0
+
+        words = seg.get("words") or []
+        if words and (float(seg["start"]) < sub_start or float(seg["end"]) > sub_end):
+            selected_words = [
+                str(w.get("text", ""))
+                for w in words
+                if sub_start <= ((float(w.get("start", sub_start)) + float(w.get("end", sub_end))) / 2.0) < sub_end
+            ]
+            text = " ".join(x for x in selected_words if x).strip()
+            if text:
+                pieces.append(text)
+            continue
+
+        if sub_start <= midpoint < sub_end:
+            text = str(seg.get("text", "")).strip()
+            if text:
+                pieces.append(text)
+
+    return "\n".join(pieces).strip()
+
+
+def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> List[float]:
+    start = float(block["start"])
+    end = float(block["end"])
+    duration = max(0.01, end - start)
+    max_seconds = float(config["max_workflow_seconds"])
+    recommended = float(config["recommended_workflow_seconds"])
+
+    if duration <= max_seconds:
+        return [start, end]
+
+    parts = max(2, int(math.ceil(duration / max(1.0, recommended))))
+    target = duration / parts
+
+    candidates = {start, end}
+    if str(block.get("kind")) == "verse":
+        for seg in timed_line_segments_for_block(block):
+            if start < float(seg["end"]) < end:
+                candidates.add(float(seg["end"]))
+            for w in seg.get("words") or []:
+                we = float(w.get("end", start))
+                if start < we < end:
+                    candidates.add(we)
+
+    sorted_candidates = sorted(candidates)
+    boundaries = [start]
+    previous = start
+
+    for part in range(1, parts):
+        desired = start + target * part
+        min_remaining = (parts - part) * 1.0
+        valid = [c for c in sorted_candidates if previous + 1.0 <= c <= end - min_remaining]
+        if valid:
+            chosen = min(valid, key=lambda c: abs(c - desired))
+        else:
+            chosen = min(max(desired, previous + 1.0), end - min_remaining)
+
+        if chosen <= previous + 0.05:
+            chosen = min(end - min_remaining, previous + 1.0)
+        boundaries.append(float(chosen))
+        previous = float(chosen)
+
+    boundaries.append(end)
+
+    clean = [boundaries[0]]
+    for b in boundaries[1:]:
+        if b > clean[-1] + 0.05:
+            clean.append(b)
+    if clean[-1] < end:
+        clean.append(end)
+    return clean
+
+
+def build_subranges_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    boundaries = split_boundaries_for_block(block, config)
+    count = max(1, len(boundaries) - 1)
+    out: List[Dict[str, Any]] = []
+
+    for i in range(count):
+        sub_start = float(boundaries[i])
+        sub_end = float(boundaries[i + 1])
+        text = "" if count == 1 else subrange_text_for_block(block, sub_start, sub_end)
+
+        out.append({
+            "block_index": int(block["block_index"]),
+            "kind": str(block.get("kind", "verse")),
+            "sub_index": i + 1,
+            "sub_count": count,
+            "start": sub_start,
+            "end": sub_end,
+            "duration": max(0.01, sub_end - sub_start),
+            "text": text,
+            "text_mode": "whole_range" if count == 1 else "slice",
+        })
+
+    return out
+
+
+def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any]) -> str:
+    kind = str(block.get("kind", "verse"))
+    directives = block.get("bracket_directives") or []
+    directive_text = "\n".join(f"- {x}" for x in directives) if directives else "- none"
+    full_text = str(block.get("text", "")).strip() or "(no sung lyrics in this semantic range)"
+    sub_text = str(subrange.get("text", "")).strip()
+
+    if subrange.get("text_mode") == "whole_range":
+        subrange_section = (
+            "This subrange covers the entire semantic range. "
+            "Use FULL SEMANTIC RANGE LYRICS / RANGE TEXT as the current factual source."
+        )
+    elif sub_text:
+        subrange_section = (
+            "CURRENT SUBRANGE TEXT — HIGHEST FACTUAL PRIORITY:\n"
+            + sub_text
+            + "\n\nDepict this current subrange as the main action. "
+              "Use the full semantic range only for continuity and meaning."
+        )
+    else:
+        subrange_section = (
+            "CURRENT SUBRANGE — HIGHEST FACTUAL PRIORITY:\n"
+            "No lyrics are sung in this subrange. Continue the visual motion of this semantic range."
+        )
+
+    return (
+        f"SEMANTIC RANGE:\n"
+        f"Block index: {int(block['block_index']):03d}\n"
+        f"Kind: {kind}\n"
+        f"Subrange: {int(subrange['sub_index'])} of {int(subrange['sub_count'])}\n"
+        f"Time: {float(subrange['start']):.3f}s..{float(subrange['end']):.3f}s\n\n"
+        f"BRACKET DIRECTIVES, metadata for the whole semantic range:\n{directive_text}\n\n"
+        f"FULL SEMANTIC RANGE LYRICS / RANGE TEXT:\n{full_text}\n\n"
+        f"{subrange_section}\n\n"
+        "Priority rules:\n"
+        "- Always follow VISUAL STYLE for medium, look, palette, character design, camera and rendering.\n"
+        "- For factual action, follow CURRENT SUBRANGE when it provides text.\n"
+        "- Bracket directives are metadata, not sung lyrics and never visible text.\n"
+        "- Do not render captions, signs, section labels, lyric cards, or written words."
+    )
+
+
+def concat_or_copy_subclips(subclips: List[Path], out_path: Path, ffmpeg: str) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not subclips:
+        raise RuntimeError(f"No subclips to concat into {out_path}")
+    if len(subclips) == 1:
+        shutil.copy2(subclips[0], out_path)
+        return
+    concat_videos(subclips, out_path, ffmpeg)
+
+
+def patch_image_workflow(
     template: Dict[str, Any],
+    image_prompt: str,
+    block_index: int,
+    sub_index: int,
+    run_id: str,
+    image_seed: int,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    wf = json.loads(json.dumps(template))
+    width = int(config["width"])
+    height = int(config["height"])
+    segment_dir = comfy_block_part_subdir(run_id, block_index, sub_index)
+
+    wf[IMAGE_N["image_prompt"]]["inputs"]["text"] = image_prompt
+    wf[IMAGE_N["image_latent"]]["inputs"]["width"] = width
+    wf[IMAGE_N["image_latent"]]["inputs"]["height"] = height
+    wf[IMAGE_N["image_scheduler"]]["inputs"]["width"] = width
+    wf[IMAGE_N["image_scheduler"]]["inputs"]["height"] = height
+    wf[IMAGE_N["image_noise"]]["inputs"]["noise_seed"] = int(image_seed)
+    wf[IMAGE_N["image_save"]]["inputs"]["filename_prefix"] = f"{segment_dir}/start_image"
+    return wf
+
+
+def patch_video_from_image_workflow(
+    template: Dict[str, Any],
+    start_image_name: str,
     visual_plan: Dict[str, str],
     duration: float,
-    index: int,
+    block_index: int,
+    sub_index: int,
     run_id: str,
     seeds: Dict[str, int],
     config: Dict[str, Any],
@@ -1737,24 +2093,18 @@ def patch_video_workflow(
 
     if duration > max_seconds:
         raise RuntimeError(
-            f"Block {index:03d} duration is {duration:.2f}s, but this video workflow hard-limits at {max_seconds:.2f}s."
+            f"Block {block_index:03d} part {sub_index:03d} duration is {duration:.2f}s, "
+            f"but this video workflow hard-limits at {max_seconds:.2f}s."
         )
     if duration > recommended_seconds:
         log(
-            f"  [warn] block {index:03d} duration is {duration:.2f}s; "
+            f"  [warn] block {block_index:03d} part {sub_index:03d} duration is {duration:.2f}s; "
             f"workflow is optimized for <= {recommended_seconds:.2f}s and quality may degrade."
         )
 
-    segment_dir = comfy_segment_subdir(run_id, index)
+    segment_dir = comfy_block_part_subdir(run_id, block_index, sub_index)
 
-    wf[VIDEO_N["image_prompt"]]["inputs"]["text"] = visual_plan["image_prompt"]
-    wf[VIDEO_N["image_latent"]]["inputs"]["width"] = width
-    wf[VIDEO_N["image_latent"]]["inputs"]["height"] = height
-    wf[VIDEO_N["image_scheduler"]]["inputs"]["width"] = width
-    wf[VIDEO_N["image_scheduler"]]["inputs"]["height"] = height
-    wf[VIDEO_N["image_noise"]]["inputs"]["noise_seed"] = int(seeds["image_seed"])
-    wf[VIDEO_N["image_save"]]["inputs"]["filename_prefix"] = f"{segment_dir}/start_image"
-
+    wf[VIDEO_N["start_image"]]["inputs"]["image"] = start_image_name
     wf[VIDEO_N["video_prompt"]]["inputs"]["value"] = visual_plan["video_prompt"]
     if VIDEO_N["video_negative"] in wf:
         wf[VIDEO_N["video_negative"]]["inputs"]["text"] = visual_plan.get("negative_prompt", "")
@@ -1828,13 +2178,11 @@ def make_timeline_blocks(
     has_limit: bool,
     config: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], Optional[float]]:
-    """Create continuous video blocks.
+    """Create continuous visual timeline blocks.
 
-    Normal blocks:
-      intro, verse, instrumental, outro
-
-    Instrumental blocks are created for long gaps without lyrics. Short gaps
-    remain attached to the previous verse block.
+    Lyric timing remains unchanged. For lyric blocks, visual_start may move
+    slightly earlier into lyric-free gap by range_visual_preroll_seconds so the
+    new scene can appear before the first sung word.
     """
     total = len(all_verses)
     selected_count = len(selected_verses)
@@ -1855,11 +2203,23 @@ def make_timeline_blocks(
     blocks: List[Dict[str, Any]] = []
     next_block_index = 0
     threshold = instrumental_gap_threshold(all_verses, config)
+    desired_preroll = max(0.0, float(config.get("range_visual_preroll_seconds", 0.0)))
+
+    # Compute visual starts for selected lyric verses. Preroll is taken only from
+    # lyric-free gap before the verse, never from time where previous lyrics sing.
+    visual_starts: List[float] = []
+    previous_lyric_end = 0.0
+    for verse in selected_verses:
+        lyric_start = float(verse["start"])
+        available_gap = max(0.0, lyric_start - previous_lyric_end)
+        actual_preroll = min(desired_preroll, available_gap)
+        visual_starts.append(max(0.0, lyric_start - actual_preroll))
+        previous_lyric_end = float(verse["end"])
 
     first = selected_verses[0]
-    first_start = float(first["start"])
+    first_visual_start = visual_starts[0]
 
-    if first_start > 0.05:
+    if first_visual_start > 0.05:
         intro_text = (
             "Opening instrumental/intro block for the whole song. "
             "Establish the main setting, recurring characters and mood before the first lyric starts."
@@ -1869,32 +2229,37 @@ def make_timeline_blocks(
             "kind": "intro",
             "verse_index": 0,
             "start": 0.0,
-            "end": first_start,
-            "duration": first_start,
-            "text": intro_text + "\n\nFirst verse context:\n" + first.get("text", ""),
+            "end": first_visual_start,
+            "duration": first_visual_start,
+            "text": intro_text,
             "bracket_directives": [],
         })
         next_block_index += 1
 
     for pos, verse in enumerate(selected_verses):
         verse_index = int(verse["index"])
-        start = float(verse["start"])
+        lyric_start = float(verse["start"])
+        start = float(visual_starts[pos])
         lyric_end = float(verse["end"])
+        actual_preroll = max(0.0, lyric_start - start)
 
         if pos + 1 < len(selected_verses):
-            next_start = float(selected_verses[pos + 1]["start"])
+            next_lyric_start = float(selected_verses[pos + 1]["start"])
+            next_visual_start = float(visual_starts[pos + 1])
             next_verse_index: Optional[int] = int(selected_verses[pos + 1]["index"])
         elif full_song:
-            next_start = lyric_end
+            next_lyric_start = lyric_end
+            next_visual_start = lyric_end
             next_verse_index = None
         else:
-            next_start = timeline_end
+            next_lyric_start = timeline_end
+            next_visual_start = timeline_end
             next_verse_index = int(all_verses[selected_count]["index"]) if selected_count < total else None
 
-        gap = max(0.0, next_start - lyric_end)
-        split_gap = gap >= threshold and next_start > lyric_end
+        lyric_gap = max(0.0, next_lyric_start - lyric_end)
+        split_gap = lyric_gap >= threshold and next_lyric_start > lyric_end
 
-        verse_end = lyric_end if split_gap else next_start
+        verse_end = lyric_end if split_gap else next_visual_start
         if verse_end <= start:
             verse_end = lyric_end
 
@@ -1907,27 +2272,32 @@ def make_timeline_blocks(
             "duration": max(0.01, verse_end - start),
             "text": verse.get("text", ""),
             "verse": verse,
+            "lyric_start": lyric_start,
+            "lyric_end": lyric_end,
+            "visual_preroll": actual_preroll,
             "bracket_directives": list(verse.get("bracket_directives", [])),
         })
         next_block_index += 1
 
         if split_gap:
-            blocks.append({
-                "block_index": next_block_index,
-                "kind": "instrumental",
-                "verse_index": verse_index,
-                "previous_verse_index": verse_index,
-                "next_verse_index": next_verse_index,
-                "start": lyric_end,
-                "end": next_start,
-                "duration": max(0.01, next_start - lyric_end),
-                "text": (
-                    f"Instrumental break with no sung lyrics between verse {verse_index}"
-                    + (f" and verse {next_verse_index}." if next_verse_index else " and the end of the selected range.")
-                ),
-                "bracket_directives": [],
-            })
-            next_block_index += 1
+            instrumental_end = next_visual_start
+            if instrumental_end > lyric_end + 0.05:
+                blocks.append({
+                    "block_index": next_block_index,
+                    "kind": "instrumental",
+                    "verse_index": verse_index,
+                    "previous_verse_index": verse_index,
+                    "next_verse_index": next_verse_index,
+                    "start": lyric_end,
+                    "end": instrumental_end,
+                    "duration": max(0.01, instrumental_end - lyric_end),
+                    "text": (
+                        f"Instrumental break with no sung lyrics between verse {verse_index}"
+                        + (f" and verse {next_verse_index}." if next_verse_index else " and the end of the selected range.")
+                    ),
+                    "bracket_directives": [],
+                })
+                next_block_index += 1
 
     if full_song:
         last = selected_verses[-1]
@@ -1945,7 +2315,7 @@ def make_timeline_blocks(
                 "start": outro_start,
                 "end": outro_end,
                 "duration": max(0.01, outro_end - outro_start),
-                "text": outro_text + "\n\nLast verse context:\n" + last.get("text", ""),
+                "text": outro_text,
                 "bracket_directives": [],
             })
 
@@ -2105,6 +2475,72 @@ def write_timeline_manifest(
     }
     write_json(out_path, manifest)
 
+
+
+def copy_file_if_exists(src_path: Path, dst_path: Path) -> None:
+    if src_path.exists():
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, dst_path)
+
+
+def copy_planner_artifacts_to_part_debug(
+    plans_dir: Path,
+    base_name: str,
+    part_debug_dir: Path,
+) -> None:
+    copy_file_if_exists(plans_dir / f"{base_name}_request.txt", part_debug_dir / "planner_request.txt")
+    copy_file_if_exists(plans_dir / f"{base_name}_request.json", part_debug_dir / "planner_request.json")
+    copy_file_if_exists(plans_dir / f"{base_name}_template.txt", part_debug_dir / "planner_template.txt")
+    copy_file_if_exists(plans_dir / f"{base_name}_raw.json", part_debug_dir / "planner_raw.json")
+    copy_file_if_exists(plans_dir / f"{base_name}.json", part_debug_dir / "planner_result.json")
+    copy_file_if_exists(plans_dir / f"{base_name}_history.json", part_debug_dir / "planner_history.json")
+
+
+def range_debug_dir(debug_dir: Path, block_index: int) -> Path:
+    return debug_dir / "ranges" / f"range_{block_index:03d}"
+
+
+def range_part_debug_dir(debug_dir: Path, block_index: int, sub_index: int) -> Path:
+    return range_debug_dir(debug_dir, block_index) / f"part_{sub_index:03d}"
+
+
+def write_range_debug_files(block: Dict[str, Any], subranges: List[Dict[str, Any]], debug_dir: Path) -> Path:
+    block_i = int(block["block_index"])
+    rdir = range_debug_dir(debug_dir, block_i)
+    rdir.mkdir(parents=True, exist_ok=True)
+
+    directives = block.get("bracket_directives") or []
+    (rdir / "range_text.txt").write_text(str(block.get("text", "")), encoding="utf-8")
+    (rdir / "range_directives.txt").write_text(
+        "\n".join(str(x) for x in directives), encoding="utf-8"
+    )
+
+    range_context = {
+        "block_index": block_i,
+        "kind": str(block.get("kind", "")),
+        "verse_index": block.get("verse_index"),
+        "previous_verse_index": block.get("previous_verse_index"),
+        "next_verse_index": block.get("next_verse_index"),
+        "start": float(block.get("start", 0.0)),
+        "end": float(block.get("end", 0.0)),
+        "duration": float(block.get("duration", 0.0)),
+        "text": str(block.get("text", "")),
+        "bracket_directives": directives,
+        "subranges": subranges,
+    }
+    write_json(rdir / "range_context.json", range_context)
+
+    for subrange in subranges:
+        sub_i = int(subrange["sub_index"])
+        pdir = range_part_debug_dir(debug_dir, block_i, sub_i)
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / "subrange_text.txt").write_text(str(subrange.get("text", "")), encoding="utf-8")
+        write_json(pdir / "subrange_context.json", subrange)
+
+    return rdir
+
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate a ComfyUI music video from input-dir files.")
     ap.add_argument("--input-dir", default="input", help="Folder containing all song input files. Defaults to ./input.")
@@ -2158,7 +2594,8 @@ def main() -> None:
     block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
 
     planner_template = load_json(workflow_dir / "planner_visual_prompts_api.json")
-    video_template = load_json(workflow_dir / "video_from_generated_image_api.json")
+    image_template = load_json(workflow_dir / "image_from_prompt_api.json")
+    video_template = load_json(workflow_dir / "video_from_image_api.json")
     width, height = int(config["width"]), int(config["height"])
 
     log("[stage] parse alignment")
@@ -2272,6 +2709,8 @@ def main() -> None:
         subtitle_mode,
         style_section,
         subtitle_style_map,
+        config,
+        debug_dir / "timing_report.json",
     )
     log(f"[stage] subtitles: {ass_path} ({subtitle_mode})")
     stats_end(stats, "subtitles")
@@ -2283,6 +2722,11 @@ def main() -> None:
     write_json(debug_dir / "run_info.json", {"run_id": run_id, "fresh_generation_run": fresh_generation_run})
     clips_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
+
+    subclips_root = out_dir / "subclips"
+    frames_root = out_dir / "frames"
+    subclips_root.mkdir(parents=True, exist_ok=True)
+    frames_root.mkdir(parents=True, exist_ok=True)
 
     for block in blocks:
         block_i = int(block["block_index"])
@@ -2302,6 +2746,9 @@ def main() -> None:
         log(f"\n=== block {block_i:03d} / {kind}: {first}")
         log(f"  [stage] time={float(block['start']):.3f}s..{float(block['end']):.3f}s duration={duration:.2f}s")
 
+        subranges = build_subranges_for_block(block, config)
+        range_dir = write_range_debug_files(block, subranges, debug_dir)
+
         if not should_generate:
             if not clip_local.exists():
                 raise FileNotFoundError(
@@ -2320,8 +2767,16 @@ def main() -> None:
             continue
 
         stats_start(stats, "video_generation")
-        continuity_before = block_i if kind == "verse" else (1 if kind == "intro" else total_verses + 1)
-        continuity = load_continuity_from_plans(plans_dir, block_i)
+
+        block_subclips_dir = subclips_root / f"block_{block_i:03d}"
+        block_frames_dir = frames_root / f"block_{block_i:03d}"
+        if block_subclips_dir.exists():
+            shutil.rmtree(block_subclips_dir)
+        if block_frames_dir.exists():
+            shutil.rmtree(block_frames_dir)
+        block_subclips_dir.mkdir(parents=True, exist_ok=True)
+        block_frames_dir.mkdir(parents=True, exist_ok=True)
+
         if kind == "instrumental":
             local_context = build_instrumental_local_context(
                 verses,
@@ -2329,67 +2784,196 @@ def main() -> None:
                 block.get("next_verse_index"),
             )
         else:
-            local_context = build_local_context(verses, int(block.get("verse_index", block_i)), LOCAL_CONTEXT_RADIUS)
-        current_instruction = build_current_block_instruction(block, verses)
+            local_context = build_local_context(
+                verses,
+                int(block.get("verse_index", block_i)),
+                int(config["local_context_radius"]),
+            )
+
         block_video_style = effective_video_style(block_i, video_style, block_video_styles)
-        write_json(debug_dir / f"planner_context_{block_i:03d}.json", {
-            "block_index": block_i,
-            "block_kind": kind,
-            "video_style_source": video_style_report.get("blocks", {}).get(str(block_i), video_style_report.get("default", {})),
-            "video_style": block_video_style,
-            "song_context": song_context,
-            "local_context": local_context,
-            "current_block": current_instruction,
-            "continuity": continuity[-5:],
-        })
+        base_continuity = load_continuity_from_plans(plans_dir, block_i)
+        part_continuity = list(base_continuity)
+        subclip_paths: List[Path] = []
+        subrange_infos: List[Dict[str, Any]] = []
+        previous_subclip: Optional[Path] = None
 
-        plan = run_comfy_planner(
-            planner_template,
-            rules,
-            block_video_style,
-            song_context,
-            local_context,
-            current_instruction,
-            block_i,
-            kind,
-            args.comfy_url,
-            plans_dir,
-            continuity,
-        )
+        for subrange in subranges:
+            sub_i = int(subrange["sub_index"])
+            sub_count = int(subrange["sub_count"])
+            sub_duration = max(0.1, float(subrange["duration"]))
+            sub_dir = comfy_block_part_subdir(run_id, block_i, sub_i)
+            plan_suffix = f"_part_{sub_i:03d}"
+            plan_base_name = f"plan_{block_i:03d}{plan_suffix}"
 
-        seeds = {
-            "image_seed": random_seed(),
-            "video_seed": random_seed(),
-            "video_refine_seed": random_seed(),
+            log(f"  [subrange] {sub_i}/{sub_count} time={float(subrange['start']):.3f}s..{float(subrange['end']):.3f}s duration={sub_duration:.2f}s")
+
+            current_instruction = build_subrange_instruction(block, subrange)
+            part_debug_dir = range_part_debug_dir(debug_dir, block_i, sub_i)
+            part_debug_dir.mkdir(parents=True, exist_ok=True)
+            write_json(part_debug_dir / "planner_context.json", {
+                "block_index": block_i,
+                "block_kind": kind,
+                "subrange": subrange,
+                "video_style_source": video_style_report.get("blocks", {}).get(str(block_i), video_style_report.get("default", {})),
+                "video_style": block_video_style,
+                "song_context": song_context,
+                "local_context": local_context,
+                "current_block": current_instruction,
+                "continuity": part_continuity[-5:],
+            })
+
+            plan = run_comfy_planner(
+                planner_template,
+                rules,
+                block_video_style,
+                song_context,
+                local_context,
+                current_instruction,
+                block_i,
+                kind,
+                args.comfy_url,
+                plans_dir,
+                part_continuity,
+                plan_suffix=plan_suffix,
+            )
+            copy_planner_artifacts_to_part_debug(plans_dir, plan_base_name, part_debug_dir)
+
+            seeds = {
+                "image_seed": random_seed(),
+                "video_seed": random_seed(),
+                "video_refine_seed": random_seed(),
+            }
+
+            start_image_local = block_frames_dir / f"part_{sub_i:03d}_start.png"
+            last_frame_local = block_frames_dir / f"part_{sub_i:03d}_last.png"
+
+            if sub_i == 1:
+                log("  [stage] queue start image")
+                iwf = patch_image_workflow(
+                    image_template,
+                    plan["image_prompt"],
+                    block_i,
+                    sub_i,
+                    run_id,
+                    seeds["image_seed"],
+                    config,
+                )
+                write_json(part_debug_dir / "image_patched.json", iwf)
+                pid, client_id = queue_prompt(iwf, args.comfy_url)
+                log(f"  [image] prompt_id={pid}")
+                ih = wait_history(pid, args.comfy_url, iwf, client_id)
+                check_history_status(ih, part_debug_dir / "image_history.json")
+                image_path = find_result_file(ih, output_dir, sub_dir, "start_image", {".png", ".jpg", ".jpeg", ".webp"})
+                if not image_path:
+                    raise RuntimeError(f"Start image result not found for block {block_i:03d} part {sub_i:03d}")
+                shutil.copy2(image_path, start_image_local)
+            else:
+                if previous_subclip is None:
+                    raise RuntimeError(f"Internal error: no previous subclip for block {block_i:03d} part {sub_i:03d}")
+                log("  [stage] extract previous last frame as next start image")
+                extract_last_frame(previous_subclip, start_image_local, args.ffmpeg)
+
+            comfy_input_name = upload_image_to_comfy(
+                start_image_local,
+                args.comfy_url,
+                f"aligned_song_inputs/{run_id}/block_{block_i:03d}",
+            )
+
+            log("  [stage] patch video-from-image workflow")
+            log(f"  [seeds] image={seeds['image_seed']} video={seeds['video_seed']} refine={seeds['video_refine_seed']}")
+            vwf = patch_video_from_image_workflow(
+                video_template,
+                comfy_input_name,
+                plan,
+                sub_duration,
+                block_i,
+                sub_i,
+                run_id,
+                seeds,
+                config,
+            )
+            write_json(part_debug_dir / "video_patched.json", vwf)
+
+            log("  [stage] queue video")
+            pid, client_id = queue_prompt(vwf, args.comfy_url)
+            log(f"  [video] prompt_id={pid}")
+            vh = wait_history(pid, args.comfy_url, vwf, client_id)
+            check_history_status(vh, part_debug_dir / "video_history.json")
+            video_path = find_result_file(vh, output_dir, sub_dir, "video", {".mp4", ".mov", ".webm", ".mkv"})
+            if not video_path:
+                raise RuntimeError(f"Video result not found for block {block_i:03d} part {sub_i:03d}")
+
+            raw_part = raw_dir / f"{clip_local.stem}_part_{sub_i:03d}{video_path.suffix}"
+            shutil.copy2(video_path, raw_part)
+
+            subclip_local = block_subclips_dir / f"part_{sub_i:03d}.mp4"
+            log("  [stage] trim/pad subclip to exact subrange duration; remove raw workflow audio")
+            trim_or_pad_video(raw_part, sub_duration, subclip_local, args.ffmpeg)
+            extract_last_frame(subclip_local, last_frame_local, args.ffmpeg)
+
+            previous_subclip = subclip_local
+            subclip_paths.append(subclip_local)
+            scene_summary = str(plan.get("scene_summary", ""))
+            part_continuity.append({
+                "segment": f"{block_i}.{sub_i}",
+                "scene_summary": scene_summary,
+            })
+
+            subrange_info = {
+                "sub_index": sub_i,
+                "sub_count": sub_count,
+                "start": float(subrange["start"]),
+                "end": float(subrange["end"]),
+                "duration": sub_duration,
+                "text": str(subrange.get("text", "")),
+                "text_mode": str(subrange.get("text_mode", "")),
+                "scene_summary": scene_summary,
+                "comfy_subdir": sub_dir,
+                "start_image": str(start_image_local.relative_to(output_root)) if start_image_local.is_relative_to(output_root) else str(start_image_local),
+                "last_frame": str(last_frame_local.relative_to(output_root)) if last_frame_local.is_relative_to(output_root) else str(last_frame_local),
+                "subclip": str(subclip_local.relative_to(output_root)) if subclip_local.is_relative_to(output_root) else str(subclip_local),
+                "seeds": seeds,
+                "plan": str((plans_dir / f"plan_{block_i:03d}{plan_suffix}.json").relative_to(output_root)),
+            }
+            subrange_infos.append(subrange_info)
+            write_json(part_debug_dir / "video_generation.json", subrange_info)
+
+        semantic_raw = raw_dir / f"{clip_local.stem}_semantic_raw.mp4"
+        concat_or_copy_subclips(subclip_paths, semantic_raw, args.ffmpeg)
+
+        log("  [stage] trim/pad semantic clip to exact block duration")
+        trim_or_pad_video(semantic_raw, duration, clip_local, args.ffmpeg)
+
+        scene_summary = " / ".join(x.get("scene_summary", "") for x in subrange_infos if x.get("scene_summary"))
+        if not scene_summary:
+            scene_summary = f"{kind} block {block_i:03d}, rendered as {len(subrange_infos)} internal subrange(s)"
+        aggregate_plan = {
+            "scene_summary": scene_summary,
+            "split_parts": len(subrange_infos),
+            "subranges": [
+                {
+                    "sub_index": x.get("sub_index"),
+                    "sub_count": x.get("sub_count"),
+                    "start": x.get("start"),
+                    "end": x.get("end"),
+                    "duration": x.get("duration"),
+                    "text_mode": x.get("text_mode"),
+                    "scene_summary": x.get("scene_summary"),
+                }
+                for x in subrange_infos
+            ],
         }
-        segment_subdir = comfy_segment_subdir(run_id, block_i)
+        write_json(plans_dir / f"plan_{block_i:03d}.json", aggregate_plan)
+
         generation_info[block_i] = {
             "run_id": run_id,
-            "segment_subdir": segment_subdir.replace("\\", "/"),
-            "seeds": seeds,
+            "segment_subdir": f"aligned_song/{run_id}/block_{block_i:03d}",
             "generated_in_this_run": True,
+            "range_debug": str(range_dir.relative_to(output_root)) if range_dir.is_relative_to(output_root) else str(range_dir),
+            "subranges": subrange_infos,
         }
-
-        log("  [stage] patch video workflow")
-        log(f"  [seeds] image={seeds['image_seed']} video={seeds['video_seed']} refine={seeds['video_refine_seed']}")
-        vwf = patch_video_workflow(video_template, plan, duration, block_i, run_id, seeds, config)
-        write_json(debug_dir / f"video_patched_{block_i:03d}.json", vwf)
         write_json(debug_dir / f"video_generation_{block_i:03d}.json", generation_info[block_i])
 
-        log("  [stage] queue video")
-        pid, client_id = queue_prompt(vwf, args.comfy_url)
-        log(f"  [video] prompt_id={pid}")
-        vh = wait_history(pid, args.comfy_url, vwf, client_id)
-        check_history_status(vh, debug_dir / f"video_history_{block_i:03d}.json")
-        video_path = find_result_file(vh, output_dir, segment_subdir, "video", {".mp4", ".mov", ".webm", ".mkv"})
-        if not video_path:
-            raise RuntimeError(f"Video result not found for block {block_i:03d}")
-
-        raw_local = raw_dir / f"{clip_local.stem}{video_path.suffix}"
-        shutil.copy2(video_path, raw_local)
-
-        log("  [stage] trim/pad video to exact block duration; remove raw workflow audio")
-        trim_or_pad_video(raw_local, duration, clip_local, args.ffmpeg)
         clips_generated += 1
         stats_end(stats, "video_generation")
         clips.append(clip_local)

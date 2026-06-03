@@ -5,5 +5,9 @@
   "recommended_workflow_seconds": 20,
   "max_workflow_seconds": 30,
   "instrumental_gap_min_seconds": 8.0,
-  "instrumental_gap_min_ratio_of_median_verse": 0.5
+  "instrumental_gap_min_ratio_of_median_verse": 0.5,
+  "local_context_radius": 2,
+  "range_visual_preroll_seconds": 0.25,
+  "subtitle_line_preroll_seconds": 0.25,
+  "min_karaoke_unit_seconds": 0.01
 }

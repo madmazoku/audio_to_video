@@ -28,7 +28,9 @@ Use only for continuity of established visuals.
 
 Priority rules:
 - If global context, local context, continuity, and current block conflict, follow the current block.
-- For verse blocks, depict the current verse/block mainly, not the whole song.
+- CURRENT_BLOCK may describe a semantic range and an internal subrange. If it contains CURRENT SUBRANGE, that subrange is the highest factual priority for what happens now.
+- FULL SEMANTIC RANGE LYRICS / RANGE TEXT is context for meaning and continuity; do not make earlier/later lyrics the main action when a CURRENT SUBRANGE slice is provided.
+- For verse blocks, depict the current semantic range/subrange mainly, not the whole song.
 - Global context may influence style, world, recurring design, and optional background details only.
 - Local context may influence transitions and continuity only.
 - Do not copy raw lyrics into image_prompt or video_prompt.

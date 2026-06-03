@@ -10,3 +10,5 @@ Current-block fact rules:
 - Previous generated summaries are only for visual continuity and must not decide what happens in the current block.
 - If the current block has a cause-and-reaction structure, show both cause and reaction when possible.
 - The scene_summary must describe the literal current-block event, not a generic global motif.
+
+- Bracket directives and section labels from bracket directives are metadata only; never render them as visible text.

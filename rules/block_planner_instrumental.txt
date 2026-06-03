@@ -28,6 +28,7 @@ Use only for continuity of established visuals.
 
 Instrumental-block rules:
 - No lyrics are sung during this timerange.
+- If this semantic range is split into internal subranges, continue the same instrumental interlude inside the range. The next semantic range will start fresh.
 - Create a visual musical interlude or transition between surrounding lyric events.
 - Use neighboring verses only to understand what the interlude connects.
 - Do not invent visible text, titles, captions, signs, or lyric cards.
