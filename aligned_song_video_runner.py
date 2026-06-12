@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -16,18 +18,6 @@ import requests
 import random
 import statistics
 import websocket
-
-COMFY_URL = "http://127.0.0.1:8188"
-COMFY_OUTPUT_DIR = Path(r"G:\Git\ComfyUI\output")
-FFMPEG = "ffmpeg"
-FFPROBE = "ffprobe"
-
-# Video duration policy.
-VIDEO_RECOMMENDED_SECONDS = 20
-VIDEO_MAX_SECONDS = 30
-
-# Prompt planning context policy.
-LOCAL_CONTEXT_RADIUS = 2
 
 IMAGE_N = {
     "image_prompt": "1004",
@@ -498,15 +488,430 @@ def extract_fps(video_style: str) -> int:
     return int(m.group(1)) if m else 24
 
 
+APOSTROPHE_CHARS = "'’‘ʼ`´"
+WORD_JOIN_CHARS = "-" + APOSTROPHE_CHARS
+
+
 def norm_word(s: str) -> str:
     s = s.casefold().replace("\u0451", "\u0435").replace("\u0401", "\u0435")
+    for ch in APOSTROPHE_CHARS:
+        s = s.replace(ch, "'")
     s = re.sub(r"[^\w]+", "", s, flags=re.U)
     return s
 
 
 def lyric_words(text: str) -> List[str]:
-    return [w for w in re.findall(r"\w+(?:[-\']\w+)?", text, flags=re.U) if norm_word(w)]
+    # Keep contractions as a single display token. Stable-ts often returns
+    # words such as should’ve / shouldn’t as one word; splitting lyrics on
+    # curly apostrophes made subtitles render them as "should ve".
+    joiners = re.escape(WORD_JOIN_CHARS)
+    pattern = rf"\w+(?:[{joiners}]\w+)*"
+    return [w for w in re.findall(pattern, text, flags=re.U) if norm_word(w)]
 
+
+
+
+def is_alignment_meta_token(text: str) -> bool:
+    stripped = str(text).strip()
+    return (
+        stripped == "***"
+        or (len(stripped) >= 2 and stripped.startswith("[") and stripped.endswith("]"))
+        or stripped.startswith("[")
+        or stripped.endswith("]")
+    )
+
+
+def clean_lyrics_for_alignment_text(lyrics_text: str) -> str:
+    """Return lyrics containing only sung lines.
+
+    Bracket directive lines and *** range separators are excluded before
+    stable-ts alignment.
+    """
+    out: List[str] = []
+    for raw_line in lyrics_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "***":
+            out.append("")
+            continue
+        if is_bracket_directive_line(line):
+            continue
+        out.append(line)
+    text = "\n".join(out)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text + "\n" if text else ""
+
+
+def write_clean_alignment_lyrics(input_dir: Path, output_dir: Path, debug_dir: Path) -> Path:
+    lyrics_path = input_dir / "lyrics.txt"
+    if not lyrics_path.exists():
+        raise FileNotFoundError(f"Cannot auto-align without lyrics.txt: {lyrics_path}")
+
+    clean_text = clean_lyrics_for_alignment_text(read_text(lyrics_path))
+    if not clean_text.strip():
+        raise RuntimeError(f"No sung lyric lines found in {lyrics_path}")
+
+    out_path = output_dir / "alignment_lyrics_clean.txt"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(clean_text, encoding="utf-8")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    (debug_dir / "alignment_lyrics_clean.txt").write_text(clean_text, encoding="utf-8")
+    return out_path
+
+
+def word_similarity(a: str, b: str) -> float:
+    aa = norm_word(a)
+    bb = norm_word(b)
+    if not aa or not bb:
+        return 0.0
+    if aa == bb:
+        return 1.0
+    return difflib.SequenceMatcher(None, aa, bb).ratio()
+
+
+def word_match_threshold(a: str, b: str, base_threshold: float) -> float:
+    max_len = max(len(norm_word(a)), len(norm_word(b)))
+    if max_len <= 2:
+        return 1.0
+    if max_len <= 4:
+        return max(0.84, base_threshold)
+    return base_threshold
+
+
+def words_are_match(a: str, b: str, base_threshold: float) -> Tuple[bool, float, str]:
+    sim = word_similarity(a, b)
+    threshold = word_match_threshold(a, b, base_threshold)
+    if sim >= 1.0:
+        return True, sim, "match"
+    if sim >= threshold:
+        return True, sim, "fuzzy_match"
+    return False, sim, "mismatch"
+
+
+def expected_words_for_lyrics_verses(lyrics_verses: List[Dict[str, Any]]) -> List[List[str]]:
+    return [lyric_words(str(v.get("text", ""))) for v in lyrics_verses]
+
+
+def find_next_range_prefix(
+    words: List[Dict[str, Any]],
+    cursor: int,
+    next_expected: List[str],
+    lookahead: int,
+    threshold: float,
+) -> Optional[int]:
+    if not next_expected:
+        return None
+
+    prefix = next_expected[:min(3, len(next_expected))]
+    if not prefix:
+        return None
+
+    max_start = min(len(words), cursor + max(1, lookahead))
+    for start in range(cursor, max_start):
+        score = 0
+        checked = 0
+        for j, ew in enumerate(prefix):
+            if start + j >= len(words):
+                break
+            aw = words[start + j]["text"]
+            ok, _, _ = words_are_match(ew, aw, threshold)
+            checked += 1
+            if ok:
+                score += 1
+        if checked >= min(2, len(prefix)) and score >= min(2, len(prefix)):
+            return start
+        if len(prefix) == 1 and checked == 1 and score == 1:
+            return start
+
+    return None
+
+
+def synthesize_word_timing(
+    expected: str,
+    previous_end: Optional[float],
+    next_start: Optional[float],
+) -> Dict[str, Any]:
+    if previous_end is None and next_start is None:
+        start = 0.0
+        end = 0.25
+    elif previous_end is None:
+        end = float(next_start)
+        start = max(0.0, end - 0.25)
+    elif next_start is None:
+        start = float(previous_end)
+        end = start + 0.25
+    else:
+        start = float(previous_end)
+        end = max(start + 0.05, min(float(next_start), start + max(0.05, (float(next_start) - start) / 2.0)))
+
+    return {
+        "text": expected,
+        "aligned_text": None,
+        "start": start,
+        "end": end,
+        "probability": None,
+        "match_status": "missing_expected",
+        "synthetic_timing": True,
+        "similarity": 0.0,
+    }
+
+
+def match_expected_range_words(
+    expected_words: List[str],
+    words: List[Dict[str, Any]],
+    cursor: int,
+    next_expected_words: List[str],
+    config: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+    lookahead = max(1, int(config.get("alignment_match_lookahead_words", 5)))
+    threshold = float(config.get("alignment_match_similarity_threshold", 0.72))
+    out: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+    extras: List[Dict[str, Any]] = []
+    stats = {
+        "expected": len(expected_words),
+        "matched": 0,
+        "fuzzy": 0,
+        "mismatch": 0,
+        "missing": 0,
+        "extra": 0,
+        "start_cursor": cursor,
+        "end_cursor": cursor,
+        "events": events,
+        "extra_actual": extras,
+        "boundary_reason": "expected_exhausted",
+    }
+
+    i = 0
+    previous_end: Optional[float] = None
+
+    while i < len(expected_words):
+        ew = expected_words[i]
+
+        if cursor >= len(words):
+            item = synthesize_word_timing(ew, previous_end, None)
+            out.append(item)
+            stats["missing"] += 1
+            events.append({"status": "missing_expected", "expected": ew, "reason": "no_aligned_words_left"})
+            previous_end = item["end"]
+            i += 1
+            continue
+
+        # If the next range prefix is already here and we still have expected
+        # words in current range, close current range with synthetic missing
+        # words rather than stealing the next range.
+        next_prefix_pos = find_next_range_prefix(words, cursor, next_expected_words, lookahead, threshold)
+        if next_prefix_pos == cursor and i > 0:
+            stats["boundary_reason"] = "next_range_prefix_detected"
+            while i < len(expected_words):
+                item = synthesize_word_timing(expected_words[i], previous_end, words[cursor]["start"])
+                out.append(item)
+                stats["missing"] += 1
+                events.append({"status": "missing_expected", "expected": expected_words[i], "reason": "next_range_prefix_detected"})
+                previous_end = item["end"]
+                i += 1
+            break
+
+        aw = words[cursor]
+        ok, sim, status = words_are_match(ew, str(aw["text"]), threshold)
+        if ok:
+            item = {
+                "text": ew,
+                "aligned_text": aw["text"],
+                "start": aw["start"],
+                "end": aw["end"],
+                "probability": aw.get("probability"),
+                "match_status": status,
+                "synthetic_timing": False,
+                "similarity": sim,
+            }
+            out.append(item)
+            stats["matched"] += 1
+            if status == "fuzzy_match":
+                stats["fuzzy"] += 1
+            events.append({
+                "status": status,
+                "expected": ew,
+                "actual": aw["text"],
+                "start": aw["start"],
+                "end": aw["end"],
+                "similarity": sim,
+            })
+            previous_end = item["end"]
+            cursor += 1
+            i += 1
+            continue
+
+        # Look ahead actual words for current expected word. Skipped actuals
+        # become extra and are not used in subtitles.
+        found_actual: Optional[int] = None
+        found_sim = 0.0
+        found_status = "mismatch"
+        max_actual = min(len(words), cursor + lookahead + 1)
+        for j in range(cursor + 1, max_actual):
+            ok2, sim2, status2 = words_are_match(ew, str(words[j]["text"]), threshold)
+            if ok2:
+                found_actual = j
+                found_sim = sim2
+                found_status = status2
+                break
+
+        # Look ahead expected words for current actual word. Missing expected
+        # words get synthetic timing.
+        found_expected: Optional[int] = None
+        found_expected_sim = 0.0
+        found_expected_status = "mismatch"
+        max_expected = min(len(expected_words), i + lookahead + 1)
+        for k in range(i + 1, max_expected):
+            ok3, sim3, status3 = words_are_match(expected_words[k], str(aw["text"]), threshold)
+            if ok3:
+                found_expected = k
+                found_expected_sim = sim3
+                found_expected_status = status3
+                break
+
+        if found_actual is not None and (found_expected is None or (found_actual - cursor) <= (found_expected - i)):
+            for j in range(cursor, found_actual):
+                extra = words[j]
+                extra_event = {
+                    "status": "extra_actual",
+                    "actual": extra["text"],
+                    "start": extra["start"],
+                    "end": extra["end"],
+                }
+                extras.append(extra_event)
+                events.append(extra_event)
+                stats["extra"] += 1
+            aw2 = words[found_actual]
+            item = {
+                "text": ew,
+                "aligned_text": aw2["text"],
+                "start": aw2["start"],
+                "end": aw2["end"],
+                "probability": aw2.get("probability"),
+                "match_status": found_status,
+                "synthetic_timing": False,
+                "similarity": found_sim,
+            }
+            out.append(item)
+            stats["matched"] += 1
+            if found_status == "fuzzy_match":
+                stats["fuzzy"] += 1
+            events.append({
+                "status": found_status,
+                "expected": ew,
+                "actual": aw2["text"],
+                "start": aw2["start"],
+                "end": aw2["end"],
+                "similarity": found_sim,
+                "after_extra_actual": found_actual - cursor,
+            })
+            previous_end = item["end"]
+            cursor = found_actual + 1
+            i += 1
+            continue
+
+        if found_expected is not None:
+            for k in range(i, found_expected):
+                item = synthesize_word_timing(expected_words[k], previous_end, aw["start"])
+                out.append(item)
+                stats["missing"] += 1
+                events.append({
+                    "status": "missing_expected",
+                    "expected": expected_words[k],
+                    "reason": "later_expected_matches_current_actual",
+                })
+                previous_end = item["end"]
+            ew2 = expected_words[found_expected]
+            item = {
+                "text": ew2,
+                "aligned_text": aw["text"],
+                "start": aw["start"],
+                "end": aw["end"],
+                "probability": aw.get("probability"),
+                "match_status": found_expected_status,
+                "synthetic_timing": False,
+                "similarity": found_expected_sim,
+            }
+            out.append(item)
+            stats["matched"] += 1
+            if found_expected_status == "fuzzy_match":
+                stats["fuzzy"] += 1
+            events.append({
+                "status": found_expected_status,
+                "expected": ew2,
+                "actual": aw["text"],
+                "start": aw["start"],
+                "end": aw["end"],
+                "similarity": found_expected_sim,
+                "after_missing_expected": found_expected - i,
+            })
+            previous_end = item["end"]
+            cursor += 1
+            i = found_expected + 1
+            continue
+
+        # Last-resort pair as mismatch to keep time moving.
+        item = {
+            "text": ew,
+            "aligned_text": aw["text"],
+            "start": aw["start"],
+            "end": aw["end"],
+            "probability": aw.get("probability"),
+            "match_status": "mismatch",
+            "synthetic_timing": False,
+            "similarity": sim,
+        }
+        out.append(item)
+        stats["mismatch"] += 1
+        events.append({
+            "status": "mismatch",
+            "expected": ew,
+            "actual": aw["text"],
+            "start": aw["start"],
+            "end": aw["end"],
+            "similarity": sim,
+        })
+        previous_end = item["end"]
+        cursor += 1
+        i += 1
+
+    stats["end_cursor"] = cursor
+    return out, cursor, stats
+
+
+def split_matched_words_into_lines(
+    ly: Dict[str, Any],
+    matched_words: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    cursor = 0
+    out_lines: List[Dict[str, Any]] = []
+
+    for li, line_text in enumerate(ly["lines_text"], 1):
+        expected_line_words = lyric_words(line_text)
+        count = len(expected_line_words)
+        line_words = matched_words[cursor:cursor + count]
+        cursor += count
+
+        if line_words:
+            start = float(line_words[0]["start"])
+            end = float(line_words[-1]["end"])
+        elif out_lines:
+            start = float(out_lines[-1]["end"])
+            end = start + 0.25
+        else:
+            start = end = 0.0
+
+        out_lines.append({
+            "index": li,
+            "text": line_text,
+            "start": start,
+            "end": max(start + 0.01, end),
+            "words": line_words,
+        })
+
+    return out_lines
 
 
 def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
@@ -526,6 +931,8 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         source = str(override_path)
 
     required = {
+        "comfy_url": str,
+        "comfy_output_dir": str,
         "width": int,
         "height": int,
         "fps": int,
@@ -537,6 +944,10 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         "range_visual_preroll_seconds": (int, float),
         "subtitle_line_preroll_seconds": (int, float),
         "min_karaoke_unit_seconds": (int, float),
+        "alignment_match_lookahead_words": int,
+        "alignment_match_similarity_threshold": (int, float),
+        "alignment_match_warn_ratio": (int, float),
+        "alignment_match_max_extra_ratio": (int, float),
     }
 
     for key, expected_type in required.items():
@@ -545,6 +956,8 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         if not isinstance(config[key], expected_type):
             raise RuntimeError(f"Bad config key {key}: expected {expected_type}, got {type(config[key]).__name__}")
 
+    config["comfy_url"] = str(config["comfy_url"])
+    config["comfy_output_dir"] = str(config["comfy_output_dir"])
     config["width"] = int(config["width"])
     config["height"] = int(config["height"])
     config["fps"] = int(config["fps"])
@@ -556,6 +969,10 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
     config["range_visual_preroll_seconds"] = float(config["range_visual_preroll_seconds"])
     config["subtitle_line_preroll_seconds"] = float(config["subtitle_line_preroll_seconds"])
     config["min_karaoke_unit_seconds"] = float(config["min_karaoke_unit_seconds"])
+    config["alignment_match_lookahead_words"] = int(config["alignment_match_lookahead_words"])
+    config["alignment_match_similarity_threshold"] = float(config["alignment_match_similarity_threshold"])
+    config["alignment_match_warn_ratio"] = float(config["alignment_match_warn_ratio"])
+    config["alignment_match_max_extra_ratio"] = float(config["alignment_match_max_extra_ratio"])
     config["_source"] = source
     return config
 
@@ -791,73 +1208,83 @@ def extract_json_words(data: Any) -> List[Dict[str, Any]]:
     return words
 
 
-def build_verses_from_json_words(words: List[Dict[str, Any]], lyrics_verses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Use *** words as verse boundaries, then map timings to original lyrics words.
-    verse_word_chunks: List[List[Dict[str, Any]]] = []
-    cur: List[Dict[str, Any]] = []
+def build_verses_from_json_words(
+    words: List[Dict[str, Any]],
+    lyrics_verses: List[Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Match clean lyrics.txt ranges against a sequential alignment word stream.
+
+    lyrics.txt is the source of semantic ranges. alignment.json is only timing
+    evidence. This function does not require *** in alignment.json.
+    """
+    config = config or {}
+
+    ignored_meta_words: List[Dict[str, Any]] = []
+    clean_words: List[Dict[str, Any]] = []
     for w in words:
-        if "***" in w["text"]:
-            if cur:
-                verse_word_chunks.append(cur)
-                cur = []
-            continue
-        cur.append(w)
-    if cur:
-        verse_word_chunks.append(cur)
+        if is_alignment_meta_token(str(w.get("text", ""))):
+            ignored_meta_words.append(w)
+        else:
+            clean_words.append(w)
 
-    verses: List[Dict[str, Any]] = []
-    n = min(len(verse_word_chunks), len(lyrics_verses)) if lyrics_verses else len(verse_word_chunks)
+    report: Dict[str, Any] = {
+        "mode": "lyrics_driven_fuzzy_sequential",
+        "alignment_words_total": len(words),
+        "alignment_words_clean": len(clean_words),
+        "ignored_meta_words": ignored_meta_words,
+        "ranges": [],
+        "trailing_extra_actual": [],
+    }
 
-    for i in range(n):
-        chunk = verse_word_chunks[i]
-        ly = lyrics_verses[i] if lyrics_verses else {
-            "text": " ".join(w["text"] for w in chunk),
-            "lines_text": [" ".join(w["text"] for w in chunk)],
+    if not lyrics_verses:
+        # Fallback when lyrics.txt is absent: treat the whole alignment as one range.
+        ly = {
+            "index": 1,
+            "text": " ".join(w["text"] for w in clean_words),
+            "lines_text": [" ".join(w["text"] for w in clean_words)],
             "bracket_directives": [],
         }
+        lyrics_verses = [ly]
 
-        # Sequentially allocate word timings to original lyric lines.
-        cursor = 0
-        out_lines: List[Dict[str, Any]] = []
-        for li, line_text in enumerate(ly["lines_text"], 1):
-            expected_words = lyric_words(line_text)
-            line_words: List[Dict[str, Any]] = []
-            for ew in expected_words:
-                if cursor >= len(chunk):
-                    break
-                aw = chunk[cursor]
-                cursor += 1
-                line_words.append({
-                    "text": ew,
-                    "aligned_text": aw["text"],
-                    "start": aw["start"],
-                    "end": aw["end"],
-                    "probability": aw.get("probability"),
-                })
-            if line_words:
-                start = line_words[0]["start"]
-                end = line_words[-1]["end"]
-            elif out_lines:
-                start = out_lines[-1]["end"]
-                end = start + 0.25
-            elif chunk:
-                start = chunk[0]["start"]
-                end = start + 0.25
-            else:
-                start = end = 0.0
+    all_expected = expected_words_for_lyrics_verses(lyrics_verses)
+    cursor = 0
+    verses: List[Dict[str, Any]] = []
 
-            out_lines.append({
-                "index": li,
-                "text": line_text,
-                "start": start,
-                "end": end,
-                "words": line_words,
-            })
+    for i, ly in enumerate(lyrics_verses):
+        expected_words = all_expected[i]
+        next_expected = all_expected[i + 1] if i + 1 < len(all_expected) else []
+        matched_words, cursor, range_report = match_expected_range_words(
+            expected_words,
+            clean_words,
+            cursor,
+            next_expected,
+            config,
+        )
 
-        start = out_lines[0]["start"] if out_lines else (chunk[0]["start"] if chunk else 0)
-        end = out_lines[-1]["end"] if out_lines else (chunk[-1]["end"] if chunk else start)
-        if chunk:
-            end = max(end, chunk[-1]["end"])
+        out_lines = split_matched_words_into_lines(ly, matched_words)
+
+        starts = [float(w["start"]) for w in matched_words if w.get("start") is not None]
+        ends = [float(w["end"]) for w in matched_words if w.get("end") is not None]
+        if starts and ends:
+            start = min(starts)
+            end = max(ends)
+        elif out_lines:
+            start = float(out_lines[0]["start"])
+            end = float(out_lines[-1]["end"])
+        else:
+            start = end = 0.0
+
+        verse_report = {
+            "range_index": i + 1,
+            "lyric_index": ly.get("index", i + 1),
+            "text_preview": str(ly.get("text", "")).splitlines()[0] if str(ly.get("text", "")).splitlines() else "",
+            **range_report,
+            "start": start,
+            "end": end,
+            "duration": max(0.01, end - start),
+        }
+        report["ranges"].append(verse_report)
 
         verses.append({
             "index": i + 1,
@@ -868,72 +1295,406 @@ def build_verses_from_json_words(words: List[Dict[str, Any]], lyrics_verses: Lis
             "lines": out_lines,
             "alignment_mode": "word_json",
             "bracket_directives": list(ly.get("bracket_directives", [])),
+            "alignment_match": verse_report,
         })
 
-    return verses
+    # Any remaining actual words are extra. They are not used in subtitles.
+    while cursor < len(clean_words):
+        w = clean_words[cursor]
+        report["trailing_extra_actual"].append({
+            "actual": w.get("text"),
+            "start": w.get("start"),
+            "end": w.get("end"),
+        })
+        cursor += 1
+
+    return verses, report
 
 
-def parse_alignment(input_dir: Path, debug_dir: Path) -> Tuple[List[Dict[str, Any]], str]:
+
+def run_stable_ts_alignment(
+    input_dir: Path,
+    out_dir: Path,
+    debug_dir: Path,
+    stable_ts_cmd: str,
+    language: str,
+) -> Path:
+    """Run stable-ts using vocals and a cleaned sung-only lyric file."""
+    source_kind, align_audio, _ = detect_alignment_source(input_dir)
+    if source_kind != "vocals":
+        raise RuntimeError("stable-ts alignment requires input/vocals.*")
+
+    align_dir = out_dir / "alignment"
+    clean_lyrics = write_clean_alignment_lyrics(input_dir, align_dir, debug_dir)
+    out_json = align_dir / "alignment.json"
+
+    cmd = [
+        stable_ts_cmd,
+        str(align_audio),
+        "--align", str(clean_lyrics),
+        "--language", str(language),
+        "-o", str(out_json),
+    ]
+
+    log("[stage] align vocals with stable-ts")
+    log(f"  [align] audio : {align_audio}")
+    log(f"  [align] lyrics: {clean_lyrics}")
+    log(f"  [align] lang  : {language}")
+    log(f"  [align] out   : {out_json}")
+    write_json(debug_dir / "stable_ts_alignment_command.json", {
+        "command": cmd,
+        "audio_mode": source_kind,
+        "audio": str(align_audio),
+        "lyrics": str(clean_lyrics),
+        "language": language,
+        "output": str(out_json),
+    })
+
+    run_cmd(cmd)
+    if not out_json.exists():
+        raise RuntimeError(f"stable-ts did not create alignment JSON: {out_json}")
+    return out_json
+
+
+
+def build_verses_from_lrc_and_lyrics(
+    lrc_lines: List[Dict[str, Any]],
+    lyrics_verses: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Match LRC sung lines to lyrics.txt semantic ranges.
+
+    lyrics.txt defines semantic ranges and bracket metadata. LRC provides
+    line-level timing and may contain [metadata] and *** separator lines, which
+    are ignored for subtitles and used only as structure/boundary hints.
+    """
+    clean_lines: List[Dict[str, Any]] = []
+    ignored_lines: List[Dict[str, Any]] = []
+
+    for line in lrc_lines:
+        text = str(line.get("text", "")).strip()
+        if text == "***":
+            ignored_lines.append({**line, "reason": "separator"})
+            continue
+        if is_bracket_directive_line(text):
+            ignored_lines.append({**line, "reason": "bracket_directive"})
+            continue
+        if not text:
+            ignored_lines.append({**line, "reason": "empty"})
+            continue
+        clean_lines.append(line)
+
+    report: Dict[str, Any] = {
+        "mode": "lyrics_driven_lrc_line_matching",
+        "lrc_lines_total": len(lrc_lines),
+        "lrc_lines_clean": len(clean_lines),
+        "ignored_lrc_lines": ignored_lines,
+        "ranges": [],
+        "trailing_extra_lrc_lines": [],
+    }
+
+    if not lyrics_verses:
+        raise RuntimeError("lyrics.txt is required for LRC semantic range matching")
+
+    verses: List[Dict[str, Any]] = []
+    cursor = 0
+
+    for vi, ly in enumerate(lyrics_verses):
+        expected_lines = list(ly.get("lines_text", []))
+        matched_lines = clean_lines[cursor:cursor + len(expected_lines)]
+        cursor += len(expected_lines)
+
+        out_lines: List[Dict[str, Any]] = []
+        for li, lyric_line in enumerate(expected_lines, 1):
+            if li - 1 < len(matched_lines):
+                lrc_line = matched_lines[li - 1]
+                start = float(lrc_line["start"])
+                end = float(lrc_line.get("end", start + 2.0))
+                out_lines.append({
+                    "index": li,
+                    "text": lyric_line,
+                    "aligned_text": lrc_line.get("text", ""),
+                    "start": start,
+                    "end": max(start + 0.01, end),
+                    "words": [],
+                })
+            else:
+                if out_lines:
+                    start = float(out_lines[-1]["end"])
+                elif verses:
+                    start = float(verses[-1]["end"])
+                else:
+                    start = 0.0
+                out_lines.append({
+                    "index": li,
+                    "text": lyric_line,
+                    "aligned_text": None,
+                    "start": start,
+                    "end": start + 2.0,
+                    "words": [],
+                    "synthetic_timing": True,
+                })
+
+        if out_lines:
+            start = float(out_lines[0]["start"])
+            end = float(out_lines[-1]["end"])
+        else:
+            start = float(verses[-1]["end"]) if verses else 0.0
+            end = start + 0.01
+
+        line_mismatches = 0
+        for line in out_lines:
+            aligned_text = str(line.get("aligned_text") or "")
+            if aligned_text:
+                expected_norm = [norm_word(x) for x in lyric_words(line["text"])]
+                actual_norm = [norm_word(x) for x in lyric_words(aligned_text)]
+                if expected_norm != actual_norm:
+                    line_mismatches += 1
+
+        range_report = {
+            "range_index": vi + 1,
+            "lyric_index": ly.get("index", vi + 1),
+            "expected_lines": len(expected_lines),
+            "matched_lines": len(matched_lines),
+            "missing_lines": max(0, len(expected_lines) - len(matched_lines)),
+            "line_mismatches": line_mismatches,
+            "start": start,
+            "end": end,
+            "duration": max(0.01, end - start),
+        }
+        report["ranges"].append(range_report)
+
+        verses.append({
+            "index": vi + 1,
+            "start": start,
+            "end": end,
+            "duration": max(0.01, end - start),
+            "text": ly.get("text", "\n".join(expected_lines)),
+            "lines": out_lines,
+            "alignment_mode": "line_lrc",
+            "bracket_directives": list(ly.get("bracket_directives", [])),
+            "alignment_match": range_report,
+        })
+
+    for line in clean_lines[cursor:]:
+        report["trailing_extra_lrc_lines"].append({
+            "text": line.get("text"),
+            "start": line.get("start"),
+            "end": line.get("end"),
+        })
+
+    return verses, report
+
+
+def write_lrc_match_report(report: Dict[str, Any], out_path: Path) -> None:
+    lines: List[str] = []
+    lines.append(f"mode             : {report.get('mode')}")
+    lines.append(f"lrc lines total  : {report.get('lrc_lines_total')}")
+    lines.append(f"lrc lines clean  : {report.get('lrc_lines_clean')}")
+    lines.append(f"ignored lines    : {len(report.get('ignored_lrc_lines', []))}")
+    lines.append(f"trailing extra   : {len(report.get('trailing_extra_lrc_lines', []))}")
+    for r in report.get("ranges", []):
+        status = "OK" if not r.get("missing_lines") and not r.get("line_mismatches") else "WARN"
+        lines.append(
+            f"range {int(r.get('range_index', 0)):03d}: {status}; "
+            f"expected_lines={r.get('expected_lines')}; matched_lines={r.get('matched_lines')}; "
+            f"missing_lines={r.get('missing_lines')}; line_mismatches={r.get('line_mismatches')}; "
+            f"duration={float(r.get('duration', 0)):.2f}s"
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def parse_alignment(
+    input_dir: Path,
+    alignment_dir: Path,
+    debug_dir: Path,
+    config: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], str]:
     lyrics_text = read_text(input_dir / "lyrics.txt", required=False)
     lyrics_verses = parse_lyrics_txt(lyrics_text) if lyrics_text else []
 
-    json_path = input_dir / "alignment.json"
-    lrc_path = input_dir / "alignment.lrc"
+    json_path = alignment_dir / "alignment.json"
+    lrc_path = alignment_dir / "alignment.lrc"
 
     if json_path.exists():
         data = load_json(json_path)
         words = extract_json_words(data)
         if not words:
             raise RuntimeError(f"No word timestamps found in {json_path}")
-
         if not lyrics_verses:
-            lyrics_verses = parse_alignment_top_text_as_lyrics(data)
-            if lyrics_verses:
-                log("[stage] WARNING: no lyrics.txt; using flattened alignment.json text split by ***")
-            else:
-                log("[stage] WARNING: no lyrics.txt and no usable top-level alignment text; using word chunks only")
+            raise RuntimeError("lyrics.txt is required for generated alignment.json parsing")
 
-        verses = build_verses_from_json_words(words, lyrics_verses)
+        verses, match_report = build_verses_from_json_words(words, lyrics_verses, config)
         write_json(debug_dir / "json_words.json", words[:200])
+        write_json(debug_dir / "alignment_match_report.json", match_report)
+        write_json(debug_dir / "alignment_ignored_meta_words.json", match_report.get("ignored_meta_words", []))
         return verses, "json"
 
     if lrc_path.exists():
         lrc_lines = parse_lrc(lrc_path)
         if not lrc_lines:
             raise RuntimeError(f"No LRC lines found in {lrc_path}")
-        verses = build_verses_from_lrc(lrc_lines)
-        if lyrics_verses and len(lyrics_verses) == len(verses):
-            for verse, lyric_verse in zip(verses, lyrics_verses):
-                verse["bracket_directives"] = list(lyric_verse.get("bracket_directives", []))
-        else:
-            for verse in verses:
-                verse.setdefault("bracket_directives", [])
+        if not lyrics_verses:
+            raise RuntimeError("lyrics.txt is required for LRC semantic range matching")
+
+        verses, lrc_report = build_verses_from_lrc_and_lyrics(lrc_lines, lyrics_verses)
+        write_json(debug_dir / "lrc_match_report.json", lrc_report)
+        write_lrc_match_report(lrc_report, debug_dir / "lrc_match_report.txt")
         return verses, "lrc"
 
-    raise FileNotFoundError(f"No alignment found. Put {input_dir / 'alignment.json'} or {input_dir / 'alignment.lrc'}")
+    raise FileNotFoundError(
+        f"No generated alignment found. Expected {alignment_dir / 'alignment.json'} "
+        f"or {alignment_dir / 'alignment.lrc'}. Run a normal fresh generation first."
+    )
+
+
+
+def resolve_command(candidates: List[Path], fallback: str) -> str:
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    found = shutil.which(fallback)
+    return found or fallback
+
+
+def resolve_stable_ts_command(script_dir: Path) -> str:
+    parent = script_dir.parent
+    candidates = [
+        parent / "stable-ts" / ".venv" / "Scripts" / "stable-ts.exe",
+        parent / "stable-ts" / ".venv" / "bin" / "stable-ts",
+    ]
+    return resolve_command(candidates, "stable-ts")
+
+
+def resolve_ffmpeg_command(script_dir: Path) -> str:
+    parent = script_dir.parent
+    candidates = [
+        parent / "ffmpeg" / "bin" / "ffmpeg.exe",
+        parent / "ffmpeg" / "bin" / "ffmpeg",
+    ]
+    return resolve_command(candidates, "ffmpeg")
+
+
+def resolve_ffprobe_command(script_dir: Path) -> str:
+    parent = script_dir.parent
+    candidates = [
+        parent / "ffmpeg" / "bin" / "ffprobe.exe",
+        parent / "ffmpeg" / "bin" / "ffprobe",
+    ]
+    return resolve_command(candidates, "ffprobe")
+
+
+
+
+def resolve_config_path(path_value: str, script_dir: Path) -> Path:
+    raw = str(path_value).strip()
+    if not raw:
+        raise RuntimeError("Configured path is empty")
+    # Config files commonly use Windows-style separators. Normalize them so
+    # relative sibling paths work consistently in tests and on non-Windows hosts.
+    normalized = raw.replace("\\", "/")
+    path = Path(normalized)
+    if path.is_absolute():
+        return path.resolve()
+    return (script_dir / path).resolve()
+def resolve_stable_ts_command(script_dir: Path) -> str:
+    parent = script_dir.parent
+    candidates = [
+        parent / "stable-ts" / ".venv" / "Scripts" / "stable-ts.exe",
+        parent / "stable-ts" / ".venv" / "bin" / "stable-ts",
+    ]
+    return resolve_command(candidates, "stable-ts")
+
+
+def resolve_ffmpeg_command(script_dir: Path) -> str:
+    parent = script_dir.parent
+    candidates = [
+        parent / "ffmpeg" / "bin" / "ffmpeg.exe",
+        parent / "ffmpeg" / "bin" / "ffmpeg",
+    ]
+    return resolve_command(candidates, "ffmpeg")
+
+
+def resolve_ffprobe_command(script_dir: Path) -> str:
+    parent = script_dir.parent
+    candidates = [
+        parent / "ffmpeg" / "bin" / "ffprobe.exe",
+        parent / "ffmpeg" / "bin" / "ffprobe",
+    ]
+    return resolve_command(candidates, "ffprobe")
+
+
+
+
+
+def find_first_existing(input_dir: Path, stem: str, extensions: Tuple[str, ...] = (".mp3", ".wav", ".m4a", ".flac")) -> Optional[Path]:
+    for ext in extensions:
+        p = input_dir / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def detect_alignment_source(input_dir: Path) -> Tuple[str, Optional[Path], Optional[Path]]:
+    vocals = find_first_existing(input_dir, "vocals")
+    if vocals:
+        return "vocals", vocals, None
+
+    lrc = input_dir / "lyrics.lrc"
+    if lrc.exists():
+        return "lrc", lrc, None
+
+    legacy_lrc = input_dir / "alignment.lrc"
+    if legacy_lrc.exists():
+        return "lrc", legacy_lrc, None
+
+    raise FileNotFoundError(
+        "No alignment source found. Use input/vocals.* for stable-ts word alignment, "
+        "or input/lyrics.lrc for line-level timing when only full audio is available."
+    )
+
+
+def find_first_existing(input_dir: Path, stem: str, extensions: Tuple[str, ...] = (".mp3", ".wav", ".m4a", ".flac")) -> Optional[Path]:
+    for ext in extensions:
+        p = input_dir / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def detect_alignment_source(input_dir: Path) -> Tuple[str, Path, Optional[Path]]:
+    vocals = find_first_existing(input_dir, "vocals")
+    if vocals:
+        return "vocals", vocals, None
+
+    lrc = input_dir / "alignment.lrc"
+    if lrc.exists():
+        return "lrc", lrc, None
+
+    raise FileNotFoundError(
+        "No alignment source found. Use input/vocals.* for stable-ts word alignment, "
+        "or input/alignment.lrc for line-level timing when only full audio is available."
+    )
 
 
 def detect_audio(input_dir: Path) -> Tuple[str, Path, Optional[Path]]:
-    vocals = input_dir / "vocals.mp3"
-    instrumental = input_dir / "instrumental.mp3"
-    full = input_dir / "audio.mp3"
+    """Detect audio used for final video.
 
-    if vocals.exists() and instrumental.exists():
-        return "stems", vocals, instrumental
-    if full.exists():
+    Prefer input/audio.* if present. Use vocals+instrumental mix only when full
+    audio is absent.
+    """
+    full = find_first_existing(input_dir, "audio")
+    if full:
         return "full", full, None
 
-    # Accept common wav/m4a fallbacks.
-    for ext in (".wav", ".m4a", ".flac"):
-        vocals2 = input_dir / f"vocals{ext}"
-        instrumental2 = input_dir / f"instrumental{ext}"
-        full2 = input_dir / f"audio{ext}"
-        if vocals2.exists() and instrumental2.exists():
-            return "stems", vocals2, instrumental2
-        if full2.exists():
-            return "full", full2, None
+    vocals = find_first_existing(input_dir, "vocals")
+    instrumental = find_first_existing(input_dir, "instrumental")
+    if vocals and instrumental:
+        return "stems", vocals, instrumental
 
-    raise FileNotFoundError("No audio found. Use input/audio.mp3 or input/vocals.mp3 + input/instrumental.mp3")
+    raise FileNotFoundError("No final audio found. Use input/audio.* or input/vocals.* + input/instrumental.*")
 
 
 def prepare_audio(
@@ -1003,6 +1764,19 @@ def centiseconds(duration: float) -> int:
     return max(1, int(round(duration * 100)))
 
 
+def build_karaoke_delay(duration: float) -> str:
+    """Consume karaoke time without highlighting the next visible syllable.
+
+    ASS karaoke timing must be attached to text. A bare "{\\kN}" before a
+    visible word can be rendered as part of that next word, making preroll or
+    inter-word gaps highlight too early. Use a transparent zero-width syllable
+    to consume the gap while the full line remains visible in its unsung state.
+    """
+    if duration <= 0:
+        return ""
+    return r"{\alpha&HFF&\k" + str(centiseconds(duration)) + "}​" + r"{\alpha&H00&}"
+
+
 
 def is_karaoke_timed_char(ch: str) -> bool:
     """Return True for characters that should receive their own karaoke duration."""
@@ -1054,7 +1828,7 @@ def build_word_karaoke_line(
     """Build word-level karaoke while preserving gaps between word timestamps.
 
     event_start is the ASS Dialogue start after shift. Silent karaoke gaps are
-    inserted before words so the line can appear earlier in unsung state.
+    inserted before words so pauses do not make the next word highlight early.
     """
     words = line.get("words", []) or []
     if not words:
@@ -1064,7 +1838,7 @@ def build_word_karaoke_line(
             event_start = line_start
         lead = max(0.0, line_start - event_start)
         body = build_char_karaoke_text(str(line["text"]), max(min_unit, line_end - line_start), min_unit)
-        return (r"{\k" + str(centiseconds(lead)) + "}" if lead > 0 else "") + body
+        return build_karaoke_delay(lead) + body
 
     if event_start is None:
         event_start = min(float(w.get("start", line["start"])) for w in words) - shift
@@ -1083,7 +1857,7 @@ def build_word_karaoke_line(
 
         gap = max(0.0, ws - current)
         if gap > 0:
-            pieces.append(r"{\k" + str(centiseconds(gap)) + "}")
+            pieces.append(build_karaoke_delay(gap))
 
         pieces.append(build_char_karaoke_text(str(w.get("text", "")), max(min_unit, we - ws), min_unit))
         current = max(current, we)
@@ -1093,6 +1867,13 @@ def build_word_karaoke_line(
 
     line_duration = max(min_unit, float(line["end"]) - float(line["start"]))
     return build_char_karaoke_text(str(line["text"]), line_duration, min_unit)
+
+
+
+
+def build_plain_subtitle_text(text: str) -> str:
+    """Build normal visible subtitle text without karaoke timing tags."""
+    return ass_escape(text).replace("\n", r"\N")
 
 
 
@@ -1354,13 +2135,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             end = max(display_start + 0.1, raw_line_end)
 
             if mode == "word" and line.get("words"):
-                text = build_word_karaoke_line(line, shift, display_start, min_unit)
+                karaoke_text = build_word_karaoke_line(line, shift, display_start, min_unit)
             else:
                 lead = max(0.0, raw_line_start - display_start)
                 body = build_char_karaoke_text(str(line["text"]), max(min_unit, raw_line_end - raw_line_start), min_unit)
-                text = (r"{\k" + str(centiseconds(lead)) + "}" if lead > 0 else "") + body
+                karaoke_text = build_karaoke_delay(lead) + body
+            events.append(f"Dialogue: 0,{ass_timestamp(display_start)},{ass_timestamp(end)},{style},,0,0,0,,{karaoke_text}")
 
-            events.append(f"Dialogue: 0,{ass_timestamp(display_start)},{ass_timestamp(end)},{style},,0,0,0,,{text}")
             timing_report.append({
                 "verse_index": verse_index,
                 "block_index": block_index,
@@ -1427,6 +2208,37 @@ def final_mux(video_in: Path, audio_in: Path, ass_path: Path, out: Path, ffmpeg:
     run_cmd([
         ffmpeg, "-y",
         "-i", str(video_in),
+        "-i", str(audio_in),
+        "-vf", f"subtitles='{sub_arg}'",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-shortest",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(out),
+    ])
+
+
+def render_subtitle_preview(
+    audio_in: Path,
+    ass_path: Path,
+    out: Path,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+    ffmpeg: str,
+) -> None:
+    """Render a quick black-screen karaoke preview with final audio and subtitles."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sub_arg = ffmpeg_sub_path(ass_path)
+    run_cmd([
+        ffmpeg, "-y",
+        "-f", "lavfi",
+        "-i", f"color=c=black:s={width}x{height}:r={fps}:d={duration:.3f}",
         "-i", str(audio_in),
         "-vf", f"subtitles='{sub_arg}'",
         "-map", "0:v:0",
@@ -1749,7 +2561,7 @@ def format_verse_context(verse: Dict[str, Any], label: str) -> str:
     return f"{label} {int(verse['index']):03d}:{directive_text}\nLyrics:\n{verse.get('text', '')}"
 
 
-def build_local_context(verses: List[Dict[str, Any]], verse_index: int, radius: int = LOCAL_CONTEXT_RADIUS) -> str:
+def build_local_context(verses: List[Dict[str, Any]], verse_index: int, radius: int) -> str:
     count = max(1, int(radius))
     if verse_index <= 0:
         early = verses[:count]
@@ -2171,6 +2983,10 @@ def instrumental_gap_threshold(verses: List[Dict[str, Any]], config: Dict[str, A
     )
 
 
+
+
+def should_create_silent_gap_block(gap_duration: float, verses: List[Dict[str, Any]], config: Dict[str, Any]) -> bool:
+    return float(gap_duration) >= instrumental_gap_threshold(verses, config)
 def make_timeline_blocks(
     all_verses: List[Dict[str, Any]],
     selected_verses: List[Dict[str, Any]],
@@ -2180,15 +2996,13 @@ def make_timeline_blocks(
 ) -> Tuple[List[Dict[str, Any]], Optional[float]]:
     """Create continuous visual timeline blocks.
 
-    Lyric timing remains unchanged. For lyric blocks, visual_start may move
-    slightly earlier into lyric-free gap by range_visual_preroll_seconds so the
-    new scene can appear before the first sung word.
+    Lyric timing remains unchanged. Short intro/outro gaps are merged into the
+    first/last lyric range using the same threshold as instrumental gaps.
     """
     total = len(all_verses)
     selected_count = len(selected_verses)
     full_song = selected_count >= total and not has_limit
 
-    # If --limit N where N == total, treat as full song equivalent.
     if selected_count >= total:
         full_song = True
 
@@ -2202,11 +3016,8 @@ def make_timeline_blocks(
 
     blocks: List[Dict[str, Any]] = []
     next_block_index = 0
-    threshold = instrumental_gap_threshold(all_verses, config)
     desired_preroll = max(0.0, float(config.get("range_visual_preroll_seconds", 0.0)))
 
-    # Compute visual starts for selected lyric verses. Preroll is taken only from
-    # lyric-free gap before the verse, never from time where previous lyrics sing.
     visual_starts: List[float] = []
     previous_lyric_end = 0.0
     for verse in selected_verses:
@@ -2216,10 +3027,10 @@ def make_timeline_blocks(
         visual_starts.append(max(0.0, lyric_start - actual_preroll))
         previous_lyric_end = float(verse["end"])
 
-    first = selected_verses[0]
     first_visual_start = visual_starts[0]
+    intro_is_separate = should_create_silent_gap_block(first_visual_start, all_verses, config)
 
-    if first_visual_start > 0.05:
+    if intro_is_separate:
         intro_text = (
             "Opening instrumental/intro block for the whole song. "
             "Establish the main setting, recurring characters and mood before the first lyric starts."
@@ -2235,6 +3046,10 @@ def make_timeline_blocks(
             "bracket_directives": [],
         })
         next_block_index += 1
+    else:
+        # Too short to be a meaningful generated clip. Fold it into the first
+        # lyric range so we do not render a 0.x second intro video.
+        visual_starts[0] = 0.0
 
     for pos, verse in enumerate(selected_verses):
         verse_index = int(verse["index"])
@@ -2257,7 +3072,7 @@ def make_timeline_blocks(
             next_verse_index = int(all_verses[selected_count]["index"]) if selected_count < total else None
 
         lyric_gap = max(0.0, next_lyric_start - lyric_end)
-        split_gap = lyric_gap >= threshold and next_lyric_start > lyric_end
+        split_gap = should_create_silent_gap_block(lyric_gap, all_verses, config) and next_lyric_start > lyric_end
 
         verse_end = lyric_end if split_gap else next_visual_start
         if verse_end <= start:
@@ -2281,29 +3096,29 @@ def make_timeline_blocks(
 
         if split_gap:
             instrumental_end = next_visual_start
-            if instrumental_end > lyric_end + 0.05:
-                blocks.append({
-                    "block_index": next_block_index,
-                    "kind": "instrumental",
-                    "verse_index": verse_index,
-                    "previous_verse_index": verse_index,
-                    "next_verse_index": next_verse_index,
-                    "start": lyric_end,
-                    "end": instrumental_end,
-                    "duration": max(0.01, instrumental_end - lyric_end),
-                    "text": (
-                        f"Instrumental break with no sung lyrics between verse {verse_index}"
-                        + (f" and verse {next_verse_index}." if next_verse_index else " and the end of the selected range.")
-                    ),
-                    "bracket_directives": [],
-                })
-                next_block_index += 1
+            blocks.append({
+                "block_index": next_block_index,
+                "kind": "instrumental",
+                "verse_index": verse_index,
+                "previous_verse_index": verse_index,
+                "next_verse_index": next_verse_index,
+                "start": lyric_end,
+                "end": instrumental_end,
+                "duration": max(0.01, instrumental_end - lyric_end),
+                "text": (
+                    f"Instrumental break with no sung lyrics between verse {verse_index}"
+                    + (f" and verse {next_verse_index}." if next_verse_index else " and the end of the selected range.")
+                ),
+                "bracket_directives": [],
+            })
+            next_block_index += 1
 
     if full_song:
         last = selected_verses[-1]
         outro_start = float(last["end"])
         outro_end = audio_duration
-        if outro_end - outro_start > 0.05:
+        outro_duration = max(0.0, outro_end - outro_start)
+        if should_create_silent_gap_block(outro_duration, all_verses, config):
             outro_text = (
                 "Closing instrumental/outro block for the whole song. "
                 "Create a final warm visual tableau that resolves the story without any text."
@@ -2314,10 +3129,15 @@ def make_timeline_blocks(
                 "verse_index": int(last["index"]) + 1,
                 "start": outro_start,
                 "end": outro_end,
-                "duration": max(0.01, outro_end - outro_start),
+                "duration": max(0.01, outro_duration),
                 "text": outro_text,
                 "bracket_directives": [],
             })
+        elif outro_duration > 0.0 and blocks:
+            # Too short for a standalone outro clip; merge into the previous
+            # visual range so final video still covers full audio duration.
+            blocks[-1]["end"] = outro_end
+            blocks[-1]["duration"] = max(0.01, float(blocks[-1]["end"]) - float(blocks[-1]["start"]))
 
     return blocks, audio_end
 
@@ -2370,54 +3190,69 @@ def load_continuity_from_plans(plans_dir: Path, before_block_index: int) -> List
 
 def write_alignment_match_report(verses: List[Dict[str, Any]], out_path: Path) -> None:
     lines: List[str] = []
-    total_lyric = 0
-    total_aligned = 0
-    warnings = 0
+    total_expected = 0
+    total_matched = 0
+    total_fuzzy = 0
+    total_mismatch = 0
+    total_missing = 0
+    total_extra = 0
+    warning_ranges = 0
 
     for verse in verses:
-        lyric_count = 0
-        aligned_count = 0
-        mismatch_count = 0
-        low_prob_count = 0
+        m = verse.get("alignment_match", {})
+        expected = int(m.get("expected", 0))
+        matched = int(m.get("matched", 0))
+        fuzzy = int(m.get("fuzzy", 0))
+        mismatch = int(m.get("mismatch", 0))
+        missing = int(m.get("missing", 0))
+        extra = int(m.get("extra", 0))
+        total_expected += expected
+        total_matched += matched
+        total_fuzzy += fuzzy
+        total_mismatch += mismatch
+        total_missing += missing
+        total_extra += extra
 
-        for line in verse.get("lines", []):
-            for w in line.get("words", []):
-                lyric_count += 1
-                if w.get("aligned_text") is not None:
-                    aligned_count += 1
-                if norm_word(str(w.get("text", ""))) != norm_word(str(w.get("aligned_text", ""))):
-                    mismatch_count += 1
-                prob = w.get("probability")
-                if isinstance(prob, (int, float)) and prob < 0.15:
-                    low_prob_count += 1
-
-        total_lyric += lyric_count
-        total_aligned += aligned_count
-
+        bad = mismatch + missing
         status = "OK"
-        notes: List[str] = []
-        if mismatch_count:
+        if bad or extra or fuzzy:
             status = "WARN"
-            warnings += 1
-            notes.append(f"mismatches={mismatch_count}")
-        if low_prob_count:
-            status = "WARN"
-            warnings += 1
-            notes.append(f"low_probability={low_prob_count}")
-        if not lyric_count and verse.get("alignment_mode") == "word_json":
-            status = "WARN"
-            warnings += 1
-            notes.append("no_words")
+            warning_ranges += 1
 
         lines.append(
-            f"verse {int(verse.get('index', 0)):03d}: {status}; "
+            f"range {int(verse.get('index', 0)):03d}: {status}; "
             f"duration={float(verse.get('duration', 0)):.2f}s; "
-            f"words={lyric_count}; " + (", ".join(notes) if notes else "clean")
+            f"expected={expected}; matched={matched}; fuzzy={fuzzy}; "
+            f"missing={missing}; mismatch={mismatch}; extra_actual={extra}; "
+            f"boundary={m.get('boundary_reason', '')}"
         )
 
-    lines.insert(0, f"total lyric words : {total_lyric}")
-    lines.insert(1, f"total aligned words: {total_aligned}")
-    lines.insert(2, f"warning verses     : {warnings}")
+        events = m.get("events", [])
+        interesting = [e for e in events if e.get("status") != "match"]
+        for e in interesting[:25]:
+            status_e = e.get("status")
+            if status_e == "extra_actual":
+                lines.append(
+                    f"  extra actual {e.get('actual')!r} "
+                    f"{float(e.get('start', 0)):.2f}..{float(e.get('end', 0)):.2f}"
+                )
+            elif status_e == "missing_expected":
+                lines.append(f"  missing expected {e.get('expected')!r}; reason={e.get('reason', '')}")
+            else:
+                lines.append(
+                    f"  {status_e}: expected={e.get('expected')!r}; actual={e.get('actual')!r}; "
+                    f"sim={float(e.get('similarity', 0)):.3f}"
+                )
+        if len(interesting) > 25:
+            lines.append(f"  ... {len(interesting) - 25} more non-exact events")
+
+    lines.insert(0, f"total expected words : {total_expected}")
+    lines.insert(1, f"total matched words  : {total_matched}")
+    lines.insert(2, f"total fuzzy matches  : {total_fuzzy}")
+    lines.insert(3, f"total missing words  : {total_missing}")
+    lines.insert(4, f"total mismatches     : {total_mismatch}")
+    lines.insert(5, f"total extra actual   : {total_extra}")
+    lines.insert(6, f"warning ranges       : {warning_ranges}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2432,6 +3267,7 @@ def write_timeline_manifest(
     final_audio: Path,
     ass_path: Path,
     final_path: Path,
+    subtitle_preview_path: Optional[Path],
     audio_mode: str,
     alignment_mode: str,
     limit: int,
@@ -2470,6 +3306,11 @@ def write_timeline_manifest(
         "timeline_end": float(blocks[-1]["end"]) if blocks else 0.0,
         "audio": str(final_audio.relative_to(output_root)) if final_audio.is_relative_to(output_root) else str(final_audio),
         "subtitles": str(ass_path.relative_to(output_root)) if ass_path.is_relative_to(output_root) else str(ass_path),
+        "subtitle_preview": (
+            str(subtitle_preview_path.relative_to(output_root))
+            if subtitle_preview_path is not None and subtitle_preview_path.is_relative_to(output_root)
+            else (str(subtitle_preview_path) if subtitle_preview_path is not None else None)
+        ),
         "final": str(final_path.relative_to(output_root)) if final_path.is_relative_to(output_root) else str(final_path),
         "blocks": items,
     }
@@ -2548,10 +3389,9 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="Use only first N verses/clips for testing.")
     ap.add_argument("--rework", nargs="*", type=int, default=None, help="Generate only these block numbers; reuse existing clips for other selected blocks. 0=intro, 1..N=verses, N+1=outro.")
     ap.add_argument("--rebuild-final", action="store_true", help="Do not generate video; reuse existing clips and rebuild concat/final only.")
-    ap.add_argument("--comfy-url", default=COMFY_URL)
-    ap.add_argument("--comfy-output-dir", default=str(COMFY_OUTPUT_DIR))
-    ap.add_argument("--ffmpeg", default=FFMPEG)
-    ap.add_argument("--ffprobe", default=FFPROBE)
+    ap.add_argument("--comfy-url", default=None, help="Override comfy_url from config.json.")
+    ap.add_argument("--comfy-output-dir", default=None, help="Override comfy_output_dir from config.json.")
+    ap.add_argument("--lyrics-language", default="en", help="Language code for stable-ts alignment. Default: en.")
     args = ap.parse_args()
 
     stats: Dict[str, float] = {"_run_start": time.perf_counter()}
@@ -2567,10 +3407,13 @@ def main() -> None:
     output_root = Path(args.output_dir).resolve()
     out_dir = output_root / "work"
     debug_dir = out_dir / "debug"
-    output_dir = Path(args.comfy_output_dir)
+    alignment_dir = out_dir / "alignment"
     workflow_dir = script_dir / "workflows"
     rules_dir = script_dir / "rules"
     data_dir = script_dir / "data"
+    ffmpeg_cmd = resolve_ffmpeg_command(script_dir)
+    ffprobe_cmd = resolve_ffprobe_command(script_dir)
+    stable_ts_cmd = resolve_stable_ts_command(script_dir)
 
     log(f"[stage] input dir : {input_dir}")
     log(f"[stage] output dir: {output_root}")
@@ -2578,6 +3421,9 @@ def main() -> None:
     log(f"[stage] run id    : {run_id}")
     log(f"[stage] rules     : {rules_dir}")
     log(f"[stage] data      : {data_dir}")
+    log(f"[stage] ffmpeg    : {ffmpeg_cmd}")
+    log(f"[stage] ffprobe   : {ffprobe_cmd}")
+    log(f"[stage] stable-ts : {stable_ts_cmd}")
 
     if fresh_generation_run:
         log(f"[stage] fresh run: clean output dir {output_root}")
@@ -2590,17 +3436,43 @@ def main() -> None:
         raise FileNotFoundError(f"Required file not found: {video_style_path}")
     video_style = read_text(video_style_path)
     config = load_config(input_dir, data_dir)
-    write_json(debug_dir / "config_used.json", config)
-    block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
-
+    width = int(config["width"])
+    height = int(config["height"])
+    comfy_url = args.comfy_url or str(config["comfy_url"])
+    output_dir = Path(args.comfy_output_dir).resolve() if args.comfy_output_dir else resolve_config_path(str(config["comfy_output_dir"]), script_dir)
     planner_template = load_json(workflow_dir / "planner_visual_prompts_api.json")
     image_template = load_json(workflow_dir / "image_from_prompt_api.json")
     video_template = load_json(workflow_dir / "video_from_image_api.json")
-    width, height = int(config["width"]), int(config["height"])
+    write_json(debug_dir / "config_used.json", config)
+    log(f"[stage] comfy url : {comfy_url}")
+    log(f"[stage] comfy out : {output_dir}")
+    block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
+
+    if fresh_generation_run:
+        align_kind, align_path, _ = detect_alignment_source(input_dir)
+        alignment_dir.mkdir(parents=True, exist_ok=True)
+        if align_kind == "vocals":
+            run_stable_ts_alignment(
+                input_dir,
+                out_dir,
+                debug_dir,
+                stable_ts_cmd,
+                args.lyrics_language,
+            )
+        elif align_kind == "lrc":
+            target_lrc = alignment_dir / "alignment.lrc"
+            shutil.copy2(align_path, target_lrc)
+            write_json(debug_dir / "lrc_alignment_source.json", {
+                "source": str(align_path),
+                "copied_to": str(target_lrc),
+                "mode": "line_level_no_stable_ts",
+            })
+            log(f"[stage] use LRC line timing without stable-ts: {align_path}")
+
 
     log("[stage] parse alignment")
     stats_start(stats, "parse_alignment")
-    verses, alignment_mode = parse_alignment(input_dir, debug_dir)
+    verses, alignment_mode = parse_alignment(input_dir, alignment_dir, debug_dir, config)
     if not verses:
         raise RuntimeError("No verses parsed from alignment.")
     write_json(debug_dir / "parsed_verses_all.json", verses)
@@ -2621,7 +3493,7 @@ def main() -> None:
         rules,
         video_style,
         verses,
-        args.comfy_url,
+        comfy_url,
         plans_dir,
         song_context_mode,
     )
@@ -2644,8 +3516,8 @@ def main() -> None:
     stats_start(stats, "prepare_audio")
     audio_mode, audio_a, audio_b = detect_audio(input_dir)
     log(f"[stage] audio mode={audio_mode}")
-    full_mix = prepare_audio_full_mix(audio_mode, audio_a, audio_b, out_dir / "audio", args.ffmpeg)
-    audio_duration = get_audio_duration(full_mix, args.ffprobe)
+    full_mix = prepare_audio_full_mix(audio_mode, audio_a, audio_b, out_dir / "audio", ffmpeg_cmd)
+    audio_duration = get_audio_duration(full_mix, ffprobe_cmd)
     log(f"[stage] full audio duration={audio_duration:.2f}s")
     stats_end(stats, "prepare_audio")
 
@@ -2683,8 +3555,8 @@ def main() -> None:
 
     log("[stage] render audio for timeline")
     stats_start(stats, "render_audio")
-    final_audio = render_audio_for_timeline(full_mix, out_dir / "audio", args.ffmpeg, audio_end)
-    render_duration = ffprobe_duration(final_audio, args.ffprobe)
+    final_audio = render_audio_for_timeline(full_mix, out_dir / "audio", ffmpeg_cmd, audio_end)
+    render_duration = ffprobe_duration(final_audio, ffprobe_cmd)
     log(f"[stage] render audio duration={render_duration:.2f}s")
     stats_end(stats, "render_audio")
 
@@ -2714,6 +3586,22 @@ def main() -> None:
     )
     log(f"[stage] subtitles: {ass_path} ({subtitle_mode})")
     stats_end(stats, "subtitles")
+
+    log("[stage] render subtitle preview")
+    stats_start(stats, "subtitle_preview")
+    subtitle_preview = output_root / "subtitle_preview.mp4"
+    render_subtitle_preview(
+        final_audio,
+        ass_path,
+        subtitle_preview,
+        render_duration,
+        width,
+        height,
+        int(config["fps"]),
+        ffmpeg_cmd,
+    )
+    log(f"[stage] subtitle preview: {subtitle_preview}")
+    stats_end(stats, "subtitle_preview")
 
     clips: List[Path] = []
     clips_dir = out_dir / "clips"
@@ -2831,7 +3719,7 @@ def main() -> None:
                 current_instruction,
                 block_i,
                 kind,
-                args.comfy_url,
+                comfy_url,
                 plans_dir,
                 part_continuity,
                 plan_suffix=plan_suffix,
@@ -2859,9 +3747,9 @@ def main() -> None:
                     config,
                 )
                 write_json(part_debug_dir / "image_patched.json", iwf)
-                pid, client_id = queue_prompt(iwf, args.comfy_url)
+                pid, client_id = queue_prompt(iwf, comfy_url)
                 log(f"  [image] prompt_id={pid}")
-                ih = wait_history(pid, args.comfy_url, iwf, client_id)
+                ih = wait_history(pid, comfy_url, iwf, client_id)
                 check_history_status(ih, part_debug_dir / "image_history.json")
                 image_path = find_result_file(ih, output_dir, sub_dir, "start_image", {".png", ".jpg", ".jpeg", ".webp"})
                 if not image_path:
@@ -2871,11 +3759,11 @@ def main() -> None:
                 if previous_subclip is None:
                     raise RuntimeError(f"Internal error: no previous subclip for block {block_i:03d} part {sub_i:03d}")
                 log("  [stage] extract previous last frame as next start image")
-                extract_last_frame(previous_subclip, start_image_local, args.ffmpeg)
+                extract_last_frame(previous_subclip, start_image_local, ffmpeg_cmd)
 
             comfy_input_name = upload_image_to_comfy(
                 start_image_local,
-                args.comfy_url,
+                comfy_url,
                 f"aligned_song_inputs/{run_id}/block_{block_i:03d}",
             )
 
@@ -2895,9 +3783,9 @@ def main() -> None:
             write_json(part_debug_dir / "video_patched.json", vwf)
 
             log("  [stage] queue video")
-            pid, client_id = queue_prompt(vwf, args.comfy_url)
+            pid, client_id = queue_prompt(vwf, comfy_url)
             log(f"  [video] prompt_id={pid}")
-            vh = wait_history(pid, args.comfy_url, vwf, client_id)
+            vh = wait_history(pid, comfy_url, vwf, client_id)
             check_history_status(vh, part_debug_dir / "video_history.json")
             video_path = find_result_file(vh, output_dir, sub_dir, "video", {".mp4", ".mov", ".webm", ".mkv"})
             if not video_path:
@@ -2908,8 +3796,8 @@ def main() -> None:
 
             subclip_local = block_subclips_dir / f"part_{sub_i:03d}.mp4"
             log("  [stage] trim/pad subclip to exact subrange duration; remove raw workflow audio")
-            trim_or_pad_video(raw_part, sub_duration, subclip_local, args.ffmpeg)
-            extract_last_frame(subclip_local, last_frame_local, args.ffmpeg)
+            trim_or_pad_video(raw_part, sub_duration, subclip_local, ffmpeg_cmd)
+            extract_last_frame(subclip_local, last_frame_local, ffmpeg_cmd)
 
             previous_subclip = subclip_local
             subclip_paths.append(subclip_local)
@@ -2939,10 +3827,10 @@ def main() -> None:
             write_json(part_debug_dir / "video_generation.json", subrange_info)
 
         semantic_raw = raw_dir / f"{clip_local.stem}_semantic_raw.mp4"
-        concat_or_copy_subclips(subclip_paths, semantic_raw, args.ffmpeg)
+        concat_or_copy_subclips(subclip_paths, semantic_raw, ffmpeg_cmd)
 
         log("  [stage] trim/pad semantic clip to exact block duration")
-        trim_or_pad_video(semantic_raw, duration, clip_local, args.ffmpeg)
+        trim_or_pad_video(semantic_raw, duration, clip_local, ffmpeg_cmd)
 
         scene_summary = " / ".join(x.get("scene_summary", "") for x in subrange_infos if x.get("scene_summary"))
         if not scene_summary:
@@ -2981,13 +3869,13 @@ def main() -> None:
     log("\n[stage] concat video clips")
     stats_start(stats, "concat")
     video_only = out_dir / "video" / "video_only.mp4"
-    concat_videos(clips, video_only, args.ffmpeg)
+    concat_videos(clips, video_only, ffmpeg_cmd)
     stats_end(stats, "concat")
 
     log("[stage] final mux audio + burn subtitles")
     stats_start(stats, "final_mux")
     final = output_root / "final_video.mp4"
-    final_mux(video_only, final_audio, ass_path, final, args.ffmpeg)
+    final_mux(video_only, final_audio, ass_path, final, ffmpeg_cmd)
     stats_end(stats, "final_mux")
 
     write_timeline_manifest(
@@ -2998,6 +3886,7 @@ def main() -> None:
         final_audio,
         ass_path,
         final,
+        subtitle_preview,
         audio_mode,
         alignment_mode,
         args.limit,

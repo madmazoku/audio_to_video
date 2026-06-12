@@ -9,7 +9,7 @@ This repository contains the orchestration code and versioned prompt/workflow te
 `aligned_song_video_runner.py` builds a music video in these stages:
 
 1. Reads a song project from `--input-dir`.
-2. Parses lyric timing from `alignment.json` or `alignment.lrc`.
+2. Parses generated lyric timing from `output/work/alignment/alignment.json` or `output/work/alignment/alignment.lrc`.
 3. Builds semantic timeline blocks: `intro`, `verse`, `instrumental`, `outro`.
 4. Uses a ComfyUI LLM workflow to create visual prompts for each block.
 5. Renders each semantic block as one final clip.
@@ -24,7 +24,6 @@ The public unit is always a semantic range/block. Internal subranges are only us
 ```text
 audio_to_video/
   aligned_song_video_runner.py
-  align_stable_ts.cmd
   requirements.txt
   run_full.cmd
   run_limit_2.cmd
@@ -74,7 +73,7 @@ requests
 websocket-client
 ```
 
-`websocket-client` is required. The runner listens to ComfyUI websocket execution/progress events and intentionally has no polling fallback.
+`websocket-client` is required. The runner listens to ComfyUI websocket execution/progress events and intentionally has no polling generated.
 
 ### 3.2 FFmpeg
 
@@ -85,6 +84,15 @@ Check:
 ```powershell
 ffmpeg -version
 ffprobe -version
+```
+
+The runner resolves FFmpeg commands from `PATH` by default. Optional environment overrides are:
+
+```text
+
+
+
+
 ```
 
 On Windows, install a compiled FFmpeg build, extract it, and add the `bin` directory to `PATH`, for example:
@@ -128,7 +136,7 @@ Override it with:
 python.exe .\aligned_song_video_runner.py --comfy-url http://127.0.0.1:8188
 ```
 
-The runner also needs to find ComfyUI output files. The default value is currently set in the script:
+The runner also needs to find ComfyUI output files. The default value is configured as a sibling repository path:
 
 ```text
 G:\Git\ComfyUI\output
@@ -142,9 +150,9 @@ python.exe .\aligned_song_video_runner.py --comfy-output-dir G:\Git\ComfyUI\outp
 
 Install all ComfyUI custom nodes and models required by the workflow JSON files in `workflows/`. If ComfyUI reports an unknown node type, install the missing custom node into `ComfyUI/custom_nodes/` and restart ComfyUI. If it reports a missing model, place the model file where the workflow expects it.
 
-### 3.4 stable-ts, optional alignment tool
+### 3.4 stable-ts
 
-stable-ts is not used by the video runner directly. It is an optional external tool for creating `input/alignment.json` from `lyrics.txt` and audio.
+stable-ts is used by the runner to create `output/work/alignment/alignment.json` from `lyrics.txt` and audio during a normal fresh generation run.
 
 Typical setup:
 
@@ -157,30 +165,33 @@ python.exe -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -U stable-ts
 ```
 
-Edit `STABLE_TS_EXE` inside `align_stable_ts.cmd` if your stable-ts path is different.
-
-Run alignment:
-
-```cmd
-align_stable_ts.cmd
-align_stable_ts.cmd .\input en
-align_stable_ts.cmd .\input ru
-```
-
-The wrapper reads from the input folder:
+The runner resolves stable-ts in this order:
 
 ```text
-lyrics.txt
-vocals.mp3 OR audio.mp3
+../stable-ts/.venv/Scripts/stable-ts.exe
+../stable-ts/.venv/bin/stable-ts
+stable-ts from PATH
 ```
 
-and writes:
+So the simplest layouts are either:
 
 ```text
-alignment.json
+G:\Git\audio_to_video
+G:\Git\stable-ts
 ```
 
-Language is a command argument. Default language is `en`.
+or putting `stable-ts` into `PATH`.
+
+During a normal run, the runner writes cleaned sung-only lyrics to:
+
+```text
+output/work/audio/alignment_lyrics_clean.txt
+output/work/debug/alignment_lyrics_clean.txt
+```
+
+and passes that file to stable-ts. Bracket directive lines such as `[Verse]` and semantic separators `***` are not sent to stable-ts.
+
+Language is controlled by `--lyrics-language`, default `en`.
 
 ### 3.5 ACE-Step 1.5, optional upstream music source
 
@@ -216,9 +227,10 @@ Prepare `input/`:
 ```text
 input/audio.mp3
 input/lyrics.txt
-input/alignment.json
 input/video_style.txt
 ```
+
+`output/work/alignment/alignment.json` is generated automatically by the runner on a normal fresh run when `input/vocals.*` is available. If there are no vocals, provide `input/alignment.lrc` for line-level timing without stable-ts.
 
 Start ComfyUI in another terminal.
 
@@ -291,13 +303,35 @@ ComfyUI server URL. Default: `http://127.0.0.1:8188`.
 ComfyUI output directory used to locate generated image/video files.
 
 ```text
---ffmpeg PATH
---ffprobe PATH
+--lyrics-language LANG
 ```
 
-Override FFmpeg/ffprobe commands.
+Language code passed to stable-ts. Default: `en`.
+
+
+
 
 ## 6. Run modes
+
+### FFmpeg/stable-ts command discovery
+
+FFmpeg, ffprobe, and stable-ts are resolved by sibling repo convention or `PATH`.
+
+Stable-ts resolution order:
+
+    ../stable-ts/.venv/Scripts/stable-ts.exe
+    ../stable-ts/.venv/bin/stable-ts
+    stable-ts from PATH
+
+FFmpeg/ffprobe resolution order:
+
+    ../ffmpeg/bin/ffmpeg.exe
+    ../ffmpeg/bin/ffmpeg
+    ffmpeg from PATH
+
+    ../ffmpeg/bin/ffprobe.exe
+    ../ffmpeg/bin/ffprobe
+    ffprobe from PATH
 
 ### Normal run
 
@@ -307,6 +341,7 @@ Behavior:
 
 ```text
 clean --output-dir
+generate output/work/alignment/alignment.json with stable-ts when vocals are available
 generate song context
 generate all selected semantic block plans
 generate all selected semantic clips
@@ -319,12 +354,13 @@ A normal run is treated as a new creative attempt. Existing files in `--output-d
 
 ### Rework run
 
-`--rework` keeps the output directory and regenerates only requested semantic block numbers.
+`--rework` keeps the output directory and regenerates only requested semantic block numbers. rework/rebuild-final do not rebuild alignment; they read only `output/work/alignment/`.
 
 Behavior:
 
 ```text
 keep --output-dir
+reuse existing alignment.json
 reuse frozen song_context.json
 reuse semantic clips not listed in --rework
 regenerate selected semantic blocks
@@ -342,6 +378,7 @@ Behavior:
 
 ```text
 keep --output-dir
+reuse existing alignment.json
 reuse semantic clips from output/work/clips/
 regenerate subtitles and final video
 write manifest
@@ -372,27 +409,17 @@ video_style.txt
 Art direction for the whole video. This is prompt style only. Technical width/height/fps live in `config.json`.
 
 ```text
-alignment.json OR alignment.lrc
-```
-
-Lyric timing. `alignment.json` gives word-level timing and smoother karaoke. `alignment.lrc` gives line-level timing.
-
-```text
-audio.mp3
-```
-
-Full song audio. `.wav`, `.m4a`, and `.flac` are also accepted as `audio.wav`, `audio.m4a`, or `audio.flac`.
-
-Alternative stem input:
-
-```text
 vocals.mp3
-instrumental.mp3
 ```
 
-If both stems exist, the runner mixes them into the full song internally. `.wav`, `.m4a`, and `.flac` stem fallbacks are also accepted.
+Optional but recommended for word-level timing. If `vocals.*` exists, a normal fresh run uses it with stable-ts to create `output/work/alignment/alignment.json`.
 
-### 7.2 Recommended file
+```text
+alignment.lrc
+```
+
+Line-level timing input for the no-vocals mode. If there is no `vocals.*`, provide `input/alignment.lrc`; stable-ts is not run in this mode. LRC is matched against `lyrics.txt` semantic ranges. `[metadata]` and `***` LRC lines are ignored for subtitles and used only as structure/boundary hints.
+
 
 ```text
 lyrics.txt
@@ -481,6 +508,7 @@ output/
 Important files:
 
 ```text
+output/subtitle_preview.mp4
 output/final_video.mp4
 output/manifest.json
 ```
@@ -524,6 +552,10 @@ output/work/
 
   debug/
     parsed_verses_all.json
+    alignment_match_report.txt
+    alignment_match_report.json
+    alignment_ignored_meta_words.json
+    alignment_lyrics_clean.txt
     timeline_blocks.json
     config_used.json
     video_style_map.json
@@ -567,6 +599,8 @@ outro
 ```
 
 Long gaps without lyrics become `instrumental` blocks when they exceed the threshold configured in `config.json`.
+Short intro/outro gaps use the same threshold as instrumental pauses. If the intro before the first sung line or the outro after the last sung line is shorter than the instrumental gap threshold, it is merged into the first/last lyric range instead of becoming a separate generated clip.
+
 
 Every semantic block is rendered through one or more internal subranges:
 
@@ -600,9 +634,13 @@ The next semantic block starts from a fresh generated image. Last-frame chaining
 
 For lyric ranges, `range_visual_preroll_seconds` lets the semantic clip start slightly before the first sung word, but only by taking time from lyric-free gap before that range. It never overlaps a previous sung lyric. This means boundaries such as `intro -> verse` or `instrumental -> verse` can show the new verse scene before the first word is sung.
 
-`subtitle_line_preroll_seconds` makes a subtitle line visible slightly before its first word. The karaoke timing itself is not shifted: the ASS event starts earlier, but a silent karaoke gap is inserted before the first word so highlighting follows the audio timing.
+`subtitle_line_preroll_seconds` makes a subtitle line visible slightly before its first word. The karaoke timing itself is not shifted. The ASS file uses a transparent timed spacer for the lead-in/gaps, so the first visible word is not highlighted before its real word timestamp.
 
-Word-level karaoke is gap-aware: gaps between word timestamps are preserved instead of compressing all words together.
+Word-level karaoke is gap-aware: gaps between word timestamps are preserved instead of compressing all words together. Silent gaps inside the karaoke overlay are consumed without making the next word highlight early.
+
+After subtitles are generated, the runner immediately writes `subtitle_preview.mp4`: a black-screen video with the rendered audio track and burned ASS subtitles. Use it to check karaoke timing before waiting for image/video generation.
+
+Intro, outro, and instrumental gaps use the same threshold predicate. A silent gap becomes its own semantic block only when its duration is at least `instrumental_gap_threshold`; shorter intro/outro gaps are merged into the nearest lyric range.
 
 Debug for ranges/subranges is written under `output/work/debug/ranges/range_NNN/`, with one folder per semantic range and one `part_MMM/` folder per internal subrange.
 
@@ -720,6 +758,8 @@ Default technical/timeline configuration:
 
 ```json
 {
+  "comfy_url": "http://127.0.0.1:8188",
+  "comfy_output_dir": "G:\Git\ComfyUI\output",
   "width": 1280,
   "height": 720,
   "fps": 24,
@@ -730,7 +770,11 @@ Default technical/timeline configuration:
   "local_context_radius": 2,
   "range_visual_preroll_seconds": 0.25,
   "subtitle_line_preroll_seconds": 0.25,
-  "min_karaoke_unit_seconds": 0.01
+  "min_karaoke_unit_seconds": 0.01,
+  "alignment_match_lookahead_words": 5,
+  "alignment_match_similarity_threshold": 0.72,
+  "alignment_match_warn_ratio": 0.2,
+  "alignment_match_max_extra_ratio": 0.5
 }
 ```
 
@@ -893,7 +937,7 @@ python.exe -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -U stable-ts
 ```
 
-Then edit `STABLE_TS_EXE` in `align_stable_ts.cmd`.
+Then edit `` in `the runner's stable-ts integration`.
 
 ### ACE-Step 1.5
 
@@ -940,3 +984,19 @@ Run a normal generation first. `--rework` intentionally keeps existing `song_con
 ### A normal run removed my output folder
 
 That is expected. A normal run is a fresh creative attempt and cleans `--output-dir` first. Use a new `--output-dir` to keep multiple attempts side by side.
+
+
+### alignment contains bracket directives or `***`
+
+Regenerate alignment by running a normal fresh generation. New alignment should be generated from cleaned sung-only lyrics. The runner can ignore metadata-looking words from old alignment files, but clean alignment is more reliable.
+
+### alignment mismatch warnings
+
+Check:
+
+```text
+output/work/debug/alignment_match_report.txt
+output/work/debug/alignment_match_report.json
+```
+
+The matcher is intentionally tolerant: fuzzy matches, missing expected words, and extra actual words are reported so that small differences between `lyrics.txt` and stable-ts output do not silently shift the rest of the song.
