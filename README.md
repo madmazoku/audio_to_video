@@ -136,7 +136,7 @@ Override it with:
 python.exe .\aligned_song_video_runner.py --comfy-url http://127.0.0.1:8188
 ```
 
-The runner also needs to find ComfyUI output files. The default value is currently set in the script:
+The runner also needs to find ComfyUI output files. The default value is configured as a sibling repository path:
 
 ```text
 G:\Git\ComfyUI\output
@@ -319,23 +319,19 @@ FFmpeg, ffprobe, and stable-ts are resolved by sibling repo convention or `PATH`
 
 Stable-ts resolution order:
 
-```text
-../stable-ts/.venv/Scripts/stable-ts.exe
-../stable-ts/.venv/bin/stable-ts
-stable-ts from PATH
-```
+    ../stable-ts/.venv/Scripts/stable-ts.exe
+    ../stable-ts/.venv/bin/stable-ts
+    stable-ts from PATH
 
 FFmpeg/ffprobe resolution order:
 
-```text
-../ffmpeg/bin/ffmpeg.exe
-../ffmpeg/bin/ffmpeg
-ffmpeg from PATH
+    ../ffmpeg/bin/ffmpeg.exe
+    ../ffmpeg/bin/ffmpeg
+    ffmpeg from PATH
 
-../ffmpeg/bin/ffprobe.exe
-../ffmpeg/bin/ffprobe
-ffprobe from PATH
-```
+    ../ffmpeg/bin/ffprobe.exe
+    ../ffmpeg/bin/ffprobe
+    ffprobe from PATH
 
 ### Normal run
 
@@ -512,6 +508,7 @@ output/
 Important files:
 
 ```text
+output/subtitle_preview.mp4
 output/final_video.mp4
 output/manifest.json
 ```
@@ -602,6 +599,8 @@ outro
 ```
 
 Long gaps without lyrics become `instrumental` blocks when they exceed the threshold configured in `config.json`.
+Short intro/outro gaps use the same threshold as instrumental pauses. If the intro before the first sung line or the outro after the last sung line is shorter than the instrumental gap threshold, it is merged into the first/last lyric range instead of becoming a separate generated clip.
+
 
 Every semantic block is rendered through one or more internal subranges:
 
@@ -635,9 +634,13 @@ The next semantic block starts from a fresh generated image. Last-frame chaining
 
 For lyric ranges, `range_visual_preroll_seconds` lets the semantic clip start slightly before the first sung word, but only by taking time from lyric-free gap before that range. It never overlaps a previous sung lyric. This means boundaries such as `intro -> verse` or `instrumental -> verse` can show the new verse scene before the first word is sung.
 
-`subtitle_line_preroll_seconds` makes a subtitle line visible slightly before its first word. The karaoke timing itself is not shifted: the ASS event starts earlier, but a silent karaoke gap is inserted before the first word so highlighting follows the audio timing.
+`subtitle_line_preroll_seconds` makes a subtitle line visible slightly before its first word. The karaoke timing itself is not shifted. The ASS file uses a transparent timed spacer for the lead-in/gaps, so the first visible word is not highlighted before its real word timestamp.
 
-Word-level karaoke is gap-aware: gaps between word timestamps are preserved instead of compressing all words together.
+Word-level karaoke is gap-aware: gaps between word timestamps are preserved instead of compressing all words together. Silent gaps inside the karaoke overlay are consumed without making the next word highlight early.
+
+After subtitles are generated, the runner immediately writes `subtitle_preview.mp4`: a black-screen video with the rendered audio track and burned ASS subtitles. Use it to check karaoke timing before waiting for image/video generation.
+
+Intro, outro, and instrumental gaps use the same threshold predicate. A silent gap becomes its own semantic block only when its duration is at least `instrumental_gap_threshold`; shorter intro/outro gaps are merged into the nearest lyric range.
 
 Debug for ranges/subranges is written under `output/work/debug/ranges/range_NNN/`, with one folder per semantic range and one `part_MMM/` folder per internal subrange.
 
@@ -755,6 +758,8 @@ Default technical/timeline configuration:
 
 ```json
 {
+  "comfy_url": "http://127.0.0.1:8188",
+  "comfy_output_dir": "G:\Git\ComfyUI\output",
   "width": 1280,
   "height": 720,
   "fps": 24,

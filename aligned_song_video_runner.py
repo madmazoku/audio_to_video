@@ -19,18 +19,6 @@ import random
 import statistics
 import websocket
 
-COMFY_URL = "http://127.0.0.1:8188"
-COMFY_OUTPUT_DIR = Path(r"G:\Git\ComfyUI\output")
-FFMPEG = "ffmpeg"
-FFPROBE = "ffprobe"
-
-# Video duration policy.
-VIDEO_RECOMMENDED_SECONDS = 20
-VIDEO_MAX_SECONDS = 30
-
-# Prompt planning context policy.
-LOCAL_CONTEXT_RADIUS = 2
-
 IMAGE_N = {
     "image_prompt": "1004",
     "image_latent": "1007",
@@ -500,14 +488,25 @@ def extract_fps(video_style: str) -> int:
     return int(m.group(1)) if m else 24
 
 
+APOSTROPHE_CHARS = "'’‘ʼ`´"
+WORD_JOIN_CHARS = "-" + APOSTROPHE_CHARS
+
+
 def norm_word(s: str) -> str:
     s = s.casefold().replace("\u0451", "\u0435").replace("\u0401", "\u0435")
+    for ch in APOSTROPHE_CHARS:
+        s = s.replace(ch, "'")
     s = re.sub(r"[^\w]+", "", s, flags=re.U)
     return s
 
 
 def lyric_words(text: str) -> List[str]:
-    return [w for w in re.findall(r"\w+(?:[-\']\w+)?", text, flags=re.U) if norm_word(w)]
+    # Keep contractions as a single display token. Stable-ts often returns
+    # words such as should’ve / shouldn’t as one word; splitting lyrics on
+    # curly apostrophes made subtitles render them as "should ve".
+    joiners = re.escape(WORD_JOIN_CHARS)
+    pattern = rf"\w+(?:[{joiners}]\w+)*"
+    return [w for w in re.findall(pattern, text, flags=re.U) if norm_word(w)]
 
 
 
@@ -932,6 +931,8 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         source = str(override_path)
 
     required = {
+        "comfy_url": str,
+        "comfy_output_dir": str,
         "width": int,
         "height": int,
         "fps": int,
@@ -955,6 +956,8 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         if not isinstance(config[key], expected_type):
             raise RuntimeError(f"Bad config key {key}: expected {expected_type}, got {type(config[key]).__name__}")
 
+    config["comfy_url"] = str(config["comfy_url"])
+    config["comfy_output_dir"] = str(config["comfy_output_dir"])
     config["width"] = int(config["width"])
     config["height"] = int(config["height"])
     config["fps"] = int(config["fps"])
@@ -1571,7 +1574,7 @@ def resolve_ffmpeg_command(script_dir: Path) -> str:
         parent / "ffmpeg" / "bin" / "ffmpeg.exe",
         parent / "ffmpeg" / "bin" / "ffmpeg",
     ]
-    return resolve_command(candidates, FFMPEG)
+    return resolve_command(candidates, "ffmpeg")
 
 
 def resolve_ffprobe_command(script_dir: Path) -> str:
@@ -1580,9 +1583,22 @@ def resolve_ffprobe_command(script_dir: Path) -> str:
         parent / "ffmpeg" / "bin" / "ffprobe.exe",
         parent / "ffmpeg" / "bin" / "ffprobe",
     ]
-    return resolve_command(candidates, FFPROBE)
+    return resolve_command(candidates, "ffprobe")
 
 
+
+
+def resolve_config_path(path_value: str, script_dir: Path) -> Path:
+    raw = str(path_value).strip()
+    if not raw:
+        raise RuntimeError("Configured path is empty")
+    # Config files commonly use Windows-style separators. Normalize them so
+    # relative sibling paths work consistently in tests and on non-Windows hosts.
+    normalized = raw.replace("\\", "/")
+    path = Path(normalized)
+    if path.is_absolute():
+        return path.resolve()
+    return (script_dir / path).resolve()
 def resolve_stable_ts_command(script_dir: Path) -> str:
     parent = script_dir.parent
     candidates = [
@@ -1598,7 +1614,7 @@ def resolve_ffmpeg_command(script_dir: Path) -> str:
         parent / "ffmpeg" / "bin" / "ffmpeg.exe",
         parent / "ffmpeg" / "bin" / "ffmpeg",
     ]
-    return resolve_command(candidates, FFMPEG)
+    return resolve_command(candidates, "ffmpeg")
 
 
 def resolve_ffprobe_command(script_dir: Path) -> str:
@@ -1607,7 +1623,7 @@ def resolve_ffprobe_command(script_dir: Path) -> str:
         parent / "ffmpeg" / "bin" / "ffprobe.exe",
         parent / "ffmpeg" / "bin" / "ffprobe",
     ]
-    return resolve_command(candidates, FFPROBE)
+    return resolve_command(candidates, "ffprobe")
 
 
 
@@ -1748,6 +1764,19 @@ def centiseconds(duration: float) -> int:
     return max(1, int(round(duration * 100)))
 
 
+def build_karaoke_delay(duration: float) -> str:
+    """Consume karaoke time without highlighting the next visible syllable.
+
+    ASS karaoke timing must be attached to text. A bare "{\\kN}" before a
+    visible word can be rendered as part of that next word, making preroll or
+    inter-word gaps highlight too early. Use a transparent zero-width syllable
+    to consume the gap while the full line remains visible in its unsung state.
+    """
+    if duration <= 0:
+        return ""
+    return r"{\alpha&HFF&\k" + str(centiseconds(duration)) + "}​" + r"{\alpha&H00&}"
+
+
 
 def is_karaoke_timed_char(ch: str) -> bool:
     """Return True for characters that should receive their own karaoke duration."""
@@ -1799,7 +1828,7 @@ def build_word_karaoke_line(
     """Build word-level karaoke while preserving gaps between word timestamps.
 
     event_start is the ASS Dialogue start after shift. Silent karaoke gaps are
-    inserted before words so the line can appear earlier in unsung state.
+    inserted before words so pauses do not make the next word highlight early.
     """
     words = line.get("words", []) or []
     if not words:
@@ -1809,7 +1838,7 @@ def build_word_karaoke_line(
             event_start = line_start
         lead = max(0.0, line_start - event_start)
         body = build_char_karaoke_text(str(line["text"]), max(min_unit, line_end - line_start), min_unit)
-        return (r"{\k" + str(centiseconds(lead)) + "}" if lead > 0 else "") + body
+        return build_karaoke_delay(lead) + body
 
     if event_start is None:
         event_start = min(float(w.get("start", line["start"])) for w in words) - shift
@@ -1828,7 +1857,7 @@ def build_word_karaoke_line(
 
         gap = max(0.0, ws - current)
         if gap > 0:
-            pieces.append(r"{\k" + str(centiseconds(gap)) + "}")
+            pieces.append(build_karaoke_delay(gap))
 
         pieces.append(build_char_karaoke_text(str(w.get("text", "")), max(min_unit, we - ws), min_unit))
         current = max(current, we)
@@ -1838,6 +1867,13 @@ def build_word_karaoke_line(
 
     line_duration = max(min_unit, float(line["end"]) - float(line["start"]))
     return build_char_karaoke_text(str(line["text"]), line_duration, min_unit)
+
+
+
+
+def build_plain_subtitle_text(text: str) -> str:
+    """Build normal visible subtitle text without karaoke timing tags."""
+    return ass_escape(text).replace("\n", r"\N")
 
 
 
@@ -2099,13 +2135,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             end = max(display_start + 0.1, raw_line_end)
 
             if mode == "word" and line.get("words"):
-                text = build_word_karaoke_line(line, shift, display_start, min_unit)
+                karaoke_text = build_word_karaoke_line(line, shift, display_start, min_unit)
             else:
                 lead = max(0.0, raw_line_start - display_start)
                 body = build_char_karaoke_text(str(line["text"]), max(min_unit, raw_line_end - raw_line_start), min_unit)
-                text = (r"{\k" + str(centiseconds(lead)) + "}" if lead > 0 else "") + body
+                karaoke_text = build_karaoke_delay(lead) + body
+            events.append(f"Dialogue: 0,{ass_timestamp(display_start)},{ass_timestamp(end)},{style},,0,0,0,,{karaoke_text}")
 
-            events.append(f"Dialogue: 0,{ass_timestamp(display_start)},{ass_timestamp(end)},{style},,0,0,0,,{text}")
             timing_report.append({
                 "verse_index": verse_index,
                 "block_index": block_index,
@@ -2172,6 +2208,37 @@ def final_mux(video_in: Path, audio_in: Path, ass_path: Path, out: Path, ffmpeg:
     run_cmd([
         ffmpeg, "-y",
         "-i", str(video_in),
+        "-i", str(audio_in),
+        "-vf", f"subtitles='{sub_arg}'",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-shortest",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(out),
+    ])
+
+
+def render_subtitle_preview(
+    audio_in: Path,
+    ass_path: Path,
+    out: Path,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+    ffmpeg: str,
+) -> None:
+    """Render a quick black-screen karaoke preview with final audio and subtitles."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sub_arg = ffmpeg_sub_path(ass_path)
+    run_cmd([
+        ffmpeg, "-y",
+        "-f", "lavfi",
+        "-i", f"color=c=black:s={width}x{height}:r={fps}:d={duration:.3f}",
         "-i", str(audio_in),
         "-vf", f"subtitles='{sub_arg}'",
         "-map", "0:v:0",
@@ -2494,7 +2561,7 @@ def format_verse_context(verse: Dict[str, Any], label: str) -> str:
     return f"{label} {int(verse['index']):03d}:{directive_text}\nLyrics:\n{verse.get('text', '')}"
 
 
-def build_local_context(verses: List[Dict[str, Any]], verse_index: int, radius: int = LOCAL_CONTEXT_RADIUS) -> str:
+def build_local_context(verses: List[Dict[str, Any]], verse_index: int, radius: int) -> str:
     count = max(1, int(radius))
     if verse_index <= 0:
         early = verses[:count]
@@ -2916,6 +2983,10 @@ def instrumental_gap_threshold(verses: List[Dict[str, Any]], config: Dict[str, A
     )
 
 
+
+
+def should_create_silent_gap_block(gap_duration: float, verses: List[Dict[str, Any]], config: Dict[str, Any]) -> bool:
+    return float(gap_duration) >= instrumental_gap_threshold(verses, config)
 def make_timeline_blocks(
     all_verses: List[Dict[str, Any]],
     selected_verses: List[Dict[str, Any]],
@@ -2925,15 +2996,13 @@ def make_timeline_blocks(
 ) -> Tuple[List[Dict[str, Any]], Optional[float]]:
     """Create continuous visual timeline blocks.
 
-    Lyric timing remains unchanged. For lyric blocks, visual_start may move
-    slightly earlier into lyric-free gap by range_visual_preroll_seconds so the
-    new scene can appear before the first sung word.
+    Lyric timing remains unchanged. Short intro/outro gaps are merged into the
+    first/last lyric range using the same threshold as instrumental gaps.
     """
     total = len(all_verses)
     selected_count = len(selected_verses)
     full_song = selected_count >= total and not has_limit
 
-    # If --limit N where N == total, treat as full song equivalent.
     if selected_count >= total:
         full_song = True
 
@@ -2947,11 +3016,8 @@ def make_timeline_blocks(
 
     blocks: List[Dict[str, Any]] = []
     next_block_index = 0
-    threshold = instrumental_gap_threshold(all_verses, config)
     desired_preroll = max(0.0, float(config.get("range_visual_preroll_seconds", 0.0)))
 
-    # Compute visual starts for selected lyric verses. Preroll is taken only from
-    # lyric-free gap before the verse, never from time where previous lyrics sing.
     visual_starts: List[float] = []
     previous_lyric_end = 0.0
     for verse in selected_verses:
@@ -2961,10 +3027,10 @@ def make_timeline_blocks(
         visual_starts.append(max(0.0, lyric_start - actual_preroll))
         previous_lyric_end = float(verse["end"])
 
-    first = selected_verses[0]
     first_visual_start = visual_starts[0]
+    intro_is_separate = should_create_silent_gap_block(first_visual_start, all_verses, config)
 
-    if first_visual_start > 0.05:
+    if intro_is_separate:
         intro_text = (
             "Opening instrumental/intro block for the whole song. "
             "Establish the main setting, recurring characters and mood before the first lyric starts."
@@ -2980,6 +3046,10 @@ def make_timeline_blocks(
             "bracket_directives": [],
         })
         next_block_index += 1
+    else:
+        # Too short to be a meaningful generated clip. Fold it into the first
+        # lyric range so we do not render a 0.x second intro video.
+        visual_starts[0] = 0.0
 
     for pos, verse in enumerate(selected_verses):
         verse_index = int(verse["index"])
@@ -3002,7 +3072,7 @@ def make_timeline_blocks(
             next_verse_index = int(all_verses[selected_count]["index"]) if selected_count < total else None
 
         lyric_gap = max(0.0, next_lyric_start - lyric_end)
-        split_gap = lyric_gap >= threshold and next_lyric_start > lyric_end
+        split_gap = should_create_silent_gap_block(lyric_gap, all_verses, config) and next_lyric_start > lyric_end
 
         verse_end = lyric_end if split_gap else next_visual_start
         if verse_end <= start:
@@ -3026,29 +3096,29 @@ def make_timeline_blocks(
 
         if split_gap:
             instrumental_end = next_visual_start
-            if instrumental_end > lyric_end + 0.05:
-                blocks.append({
-                    "block_index": next_block_index,
-                    "kind": "instrumental",
-                    "verse_index": verse_index,
-                    "previous_verse_index": verse_index,
-                    "next_verse_index": next_verse_index,
-                    "start": lyric_end,
-                    "end": instrumental_end,
-                    "duration": max(0.01, instrumental_end - lyric_end),
-                    "text": (
-                        f"Instrumental break with no sung lyrics between verse {verse_index}"
-                        + (f" and verse {next_verse_index}." if next_verse_index else " and the end of the selected range.")
-                    ),
-                    "bracket_directives": [],
-                })
-                next_block_index += 1
+            blocks.append({
+                "block_index": next_block_index,
+                "kind": "instrumental",
+                "verse_index": verse_index,
+                "previous_verse_index": verse_index,
+                "next_verse_index": next_verse_index,
+                "start": lyric_end,
+                "end": instrumental_end,
+                "duration": max(0.01, instrumental_end - lyric_end),
+                "text": (
+                    f"Instrumental break with no sung lyrics between verse {verse_index}"
+                    + (f" and verse {next_verse_index}." if next_verse_index else " and the end of the selected range.")
+                ),
+                "bracket_directives": [],
+            })
+            next_block_index += 1
 
     if full_song:
         last = selected_verses[-1]
         outro_start = float(last["end"])
         outro_end = audio_duration
-        if outro_end - outro_start > 0.05:
+        outro_duration = max(0.0, outro_end - outro_start)
+        if should_create_silent_gap_block(outro_duration, all_verses, config):
             outro_text = (
                 "Closing instrumental/outro block for the whole song. "
                 "Create a final warm visual tableau that resolves the story without any text."
@@ -3059,10 +3129,15 @@ def make_timeline_blocks(
                 "verse_index": int(last["index"]) + 1,
                 "start": outro_start,
                 "end": outro_end,
-                "duration": max(0.01, outro_end - outro_start),
+                "duration": max(0.01, outro_duration),
                 "text": outro_text,
                 "bracket_directives": [],
             })
+        elif outro_duration > 0.0 and blocks:
+            # Too short for a standalone outro clip; merge into the previous
+            # visual range so final video still covers full audio duration.
+            blocks[-1]["end"] = outro_end
+            blocks[-1]["duration"] = max(0.01, float(blocks[-1]["end"]) - float(blocks[-1]["start"]))
 
     return blocks, audio_end
 
@@ -3192,6 +3267,7 @@ def write_timeline_manifest(
     final_audio: Path,
     ass_path: Path,
     final_path: Path,
+    subtitle_preview_path: Optional[Path],
     audio_mode: str,
     alignment_mode: str,
     limit: int,
@@ -3230,6 +3306,11 @@ def write_timeline_manifest(
         "timeline_end": float(blocks[-1]["end"]) if blocks else 0.0,
         "audio": str(final_audio.relative_to(output_root)) if final_audio.is_relative_to(output_root) else str(final_audio),
         "subtitles": str(ass_path.relative_to(output_root)) if ass_path.is_relative_to(output_root) else str(ass_path),
+        "subtitle_preview": (
+            str(subtitle_preview_path.relative_to(output_root))
+            if subtitle_preview_path is not None and subtitle_preview_path.is_relative_to(output_root)
+            else (str(subtitle_preview_path) if subtitle_preview_path is not None else None)
+        ),
         "final": str(final_path.relative_to(output_root)) if final_path.is_relative_to(output_root) else str(final_path),
         "blocks": items,
     }
@@ -3308,8 +3389,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="Use only first N verses/clips for testing.")
     ap.add_argument("--rework", nargs="*", type=int, default=None, help="Generate only these block numbers; reuse existing clips for other selected blocks. 0=intro, 1..N=verses, N+1=outro.")
     ap.add_argument("--rebuild-final", action="store_true", help="Do not generate video; reuse existing clips and rebuild concat/final only.")
-    ap.add_argument("--comfy-url", default=COMFY_URL)
-    ap.add_argument("--comfy-output-dir", default=str(COMFY_OUTPUT_DIR))
+    ap.add_argument("--comfy-url", default=None, help="Override comfy_url from config.json.")
+    ap.add_argument("--comfy-output-dir", default=None, help="Override comfy_output_dir from config.json.")
     ap.add_argument("--lyrics-language", default="en", help="Language code for stable-ts alignment. Default: en.")
     args = ap.parse_args()
 
@@ -3327,7 +3408,6 @@ def main() -> None:
     out_dir = output_root / "work"
     debug_dir = out_dir / "debug"
     alignment_dir = out_dir / "alignment"
-    output_dir = Path(args.comfy_output_dir)
     workflow_dir = script_dir / "workflows"
     rules_dir = script_dir / "rules"
     data_dir = script_dir / "data"
@@ -3351,9 +3431,6 @@ def main() -> None:
 
     log("[stage] read style/workflows/rules")
     rules = load_rules(rules_dir)
-    planner_template = load_json(workflow_dir / "planner_visual_prompts_api.json")
-    image_template = load_json(workflow_dir / "image_from_prompt_api.json")
-    video_template = load_json(workflow_dir / "video_from_image_api.json")
     video_style_path = input_dir / "video_style.txt"
     if not video_style_path.exists():
         raise FileNotFoundError(f"Required file not found: {video_style_path}")
@@ -3361,7 +3438,14 @@ def main() -> None:
     config = load_config(input_dir, data_dir)
     width = int(config["width"])
     height = int(config["height"])
+    comfy_url = args.comfy_url or str(config["comfy_url"])
+    output_dir = Path(args.comfy_output_dir).resolve() if args.comfy_output_dir else resolve_config_path(str(config["comfy_output_dir"]), script_dir)
+    planner_template = load_json(workflow_dir / "planner_visual_prompts_api.json")
+    image_template = load_json(workflow_dir / "image_from_prompt_api.json")
+    video_template = load_json(workflow_dir / "video_from_image_api.json")
     write_json(debug_dir / "config_used.json", config)
+    log(f"[stage] comfy url : {comfy_url}")
+    log(f"[stage] comfy out : {output_dir}")
     block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
 
     if fresh_generation_run:
@@ -3409,7 +3493,7 @@ def main() -> None:
         rules,
         video_style,
         verses,
-        args.comfy_url,
+        comfy_url,
         plans_dir,
         song_context_mode,
     )
@@ -3502,6 +3586,22 @@ def main() -> None:
     )
     log(f"[stage] subtitles: {ass_path} ({subtitle_mode})")
     stats_end(stats, "subtitles")
+
+    log("[stage] render subtitle preview")
+    stats_start(stats, "subtitle_preview")
+    subtitle_preview = output_root / "subtitle_preview.mp4"
+    render_subtitle_preview(
+        final_audio,
+        ass_path,
+        subtitle_preview,
+        render_duration,
+        width,
+        height,
+        int(config["fps"]),
+        ffmpeg_cmd,
+    )
+    log(f"[stage] subtitle preview: {subtitle_preview}")
+    stats_end(stats, "subtitle_preview")
 
     clips: List[Path] = []
     clips_dir = out_dir / "clips"
@@ -3619,7 +3719,7 @@ def main() -> None:
                 current_instruction,
                 block_i,
                 kind,
-                args.comfy_url,
+                comfy_url,
                 plans_dir,
                 part_continuity,
                 plan_suffix=plan_suffix,
@@ -3647,9 +3747,9 @@ def main() -> None:
                     config,
                 )
                 write_json(part_debug_dir / "image_patched.json", iwf)
-                pid, client_id = queue_prompt(iwf, args.comfy_url)
+                pid, client_id = queue_prompt(iwf, comfy_url)
                 log(f"  [image] prompt_id={pid}")
-                ih = wait_history(pid, args.comfy_url, iwf, client_id)
+                ih = wait_history(pid, comfy_url, iwf, client_id)
                 check_history_status(ih, part_debug_dir / "image_history.json")
                 image_path = find_result_file(ih, output_dir, sub_dir, "start_image", {".png", ".jpg", ".jpeg", ".webp"})
                 if not image_path:
@@ -3663,7 +3763,7 @@ def main() -> None:
 
             comfy_input_name = upload_image_to_comfy(
                 start_image_local,
-                args.comfy_url,
+                comfy_url,
                 f"aligned_song_inputs/{run_id}/block_{block_i:03d}",
             )
 
@@ -3683,9 +3783,9 @@ def main() -> None:
             write_json(part_debug_dir / "video_patched.json", vwf)
 
             log("  [stage] queue video")
-            pid, client_id = queue_prompt(vwf, args.comfy_url)
+            pid, client_id = queue_prompt(vwf, comfy_url)
             log(f"  [video] prompt_id={pid}")
-            vh = wait_history(pid, args.comfy_url, vwf, client_id)
+            vh = wait_history(pid, comfy_url, vwf, client_id)
             check_history_status(vh, part_debug_dir / "video_history.json")
             video_path = find_result_file(vh, output_dir, sub_dir, "video", {".mp4", ".mov", ".webm", ".mkv"})
             if not video_path:
@@ -3786,6 +3886,7 @@ def main() -> None:
         final_audio,
         ass_path,
         final,
+        subtitle_preview,
         audio_mode,
         alignment_mode,
         args.limit,
