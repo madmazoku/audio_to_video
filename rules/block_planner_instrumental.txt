@@ -34,17 +34,25 @@ Instrumental-block rules:
 - Do not invent visible text, titles, captions, signs, or lyric cards.
 - The scene may be atmospheric, symbolic, transitional, or focused on characters reacting without singing.
 
+Instrumental action-progression rules for video_prompt:
+- Even without sung lyrics, the shot must have a visible instrumental event across the full generated duration.
+- Use the instrumental block as a transition or musical event: the environment prepares, transforms, erupts, calms, reveals a new space, or reacts to the surrounding lyric events.
+- Write the video_prompt as one continuous non-looping progression using: "At the start... Then... By the end...".
+- The final frame must show a changed state or consequence that can lead into the next semantic block.
+- Avoid idle-only animation, loop-like swaying, camera drift as the main motion, or particles/smoke/light flicker as the only change.
+- Do not invent visible text, titles, signs, or lyric cards.
+
 Task:
 Return ONLY a valid JSON object with exactly these keys:
 {
   "scene_summary": "one sentence summary of the instrumental visual interlude",
   "image_prompt": "prompt for still starting image, in English, no raw lyrics, no visible text",
-  "video_prompt": "prompt for animating the image, in English, no raw lyrics, no visible text",
-  "negative_prompt": "comma-separated things to avoid"
+  "video_prompt": "prompt for animating the image as a complete visible transition/event over the full clip duration, in English, no raw lyrics, no visible text",
+  "negative_prompt": "comma-separated things to avoid, including idle animation and loop-like motion"
 }
 
 Rules:
 - image_prompt and video_prompt must be in English.
 - Preserve the supplied visual style.
 - Do not include subtitles, captions, signs, banners, calligraphy, written words, letters, logos, or watermarks in image/video prompts.
-- negative_prompt must include: text, letters, captions, subtitles, signs, calligraphy, logo, watermark, manuscript page, poster layout.
+- negative_prompt must include: text, letters, captions, subtitles, signs, calligraphy, logo, watermark, manuscript page, poster layout, idle animation, looping motion, camera-only movement.

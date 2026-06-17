@@ -37,20 +37,34 @@ Priority rules:
 - Do not ask the image/video model to render visible text.
 - Choose only a few relevant props for the block. Do not include every recurring prop.
 
+Action-progression rules for video_prompt:
+- Infer a concrete visual micro-event from the current block even when the lyrics are metaphorical, repetitive, chanted, or abstract.
+- The video_prompt must cover the whole generated duration as a single continuous non-looping event: beginning, development, and changed end state.
+- Write it with explicit temporal phrases: "At the start... Then... By the end...".
+- Include at least one purposeful character action, one object/environment reaction, and one visible consequence by the end.
+- The final frame must be visibly changed from the starting frame; do not return to the same pose, same composition, or same state.
+- Do not make camera movement the only motion. Camera movement may support the action, but characters, objects, lighting, props, or the environment must actually change.
+- Avoid idle-only animation: no loop-like swaying, no repeated rhythmic gestures, no endless floating particles, no static pose with only smoke/light/hair movement.
+- Prefer irreversible physical verbs and cause/effect: raises, grabs, turns, opens, shatters, scatters, extinguishes, collapses, reveals, transforms, strikes, recoils, retreats, bursts, falls, floods, consumes, clears.
+- For repeated chorus/refrain blocks, escalate the event or show a later consequence instead of repeating the same performance pose.
+- Keep the action consistent with the still image and the current block; do not invent unrelated plot twists.
+
 Task:
 Return ONLY a valid JSON object with exactly these keys:
 {
   "scene_summary": "one sentence summary of the literal current-block visual event",
   "image_prompt": "prompt for still starting image, in English, no raw lyrics, no visible text",
-  "video_prompt": "prompt for animating the image, in English, no raw lyrics, no visible text",
-  "negative_prompt": "comma-separated things to avoid"
+  "video_prompt": "prompt for animating the image as a complete visible action arc over the full clip duration, in English, no raw lyrics, no visible text",
+  "negative_prompt": "comma-separated things to avoid, including idle animation and loop-like motion"
 }
 
 Rules:
 - image_prompt and video_prompt must be in English.
 - Preserve the supplied visual style.
 - Do not include subtitles, captions, signs, banners, calligraphy, written words, letters, logos, or watermarks in image/video prompts.
-- negative_prompt must include: text, letters, captions, subtitles, signs, calligraphy, logo, watermark, manuscript page, poster layout.
+- negative_prompt must include: text, letters, captions, subtitles, signs, calligraphy, logo, watermark, manuscript page, poster layout, idle animation, looping motion, camera-only movement.
 
-Additional verse-block rule:
+Additional verse-block rules:
 - The main visible action must be derived from CURRENT BLOCK, not from global song context or neighboring verses.
+- If CURRENT SUBRANGE is present, make its local meaning the main action beat; use the full semantic range only for context.
+- For repeated chorus/refrain blocks, do not output the same idle performance shot again; escalate the visual consequence or change the event stage while preserving continuity.

@@ -35,20 +35,28 @@ Priority rules:
 - Do not ask the image/video model to render visible text.
 - Choose only a few relevant props for the block. Do not include every recurring prop.
 
+Opening action-progression rules for video_prompt:
+- The intro may establish mood and world, but it must still contain a visible opening event, not a static establishing shot.
+- Use it as an opening reveal: the location awakens, lights ignite or fail, a presence is introduced, objects react, a portal/gate/space is revealed, or a visual omen unfolds.
+- Write the video_prompt as one continuous non-looping progression using: "At the start... Then... By the end...".
+- The end state must visibly set up the first lyric block and differ from the first frame.
+- Avoid camera drift, smoke, particles, hair movement, flickering light, or idle swaying as the main motion.
+- Do not make the intro action so climactic that it steals the first verse; it should prepare the first lyric block.
+
 Task:
 Return ONLY a valid JSON object with exactly these keys:
 {
   "scene_summary": "one sentence summary of the literal current-block visual event",
   "image_prompt": "prompt for still starting image, in English, no raw lyrics, no visible text",
-  "video_prompt": "prompt for animating the image, in English, no raw lyrics, no visible text",
-  "negative_prompt": "comma-separated things to avoid"
+  "video_prompt": "prompt for animating the image as an opening reveal with visible progression over the full clip duration, in English, no raw lyrics, no visible text",
+  "negative_prompt": "comma-separated things to avoid, including idle animation and loop-like motion"
 }
 
 Rules:
 - image_prompt and video_prompt must be in English.
 - Preserve the supplied visual style.
 - Do not include subtitles, captions, signs, banners, calligraphy, written words, letters, logos, or watermarks in image/video prompts.
-- negative_prompt must include: text, letters, captions, subtitles, signs, calligraphy, logo, watermark, manuscript page, poster layout.
+- negative_prompt must include: text, letters, captions, subtitles, signs, calligraphy, logo, watermark, manuscript page, poster layout, idle animation, looping motion, camera-only movement.
 
 Additional intro-block rule:
 - This is the opening instrumental intro before lyrics.

@@ -2417,13 +2417,6 @@ def run_comfy_planner(
     if missing:
         raise RuntimeError(f"Planner JSON missing keys: {missing}. Raw response saved to {raw_path}")
 
-    guard = "No visible text, no letters, no captions, no subtitles, no signs, no calligraphy, no logo, no watermark."
-    plan["image_prompt"] = f"{str(plan['image_prompt']).strip()} {guard}"
-    plan["video_prompt"] = f"{str(plan['video_prompt']).strip()} {guard}"
-    plan["negative_prompt"] = (
-        f"{str(plan['negative_prompt']).strip()}, text, letters, readable words, captions, subtitles, "
-        "signs, calligraphy, title card, logo, watermark, manuscript page, poster layout"
-    )
     clean_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     return {k: str(plan[k]) for k in required}
 
