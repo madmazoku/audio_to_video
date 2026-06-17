@@ -659,6 +659,25 @@ CURRENT SUBRANGE TEXT, when present
 
 Visual style is the mandatory style contract. Current subrange text is the highest factual priority when a semantic block is split. Bracket directives are metadata and must not be rendered as visible text.
 
+
+### Action-oriented video prompts
+
+The default block planner rules are tuned for LTXV image-to-video. The LLM is asked to write every `video_prompt` as a short non-looping event arc instead of an idle animated illustration. The image prompt defines the starting keyframe; the video prompt must describe what happens after that frame.
+
+Every generated video prompt should contain a clear temporal structure:
+
+```text
+At the start...
+Then...
+By the end...
+```
+
+The event should include character action, object interaction, or environmental transformation, plus a visible consequence in the final frame. Camera drift, smoke, particles, hair movement, breathing, flickering light, and rhythmic swaying may support the shot, but they must not be the main motion.
+
+The runner does not append or rewrite prompt fragments in code. Action policy lives in `rules/*.txt`; the planner JSON schema is unchanged.
+
+The default `recommended_workflow_seconds` and `max_workflow_seconds` use the existing config keys and are intentionally shorter for LTXV action shots. Shorter subranges are more likely to produce visible action instead of slow idle motion.
+
 ## 11. Subtitle styling
 
 Default subtitle style:
@@ -759,12 +778,12 @@ Default technical/timeline configuration:
 ```json
 {
   "comfy_url": "http://127.0.0.1:8188",
-  "comfy_output_dir": "G:\Git\ComfyUI\output",
+  "comfy_output_dir": "..\\ComfyUI\\output",
   "width": 1280,
   "height": 720,
   "fps": 24,
-  "recommended_workflow_seconds": 20,
-  "max_workflow_seconds": 30,
+  "recommended_workflow_seconds": 12,
+  "max_workflow_seconds": 16,
   "instrumental_gap_min_seconds": 8.0,
   "instrumental_gap_min_ratio_of_median_verse": 0.5,
   "local_context_radius": 2,

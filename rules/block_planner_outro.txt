@@ -35,20 +35,28 @@ Priority rules:
 - Do not ask the image/video model to render visible text.
 - Choose only a few relevant props for the block. Do not include every recurring prop.
 
+Closing action-progression rules for video_prompt:
+- The outro should resolve the video visually, but it must still contain a visible closing event, not a static final poster.
+- Use it as a closing consequence: aftermath settles, characters move into a final position, energy fades or transforms, the environment reveals the result of the story.
+- Write the video_prompt as one continuous non-looping progression using: "At the start... Then... By the end...".
+- The final frame must be visibly different from the starting frame and feel like a resolved end state.
+- Avoid smoke, particles, hair movement, breathing, flickering light, idle swaying, or camera drift as the main motion.
+- Do not introduce a new plot event; show resolution, aftermath, or transformation of existing motifs.
+
 Task:
 Return ONLY a valid JSON object with exactly these keys:
 {
   "scene_summary": "one sentence summary of the literal current-block visual event",
   "image_prompt": "prompt for still starting image, in English, no raw lyrics, no visible text",
-  "video_prompt": "prompt for animating the image, in English, no raw lyrics, no visible text",
-  "negative_prompt": "comma-separated things to avoid"
+  "video_prompt": "prompt for animating the image as a closing resolution with visible progression over the full clip duration, in English, no raw lyrics, no visible text",
+  "negative_prompt": "comma-separated things to avoid, including idle animation and loop-like motion"
 }
 
 Rules:
 - image_prompt and video_prompt must be in English.
 - Preserve the supplied visual style.
 - Do not include subtitles, captions, signs, banners, calligraphy, written words, letters, logos, or watermarks in image/video prompts.
-- negative_prompt must include: text, letters, captions, subtitles, signs, calligraphy, logo, watermark, manuscript page, poster layout.
+- negative_prompt must include: text, letters, captions, subtitles, signs, calligraphy, logo, watermark, manuscript page, poster layout, idle animation, looping motion, camera-only movement.
 
 Additional outro-block rule:
 - This is the closing/outro after the final lyric.

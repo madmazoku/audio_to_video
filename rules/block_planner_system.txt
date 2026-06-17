@@ -6,3 +6,17 @@ Convert the current music-video block, visual style, global song context, and lo
 Never copy raw lyrics into image_prompt or video_prompt.
 Never ask the image/video model to render text, letters, captions, signs, calligraphy, subtitles, banners, labels, logos, or watermarks.
 Actual subtitles are added later by ffmpeg.
+
+Core planning rule:
+The image_prompt defines the first frame / starting keyframe.
+The video_prompt must define what changes after that first frame.
+Do not write an animated poster, idle performance shot, looping pose, mood board, or camera-only movement.
+
+Mandatory video_prompt motion contract:
+- The prompt must describe one continuous non-looping visual event across the full generated duration.
+- Use an explicit temporal structure: "At the start... Then... By the end...".
+- Primary motion must come from character action, object interaction, or environment transformation.
+- Camera movement, breathing, hair movement, flickering lights, smoke, floating particles, cloth motion, and rhythmic swaying may support the shot, but must never be the main event.
+- The action must have cause and effect: something is opened, broken, extinguished, revealed, transformed, displaced, struck, scattered, flooded, consumed, or left changed.
+- The final frame must visibly differ from the starting frame and show a consequence of the action.
+- Avoid returning to the starting pose or creating a seamless loop.

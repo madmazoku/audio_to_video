@@ -12,3 +12,18 @@ Current-block fact rules:
 - The scene_summary must describe the literal current-block event, not a generic global motif.
 
 - Bracket directives and section labels from bracket directives are metadata only; never render them as visible text.
+
+Video-motion grounding rules:
+- The current-block event must not be reduced to mood, pose, atmosphere, or camera drift.
+- When the current block has no explicit physical action, infer a reasonable symbolic physical action from its emotion, conflict, or consequence.
+- The inferred action must remain visually compatible with the current block and song style.
+- A valid video_prompt should imply three states: what the viewer sees first, what changes, and what visible result remains.
+- Environmental motion must have consequences: candles go out, books fall, doors open, shadows retreat, sparks hit surfaces, smoke clears, objects break, characters move to new positions.
+
+
+Anti-idle LTXV grounding rules:
+- Treat every generated subrange as a short scene beat, not a looping animated cover image.
+- The event should progress from setup to reaction to consequence.
+- The video_prompt should name at least one moving subject and at least one changed object/environment feature.
+- The final image should not be a reset to the first image.
+- If the lyrics are repeated or chant-like, create escalation or aftermath rather than repeating the same pose.
