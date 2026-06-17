@@ -9,13 +9,13 @@ This repository contains the orchestration code and versioned prompt/workflow te
 `aligned_song_video_runner.py` builds a music video in these stages:
 
 1. Reads a song project from `--input-dir`.
-2. Parses generated lyric timing from `output/work/alignment/alignment.json` or `output/work/alignment/alignment.lrc`.
+2. Prepares or refreshes lyric timing in `output/work/alignment/`.
 3. Builds semantic timeline blocks: `intro`, `verse`, `instrumental`, `outro`.
-4. Uses a ComfyUI LLM workflow to create visual prompts for each block.
-5. Renders each semantic block as one final clip.
-6. Splits long semantic blocks into internal subranges when needed.
-7. Uses ComfyUI image/video workflows to generate clips.
-8. Concatenates generated clips, prepares audio, and burns karaoke ASS subtitles into `final_video.mp4`.
+4. Builds karaoke subtitles and an early `subtitle_preview.mp4` with debug range/subrange progress bars.
+5. Uses ComfyUI LLM/image/video workflows only for blocks that need visual generation.
+6. Generates unscaled visual material for each semantic block.
+7. Retimes each unscaled block clip to the current timeline duration by scaling video timestamps.
+8. Concatenates scaled clips, normalizes final FPS, burns karaoke ASS subtitles, and muxes the full song audio into `final_video.mp4`.
 
 The public unit is always a semantic range/block. Internal subranges are only used to render long blocks. User-facing options such as `--rework N`, `video_style_N.txt`, and `subtitle_styles_N.ass` refer to semantic block numbers, not internal subranges.
 
@@ -104,7 +104,7 @@ G:\Tools\ffmpeg\bin
 The runner uses FFmpeg for:
 
 - audio conversion and mixing,
-- video trim/pad,
+- stream-copy video remuxing and timestamp retiming,
 - subclip and final clip concatenation,
 - extracting last frames for long-block subrange chaining,
 - burning ASS subtitles into the final video.
@@ -252,7 +252,13 @@ Rework one existing semantic block:
 .\.venv\Scripts\python.exe .\aligned_song_video_runner.py --output-dir .\output-test --rework 2
 ```
 
-Rebuild final video without regenerating ComfyUI clips:
+Render only the subtitle preview video and stop before ComfyUI generation:
+
+```powershell
+.\.venv\Scripts\python.exe .\aligned_song_video_runner.py --output-dir .\output-test --preview-subtitles-only
+```
+
+Refresh alignment from current lyrics/audio, render subtitle preview, and stop before visual generation:
 
 ```powershell
 .\.venv\Scripts\python.exe .\aligned_song_video_runner.py --output-dir .\output-test --rebuild-final
@@ -282,13 +288,25 @@ Use only the first `N` parsed lyric verses for testing. If `N` equals the total 
 --rework N [N ...]
 ```
 
-Regenerate only selected semantic blocks and reuse existing clips for all others. `--rework` expects existing output from a previous normal run. If a selected semantic block is internally split into subranges, the whole semantic block is regenerated.
+Regenerate only selected semantic blocks and reuse existing unscaled clips for all others. `--rework` expects existing output from a previous normal run. If a selected semantic block is internally split into subranges, the whole semantic block is regenerated as a new unscaled range clip.
 
 ```text
 --rebuild-final
 ```
 
-Do not run LLM/image/video generation. Reuse existing semantic clips from `output/work/clips/`, regenerate subtitles/final concat/mux, and write a fresh manifest.
+Do not run LLM/image/video generation. Reuse existing unscaled semantic clips from `output/work/clips_unscaled/`, retime them into `output/work/clips/`, regenerate subtitles/final concat/mux, and write a fresh manifest.
+
+```text
+--preview-subtitles-only
+```
+
+Build full-song preview subtitles, build debug-only `work/subs/preview_debug.ass`, and render `subtitle_preview.mp4`, then stop before any ComfyUI song-context/planner/image/video work. The preview is always generated for the whole song, regardless of `--limit`; `--limit` only affects visual generation/final assembly. This is the fastest way to check voice/subtitle alignment, karaoke timing, and semantic range/subrange boundaries.
+
+```text
+--refresh-alignment
+```
+
+Rebuild `output/work/alignment/` from the current `input/lyrics.txt` and the current alignment source before parsing timeline blocks. Use this after editing lyrics to match the actual vocals. With `--preview-subtitles-only`, this lets you validate new karaoke timing and range/subrange boundaries before any visual generation. During visual reuse, existing `clips_unscaled/` files are matched by the same block index and checked by duration ratio only; the default tolerance is `clip_reuse_duration_tolerance_ratio = 0.05`.
 
 ```text
 --comfy-url URL
@@ -354,7 +372,7 @@ A normal run is treated as a new creative attempt. Existing files in `--output-d
 
 ### Rework run
 
-`--rework` keeps the output directory and regenerates only requested semantic block numbers. rework/rebuild-final do not rebuild alignment; they read only `output/work/alignment/`.
+`--rework` keeps the output directory and regenerates only requested semantic block numbers as unscaled clips. Rework/rebuild-final do not rebuild alignment unless `--refresh-alignment` is also passed.
 
 Behavior:
 
@@ -362,7 +380,7 @@ Behavior:
 keep --output-dir
 reuse existing alignment.json
 reuse frozen song_context.json
-reuse semantic clips not listed in --rework
+reuse unscaled semantic clips not listed in --rework
 regenerate selected semantic blocks
 regenerate subtitles and final video
 write manifest
@@ -379,12 +397,12 @@ Behavior:
 ```text
 keep --output-dir
 reuse existing alignment.json
-reuse semantic clips from output/work/clips/
+reuse unscaled semantic clips from output/work/clips_unscaled/
 regenerate subtitles and final video
 write manifest
 ```
 
-Internal subclips are not required for `--rebuild-final`.
+Internal raw subclips are not required for `--rebuild-final`; `clips_unscaled/` is required.
 
 ## 7. Input folder
 
@@ -521,12 +539,22 @@ output/work/
     full_mix.wav
     final_audio.wav
 
+  clips_unscaled/
+    clip_000_intro.mp4
+    clip_001_verse_001.mp4
+    ...
+
   clips/
     clip_000_intro.mp4
     clip_001_verse_001.mp4
     ...
 
-  subclips/
+  subclips_raw/
+    block_NNN/
+      part_001.mp4
+      part_002.mp4
+
+  subclips_video/
     block_NNN/
       part_001.mp4
       part_002.mp4
@@ -536,9 +564,6 @@ output/work/
       part_001_start.png
       part_001_last.png
 
-  clips_raw/
-    raw ComfyUI video copies and semantic intermediates
-
   plans/
     song_context.json
     plan_NNN.json
@@ -546,6 +571,7 @@ output/work/
 
   subs/
     karaoke.ass
+    preview_debug.ass
 
   video/
     video_only.mp4
@@ -562,6 +588,8 @@ output/work/
     subtitle_styles_map.json
     timing_report.json
     video_generation_NNN.json
+    clip_reuse_plan.json
+    clip_scaling_report.json
 
     ranges/
       range_NNN/
@@ -585,7 +613,7 @@ output/work/
           video_generation.json
 ```
 
-`output/work/clips/` contains semantic clips used by final assembly. `output/work/subclips/` and `output/work/frames/` are internal artifacts for long-range rendering.
+`output/work/clips_unscaled/` contains semantic range visual material as generated/assembled, without duration fitting. `output/work/clips/` contains timestamp-retimed copies fitted to the current timeline and used by final assembly. `output/work/subclips_raw/`, `output/work/subclips_video/`, and `output/work/frames/` are internal artifacts for long-range rendering.
 
 ## 9. Semantic blocks and internal subranges
 
@@ -624,8 +652,8 @@ next subrange:
   video_from_image_api.json -> subclip
 
 after all subranges:
-  concatenate subclips -> semantic clip
-  trim/pad semantic clip to exact block duration
+  concatenate video-only subclips -> clips_unscaled semantic clip
+  later final assembly retimes clips_unscaled -> clips by timestamp scaling
 ```
 
 The next semantic block starts from a fresh generated image. Last-frame chaining is only inside one semantic block.
@@ -638,7 +666,7 @@ For lyric ranges, `range_visual_preroll_seconds` lets the semantic clip start sl
 
 Word-level karaoke is gap-aware: gaps between word timestamps are preserved instead of compressing all words together. Silent gaps inside the karaoke overlay are consumed without making the next word highlight early.
 
-After subtitles are generated, the runner immediately writes `subtitle_preview.mp4`: a black-screen video with the rendered audio track and burned ASS subtitles. Use it to check karaoke timing before waiting for image/video generation.
+After subtitles are generated, the runner immediately writes `subtitle_preview.mp4`: a black-screen video with the full song audio track, burned full-song preview karaoke subtitles from `work/subs/preview_karaoke.ass`, and a separate debug overlay from `work/subs/preview_debug.ass`. This preview is independent of `--limit`; release/final subtitles remain in `work/subs/karaoke.ass` for the selected final timeline. The debug overlay is vector-drawn ASS graphics with three progress bars: full song progress with range/subrange boundary ticks, current range progress, and current subrange progress. Range labels use compact `Rnumber/count` labels without the range kind, where `count` is always the total full-song range count, independent of `--limit`; this total is the maximum useful value for `--limit`. Subranges use `Snumber/count`. `preview_debug.ass` is never used for the final video. This happens before song-context LLM, planner LLM, image generation, or video generation. Use `--preview-subtitles-only` to stop after this file is created.
 
 Intro, outro, and instrumental gaps use the same threshold predicate. A silent gap becomes its own semantic block only when its duration is at least `instrumental_gap_threshold`; shorter intro/outro gaps are merged into the nearest lyric range.
 
@@ -793,7 +821,8 @@ Default technical/timeline configuration:
   "alignment_match_lookahead_words": 5,
   "alignment_match_similarity_threshold": 0.72,
   "alignment_match_warn_ratio": 0.2,
-  "alignment_match_max_extra_ratio": 0.5
+  "alignment_match_max_extra_ratio": 0.5,
+  "clip_reuse_duration_tolerance_ratio": 0.05
 }
 ```
 
@@ -887,7 +916,7 @@ Purpose in this project:
 ```text
 audio conversion
 audio mixing
-video trim/pad
+stream-copy video remuxing and timestamp retiming
 frame extraction
 concat
 subtitle burn-in
