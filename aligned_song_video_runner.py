@@ -948,6 +948,7 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         "alignment_match_similarity_threshold": (int, float),
         "alignment_match_warn_ratio": (int, float),
         "alignment_match_max_extra_ratio": (int, float),
+        "clip_reuse_duration_tolerance_ratio": (int, float),
     }
 
     for key, expected_type in required.items():
@@ -973,6 +974,7 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
     config["alignment_match_similarity_threshold"] = float(config["alignment_match_similarity_threshold"])
     config["alignment_match_warn_ratio"] = float(config["alignment_match_warn_ratio"])
     config["alignment_match_max_extra_ratio"] = float(config["alignment_match_max_extra_ratio"])
+    config["clip_reuse_duration_tolerance_ratio"] = float(config["clip_reuse_duration_tolerance_ratio"])
     config["_source"] = source
     return config
 
@@ -2167,49 +2169,290 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         })
 
 
+
+def ass_draw_rect(x: int, y: int, w: int, h: int, color: str, alpha: str = "&H00&") -> str:
+    """Return an ASS vector rectangle at absolute screen coordinates."""
+    w = max(1, int(w))
+    h = max(1, int(h))
+    return (
+        f"{{\\an7\\pos({int(x)},{int(y)})\\p1\\bord0\\shad0"
+        f"\\c{color}\\alpha{alpha}}}m 0 0 l {w} 0 l {w} {h} l 0 {h}"
+    )
+
+
+def ass_draw_tick(x: int, y: int, h: int, color: str, alpha: str = "&H00&", width: int = 2) -> str:
+    return ass_draw_rect(int(x), int(y), max(1, int(width)), int(h), color, alpha)
+
+
+def clamp01(value: float) -> float:
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
+
+
+def format_progress_time(value: float) -> str:
+    value = max(0.0, float(value))
+    if value >= 60.0:
+        minutes = int(value // 60)
+        seconds = int(round(value - minutes * 60))
+        if seconds >= 60:
+            minutes += 1
+            seconds -= 60
+        return f"{minutes:02d}:{seconds:02d}"
+    return f"{value:04.1f}s"
+
+
+def build_preview_debug_ass(
+    blocks: List[Dict[str, Any]],
+    out_path: Path,
+    width: int,
+    height: int,
+    config: Dict[str, Any],
+    total_duration: float,
+) -> None:
+    """Write debug-only ASS progress bars for subtitle_preview.mp4.
+
+    This file is never used for the release/final karaoke subtitles.
+    It renders three vector progress bars: full song, current range, and current subrange.
+    """
+    total_duration = max(0.1, float(total_duration))
+    range_count = len(blocks)
+    step = max(0.1, float(config.get("preview_progress_step_seconds", 0.5)))
+
+    label_x = 24
+    bar_x = 150
+    bar_w = max(240, int(width - 330))
+    time_x = bar_x + bar_w + 18
+    bar_h = 18
+    row_gap = 34
+    y0 = 24
+    y_song = y0
+    y_range = y0 + row_gap
+    y_sub = y0 + row_gap * 2
+    tick_h = bar_h + 8
+
+    bg = "&H00242424&"
+    border = "&H00787878&"
+    fill_song = "&H00C28A35&"
+    fill_range = "&H0065B86A&"
+    fill_sub = "&H00D0B050&"
+    range_tick = "&H00FFFFFF&"
+    sub_tick = "&H0060E8FF&"
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: PreviewDebug,Consolas,24,&H00FFFFFF,&H00FFFFFF,&H00000000,&HAA000000,0,0,0,0,100,100,0,0,1,2,0,7,24,24,24,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    events: List[str] = []
+
+    def add_draw(layer: int, start: float, end: float, shape: str) -> None:
+        if end <= start:
+            return
+        events.append(f"Dialogue: {layer},{ass_timestamp(start)},{ass_timestamp(end)},PreviewDebug,,0,0,0,,{shape}")
+
+    def add_text(layer: int, start: float, end: float, x: int, y: int, text: str) -> None:
+        if end <= start:
+            return
+        events.append(
+            f"Dialogue: {layer},{ass_timestamp(start)},{ass_timestamp(end)},PreviewDebug,,0,0,0,,"
+            f"{{\\an7\\pos({int(x)},{int(y)})}}{ass_escape(text)}"
+        )
+
+    def add_bar_background(start: float, end: float, y: int) -> None:
+        add_draw(1, start, end, ass_draw_rect(bar_x, y, bar_w, bar_h, bg, "&H20&"))
+        add_draw(4, start, end, ass_draw_rect(bar_x - 1, y - 1, bar_w + 2, 2, border, "&H20&"))
+        add_draw(4, start, end, ass_draw_rect(bar_x - 1, y + bar_h, bar_w + 2, 2, border, "&H20&"))
+        add_draw(4, start, end, ass_draw_rect(bar_x - 1, y - 1, 2, bar_h + 2, border, "&H20&"))
+        add_draw(4, start, end, ass_draw_rect(bar_x + bar_w, y - 1, 2, bar_h + 2, border, "&H20&"))
+
+    add_text(5, 0.0, total_duration, label_x, y_song - 4, "SONG")
+    add_bar_background(0.0, total_duration, y_song)
+    # Full-song progress fill and time label.
+    t = 0.0
+    while t < total_duration:
+        nt = min(total_duration, t + step)
+        mid = (t + nt) * 0.5
+        ratio = clamp01(mid / total_duration)
+        fill_w = int(round(bar_w * ratio))
+        if fill_w > 0:
+            add_draw(2, t, nt, ass_draw_rect(bar_x, y_song, fill_w, bar_h, fill_song, "&H20&"))
+        add_text(5, t, nt, time_x, y_song - 4, f"{format_progress_time(mid)} / {format_progress_time(total_duration)}")
+        t = nt
+
+    # Always-visible full-song range and subrange boundary ticks.
+    seen_sub_ticks = set()
+    for block in blocks:
+        start = max(0.0, float(block["start"]))
+        end = min(total_duration, max(start, float(block["end"])))
+        for boundary in (start, end):
+            x = bar_x + int(round(bar_w * clamp01(boundary / total_duration)))
+            add_draw(6, 0.0, total_duration, ass_draw_tick(x, y_song - 4, tick_h, range_tick, "&H00&", 2))
+        for sub in build_subranges_for_block(block, config):
+            for boundary in (float(sub["start"]), float(sub["end"])):
+                key = round(boundary, 3)
+                if key in seen_sub_ticks:
+                    continue
+                seen_sub_ticks.add(key)
+                x = bar_x + int(round(bar_w * clamp01(boundary / total_duration)))
+                add_draw(5, 0.0, total_duration, ass_draw_tick(x, y_song, bar_h, sub_tick, "&H10&", 1))
+
+    # Per-range and per-subrange progress bars.
+    for block in blocks:
+        block_i = int(block["block_index"])
+        start = max(0.0, float(block["start"]))
+        end = min(total_duration, max(start + 0.1, float(block["end"])))
+        duration = max(0.1, end - start)
+        subranges = build_subranges_for_block(block, config)
+
+        add_text(5, start, end, label_x, y_range - 4, f"R{block_i:03d}/{range_count:03d}")
+        add_bar_background(start, end, y_range)
+        for sub in subranges:
+            boundary = max(start, min(end, float(sub["start"])))
+            x = bar_x + int(round(bar_w * clamp01((boundary - start) / duration)))
+            add_draw(6, start, end, ass_draw_tick(x, y_range - 4, tick_h, sub_tick, "&H00&", 2))
+        add_draw(6, start, end, ass_draw_tick(bar_x + bar_w, y_range - 4, tick_h, sub_tick, "&H00&", 2))
+
+        t = start
+        while t < end:
+            nt = min(end, t + step)
+            mid = (t + nt) * 0.5
+            elapsed = max(0.0, mid - start)
+            ratio = clamp01(elapsed / duration)
+            fill_w = int(round(bar_w * ratio))
+            if fill_w > 0:
+                add_draw(2, t, nt, ass_draw_rect(bar_x, y_range, fill_w, bar_h, fill_range, "&H20&"))
+            add_text(5, t, nt, time_x, y_range - 4, f"{format_progress_time(elapsed)} / {format_progress_time(duration)}")
+            t = nt
+
+        for sub in subranges:
+            sub_i = int(sub["sub_index"])
+            sub_count = int(sub["sub_count"])
+            ss = max(start, float(sub["start"]))
+            se = min(end, max(ss + 0.1, float(sub["end"])))
+            sd = max(0.1, se - ss)
+            add_text(5, ss, se, label_x, y_sub - 4, f"S{sub_i:03d}/{sub_count:03d}")
+            add_bar_background(ss, se, y_sub)
+            t = ss
+            while t < se:
+                nt = min(se, t + step)
+                mid = (t + nt) * 0.5
+                elapsed = max(0.0, mid - ss)
+                ratio = clamp01(elapsed / sd)
+                fill_w = int(round(bar_w * ratio))
+                if fill_w > 0:
+                    add_draw(2, t, nt, ass_draw_rect(bar_x, y_sub, fill_w, bar_h, fill_sub, "&H20&"))
+                add_text(5, t, nt, time_x, y_sub - 4, f"{format_progress_time(elapsed)} / {format_progress_time(sd)}")
+                t = nt
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+
 def ffmpeg_sub_path(path: Path) -> str:
     return path.resolve().as_posix().replace(":", r"\:").replace("'", r"\'")
 
 
-def trim_or_pad_video(video_in: Path, duration: float, video_out: Path, ffmpeg: str) -> None:
+def copy_video_only(video_in: Path, video_out: Path, ffmpeg: str) -> None:
+    """Copy only the video stream without re-encoding."""
     video_out.parent.mkdir(parents=True, exist_ok=True)
-    # Generated videos are usually slightly longer because frame counts are rounded.
-    # setpts normalizes timestamps; tpad covers rare too-short clips.
     run_cmd([
         ffmpeg, "-y",
         "-i", str(video_in),
-        "-vf", f"tpad=stop_mode=clone:stop_duration=2,trim=duration={duration:.3f},setpts=PTS-STARTPTS",
+        "-map", "0:v:0",
         "-an",
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
+        "-c:v", "copy",
+        "-movflags", "+faststart",
         str(video_out),
     ])
 
 
 def concat_videos(clips: List[Path], out: Path, ffmpeg: str) -> None:
+    """Concatenate compatible video-only clips without re-encoding."""
     out.parent.mkdir(parents=True, exist_ok=True)
     concat_txt = out.parent / "concat.txt"
-    concat_txt.write_text("\n".join(f"file '{p.as_posix()}'" for p in clips), encoding="utf-8")
+    concat_txt.write_text("\n".join(f"file '{p.resolve().as_posix()}'" for p in clips), encoding="utf-8")
     run_cmd([
         ffmpeg, "-y",
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_txt),
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
+        "-map", "0:v:0",
         "-an",
+        "-c:v", "copy",
+        "-movflags", "+faststart",
         str(out),
     ])
 
 
-def final_mux(video_in: Path, audio_in: Path, ass_path: Path, out: Path, ffmpeg: str) -> None:
+def retime_video_copy(
+    video_in: Path,
+    target_duration: float,
+    video_out: Path,
+    ffmpeg: str,
+    ffprobe: str,
+    fps: int,
+) -> Dict[str, Any]:
+    """Fit a video-only range clip to the timeline by scaling timestamps only."""
+    video_out.parent.mkdir(parents=True, exist_ok=True)
+    source_duration = ffprobe_duration(video_in, ffprobe)
+    if source_duration <= 0:
+        raise RuntimeError(f"Cannot retime zero-duration video: {video_in}")
+    target_duration = max(0.1, float(target_duration))
+    scale = target_duration / source_duration
+    run_cmd([
+        ffmpeg, "-y",
+        "-itsscale", f"{scale:.9f}",
+        "-i", str(video_in),
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "copy",
+        "-movflags", "+faststart",
+        str(video_out),
+    ])
+    verified_duration = ffprobe_duration(video_out, ffprobe)
+    verify_epsilon = max(0.15, 3.0 / max(1, int(fps)))
+    if abs(verified_duration - target_duration) > verify_epsilon:
+        raise RuntimeError(
+            "Retimed clip duration verification failed:\n"
+            f"  source: {video_in} duration={source_duration:.3f}s\n"
+            f"  target: {video_out} expected={target_duration:.3f}s actual={verified_duration:.3f}s\n"
+            "Intermediate clips are timestamp-retimed with stream copy only; no silent re-encode fallback is used."
+        )
+    return {
+        "source": str(video_in),
+        "target": str(video_out),
+        "source_duration": source_duration,
+        "target_duration": target_duration,
+        "scale": scale,
+        "verified_duration": verified_duration,
+        "codec_copy": True,
+    }
+
+
+def duration_ratio_delta(source_duration: float, target_duration: float) -> float:
+    target_duration = max(0.1, float(target_duration))
+    return abs(float(source_duration) - target_duration) / target_duration
+
+
+def final_mux(video_in: Path, audio_in: Path, ass_path: Path, out: Path, ffmpeg: str, fps: int) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     sub_arg = ffmpeg_sub_path(ass_path)
     run_cmd([
         ffmpeg, "-y",
         "-i", str(video_in),
         "-i", str(audio_in),
-        "-vf", f"subtitles='{sub_arg}'",
+        "-vf", f"fps={int(fps)},subtitles='{sub_arg}'",
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-shortest",
@@ -2231,16 +2474,21 @@ def render_subtitle_preview(
     height: int,
     fps: int,
     ffmpeg: str,
+    debug_ass_path: Optional[Path] = None,
 ) -> None:
-    """Render a quick black-screen karaoke preview with final audio and subtitles."""
+    """Render a quick black-screen karaoke preview with final audio and debug range markers."""
     out.parent.mkdir(parents=True, exist_ok=True)
     sub_arg = ffmpeg_sub_path(ass_path)
+    vf = f"subtitles='{sub_arg}'"
+    if debug_ass_path is not None:
+        debug_sub_arg = ffmpeg_sub_path(debug_ass_path)
+        vf += f",subtitles='{debug_sub_arg}'"
     run_cmd([
         ffmpeg, "-y",
         "-f", "lavfi",
         "-i", f"color=c=black:s={width}x{height}:r={fps}:d={duration:.3f}",
         "-i", str(audio_in),
-        "-vf", f"subtitles='{sub_arg}'",
+        "-vf", vf,
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-shortest",
@@ -2417,6 +2665,7 @@ def run_comfy_planner(
     if missing:
         raise RuntimeError(f"Planner JSON missing keys: {missing}. Raw response saved to {raw_path}")
 
+    # Do not modify visual prompts in code. Prompt policy belongs in rules/*.txt templates.
     clean_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     return {k: str(plan[k]) for k in required}
 
@@ -3311,6 +3560,59 @@ def write_timeline_manifest(
 
 
 
+def write_preview_manifest(
+    out_path: Path,
+    output_root: Path,
+    blocks: List[Dict[str, Any]],
+    final_audio: Path,
+    ass_path: Path,
+    subtitle_preview_path: Path,
+    audio_mode: str,
+    alignment_mode: str,
+    limit: int,
+    rework: Optional[List[int]],
+    run_id: str,
+) -> None:
+    items: List[Dict[str, Any]] = []
+    for block in blocks:
+        block_index = int(block["block_index"])
+        items.append({
+            "block_index": block_index,
+            "kind": block["kind"],
+            "verse_index": int(block.get("verse_index", block["block_index"])),
+            "start": float(block["start"]),
+            "end": float(block["end"]),
+            "duration": float(block["duration"]),
+            "text": block.get("text", ""),
+            "bracket_directives": block.get("bracket_directives", []),
+            "clip": None,
+            "plan": None,
+            "generation": {
+                "run_id": run_id,
+                "generated_in_this_run": False,
+                "preview_subtitles_only": True,
+            },
+        })
+    manifest = {
+        "output_dir": str(output_root),
+        "run_id": run_id,
+        "audio_mode": audio_mode,
+        "alignment_mode": alignment_mode,
+        "limit": limit,
+        "rework": rework or [],
+        "preview_subtitles_only": True,
+        "timeline_start": 0.0,
+        "timeline_end": float(blocks[-1]["end"]) if blocks else 0.0,
+        "audio": str(final_audio.relative_to(output_root)) if final_audio.is_relative_to(output_root) else str(final_audio),
+        "subtitles": str(ass_path.relative_to(output_root)) if ass_path.is_relative_to(output_root) else str(ass_path),
+        "subtitle_preview": str(subtitle_preview_path.relative_to(output_root)) if subtitle_preview_path.is_relative_to(output_root) else str(subtitle_preview_path),
+        "final": None,
+        "blocks": items,
+    }
+    write_json(out_path, manifest)
+
+
+
 def copy_file_if_exists(src_path: Path, dst_path: Path) -> None:
     if src_path.exists():
         dst_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3381,7 +3683,9 @@ def main() -> None:
     ap.add_argument("--output-dir", default="output", help="Folder for all generated artifacts. Defaults to ./output.")
     ap.add_argument("--limit", type=int, default=0, help="Use only first N verses/clips for testing.")
     ap.add_argument("--rework", nargs="*", type=int, default=None, help="Generate only these block numbers; reuse existing clips for other selected blocks. 0=intro, 1..N=verses, N+1=outro.")
-    ap.add_argument("--rebuild-final", action="store_true", help="Do not generate video; reuse existing clips and rebuild concat/final only.")
+    ap.add_argument("--rebuild-final", action="store_true", help="Do not generate video; reuse existing unscaled clips and rebuild scaled clips/final only.")
+    ap.add_argument("--refresh-alignment", action="store_true", help="Rebuild alignment/timeline from current input lyrics before deciding which visual clips to reuse or regenerate.")
+    ap.add_argument("--preview-subtitles-only", action="store_true", help="Build karaoke subtitles and subtitle_preview.mp4, then stop before any ComfyUI LLM/image/video generation.")
     ap.add_argument("--comfy-url", default=None, help="Override comfy_url from config.json.")
     ap.add_argument("--comfy-output-dir", default=None, help="Override comfy_output_dir from config.json.")
     ap.add_argument("--lyrics-language", default="en", help="Language code for stable-ts alignment. Default: en.")
@@ -3392,7 +3696,7 @@ def main() -> None:
     clips_reused = 0
     run_id = make_run_id()
     generation_info: Dict[int, Dict[str, Any]] = {}
-    fresh_generation_run = not args.rebuild_final and not args.rework
+    fresh_generation_run = not args.rebuild_final and not args.rework and not args.refresh_alignment
     rework_indices = set(args.rework or [])
 
     script_dir = Path(__file__).resolve().parent
@@ -3441,9 +3745,12 @@ def main() -> None:
     log(f"[stage] comfy out : {output_dir}")
     block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
 
-    if fresh_generation_run:
+    if fresh_generation_run or args.refresh_alignment:
         align_kind, align_path, _ = detect_alignment_source(input_dir)
         alignment_dir.mkdir(parents=True, exist_ok=True)
+        for stale_alignment in (alignment_dir / "alignment.json", alignment_dir / "alignment.lrc"):
+            if stale_alignment.exists():
+                stale_alignment.unlink()
         if align_kind == "vocals":
             run_stable_ts_alignment(
                 input_dir,
@@ -3473,28 +3780,6 @@ def main() -> None:
     stats_end(stats, "parse_alignment")
 
     plans_dir = out_dir / "plans"
-    if args.rebuild_final:
-        song_context_mode = "skip"
-    elif rework_indices:
-        song_context_mode = "frozen"
-    else:
-        song_context_mode = "fresh"
-
-    stats_start(stats, "song_context")
-    song_context = run_or_load_song_context(
-        planner_template,
-        rules,
-        video_style,
-        verses,
-        comfy_url,
-        plans_dir,
-        song_context_mode,
-    )
-    write_json(debug_dir / "song_context_used.json", {
-        "mode": song_context_mode,
-        "context": song_context,
-    })
-    stats_end(stats, "song_context")
 
     total_verses = len(verses)
     has_effective_limit = bool(args.limit and args.limit < total_verses)
@@ -3518,6 +3803,12 @@ def main() -> None:
     blocks, audio_end = make_timeline_blocks(verses, selected, audio_duration, has_effective_limit, config)
     if not blocks:
         raise RuntimeError("No timeline blocks created.")
+
+    # Subtitle preview is always full-song, regardless of --limit.
+    # --limit affects generation/final assembly only.
+    preview_blocks, preview_audio_end = make_timeline_blocks(verses, verses, audio_duration, False, config)
+    if not preview_blocks:
+        raise RuntimeError("No full-song preview timeline blocks created.")
     stats_end(stats, "timeline")
 
     block_indices = {int(b["block_index"]) for b in blocks}
@@ -3532,19 +3823,25 @@ def main() -> None:
 
     log(f"[stage] verses total={total_verses} selected={len(selected)} alignment={alignment_mode}")
     log(f"[stage] timeline blocks={len(blocks)} range=0.000s..{blocks[-1]['end']:.3f}s")
+    log(f"[stage] subtitle preview timeline blocks={len(preview_blocks)} range=0.000s..{preview_blocks[-1]['end']:.3f}s (full song)")
     if has_effective_limit:
         log(f"[stage] limit mode: audio/video ends at start of verse {len(selected) + 1:03d}")
     else:
         log("[stage] full-song mode: audio is not cut by verse boundaries")
 
     if args.rebuild_final:
-        log("[stage] rebuild-final mode: no video generation, existing clips only")
+        log("[stage] rebuild-final mode: no video generation; rebuild scaled clips/final only")
+    elif args.refresh_alignment and rework_indices:
+        log(f"[stage] refresh-alignment + rework mode: regenerate blocks {sorted(rework_indices)} and validate/reuse the rest")
+    elif args.refresh_alignment:
+        log("[stage] refresh-alignment mode: reuse compatible unscaled clips and generate missing/incompatible ranges")
     elif rework_indices:
         log(f"[stage] rework mode: regenerate blocks {sorted(rework_indices)} and reuse the rest")
     else:
         log("[stage] full generation mode for selected timeline blocks")
 
     write_json(debug_dir / "timeline_blocks.json", blocks)
+    write_json(debug_dir / "preview_timeline_blocks.json", preview_blocks)
 
     log("[stage] render audio for timeline")
     stats_start(stats, "render_audio")
@@ -3557,13 +3854,14 @@ def main() -> None:
     stats_start(stats, "subtitles")
     subtitle_mode = "word" if alignment_mode == "json" else "line"
     ass_path = out_dir / "subs" / "karaoke.ass"
+    preview_ass_path = out_dir / "subs" / "preview_karaoke.ass"
     style_section, subtitle_style_map, subtitle_style_report = build_subtitle_styles_for_blocks(
-        blocks,
+        preview_blocks,
         input_dir,
         data_dir,
         debug_dir,
     )
-    # Timeline always starts at 0 now, so subtitles keep real timestamps.
+    # Release subtitles follow the selected timeline used by final assembly.
     build_ass_subtitles(
         selected,
         blocks,
@@ -3577,37 +3875,164 @@ def main() -> None:
         config,
         debug_dir / "timing_report.json",
     )
+    # Preview subtitles are always full-song, independent of --limit.
+    build_ass_subtitles(
+        verses,
+        preview_blocks,
+        0.0,
+        width,
+        height,
+        preview_ass_path,
+        subtitle_mode,
+        style_section,
+        subtitle_style_map,
+        config,
+        debug_dir / "preview_timing_report.json",
+    )
     log(f"[stage] subtitles: {ass_path} ({subtitle_mode})")
+    log(f"[stage] preview subtitles: {preview_ass_path} ({subtitle_mode}, full song)")
     stats_end(stats, "subtitles")
+
+    preview_debug_ass = out_dir / "subs" / "preview_debug.ass"
+    build_preview_debug_ass(preview_blocks, preview_debug_ass, width, height, config, audio_duration)
 
     log("[stage] render subtitle preview")
     stats_start(stats, "subtitle_preview")
     subtitle_preview = output_root / "subtitle_preview.mp4"
     render_subtitle_preview(
-        final_audio,
-        ass_path,
+        full_mix,
+        preview_ass_path,
         subtitle_preview,
-        render_duration,
+        audio_duration,
         width,
         height,
         int(config["fps"]),
         ffmpeg_cmd,
+        preview_debug_ass,
     )
     log(f"[stage] subtitle preview: {subtitle_preview}")
     stats_end(stats, "subtitle_preview")
 
+    if args.preview_subtitles_only:
+        write_preview_manifest(
+            output_root / "manifest.json",
+            output_root,
+            preview_blocks,
+            full_mix,
+            preview_ass_path,
+            subtitle_preview,
+            audio_mode,
+            alignment_mode,
+            args.limit,
+            sorted(rework_indices) if rework_indices else [],
+            run_id,
+        )
+        write_json(debug_dir / "run_info.json", {
+            "run_id": run_id,
+            "fresh_generation_run": fresh_generation_run,
+            "preview_subtitles_only": True,
+        })
+        print_run_stats(
+            stats,
+            total_verses,
+            len(selected),
+            len(preview_blocks),
+            0,
+            0,
+            subtitle_preview,
+        )
+        log(f"\n[done] SUBTITLE PREVIEW: {subtitle_preview}")
+        log(f"[done] MANIFEST: {output_root / 'manifest.json'}")
+        return
+
     clips: List[Path] = []
     clips_dir = out_dir / "clips"
-    raw_dir = out_dir / "clips_raw"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    write_json(debug_dir / "run_info.json", {"run_id": run_id, "fresh_generation_run": fresh_generation_run})
-    clips_dir.mkdir(parents=True, exist_ok=True)
-    raw_dir.mkdir(parents=True, exist_ok=True)
-
-    subclips_root = out_dir / "subclips"
+    clips_unscaled_dir = out_dir / "clips_unscaled"
+    subclips_raw_root = out_dir / "subclips_raw"
+    subclips_video_root = out_dir / "subclips_video"
     frames_root = out_dir / "frames"
-    subclips_root.mkdir(parents=True, exist_ok=True)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    write_json(debug_dir / "run_info.json", {
+        "run_id": run_id,
+        "fresh_generation_run": fresh_generation_run,
+        "refresh_alignment": bool(args.refresh_alignment),
+    })
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    clips_unscaled_dir.mkdir(parents=True, exist_ok=True)
+    subclips_raw_root.mkdir(parents=True, exist_ok=True)
+    subclips_video_root.mkdir(parents=True, exist_ok=True)
     frames_root.mkdir(parents=True, exist_ok=True)
+
+    reuse_tolerance = float(config["clip_reuse_duration_tolerance_ratio"])
+    blocks_to_generate: set = set()
+    reuse_plan: Dict[int, Dict[str, Any]] = {}
+
+    for block in blocks:
+        block_i = int(block["block_index"])
+        duration = max(0.1, float(block["duration"]))
+        unscaled_clip = block_clip_path(clips_unscaled_dir, block)
+
+        if args.rebuild_final:
+            should_generate = False
+        elif rework_indices:
+            should_generate = block_i in rework_indices
+        elif fresh_generation_run:
+            should_generate = True
+        else:
+            should_generate = not unscaled_clip.exists()
+
+        if not should_generate and unscaled_clip.exists():
+            source_duration = ffprobe_duration(unscaled_clip, ffprobe_cmd)
+            ratio_delta = duration_ratio_delta(source_duration, duration)
+            reuse_plan[block_i] = {
+                "source": str(unscaled_clip.relative_to(output_root)) if unscaled_clip.is_relative_to(output_root) else str(unscaled_clip),
+                "source_duration": source_duration,
+                "target_duration": duration,
+                "ratio_delta": ratio_delta,
+                "tolerance": reuse_tolerance,
+            }
+            if args.refresh_alignment and rework_indices and ratio_delta > reuse_tolerance:
+                raise RuntimeError(
+                    f"Existing unscaled clip is not compatible with refreshed alignment for block {block_i:03d}:\n"
+                    f"  clip duration={source_duration:.3f}s current range duration={duration:.3f}s ratio_delta={ratio_delta:.3f}\n"
+                    f"  tolerance={reuse_tolerance:.3f}. Add --rework {block_i} or run full generation."
+                )
+            if args.refresh_alignment and not rework_indices and ratio_delta > reuse_tolerance:
+                should_generate = True
+
+        if not should_generate and not unscaled_clip.exists():
+            if args.rebuild_final:
+                raise FileNotFoundError(
+                    f"Existing unscaled clip required but not found: {unscaled_clip}\n"
+                    "Run visual generation first, or remove --rebuild-final."
+                )
+            should_generate = True
+
+        if should_generate:
+            blocks_to_generate.add(block_i)
+
+    write_json(debug_dir / "clip_reuse_plan.json", reuse_plan)
+
+    song_context: Optional[Dict[str, Any]] = None
+    if blocks_to_generate:
+        song_context_mode = "fresh" if (fresh_generation_run or args.refresh_alignment or not rework_indices) else "frozen"
+        stats_start(stats, "song_context")
+        song_context = run_or_load_song_context(
+            planner_template,
+            rules,
+            video_style,
+            verses,
+            comfy_url,
+            plans_dir,
+            song_context_mode,
+        )
+        write_json(debug_dir / "song_context_used.json", {
+            "mode": song_context_mode,
+            "context": song_context,
+        })
+        stats_end(stats, "song_context")
+    else:
+        log("[stage] no visual generation required; skip song context")
 
     for block in blocks:
         block_i = int(block["block_index"])
@@ -3616,13 +4041,8 @@ def main() -> None:
         first_line = str(block.get("text", "")).splitlines()[0] if str(block.get("text", "")).splitlines() else ""
         first = first_line[:100]
         clip_local = block_clip_path(clips_dir, block)
-
-        if args.rebuild_final:
-            should_generate = False
-        elif rework_indices:
-            should_generate = block_i in rework_indices
-        else:
-            should_generate = True
+        unscaled_clip = block_clip_path(clips_unscaled_dir, block)
+        should_generate = block_i in blocks_to_generate
 
         log(f"\n=== block {block_i:03d} / {kind}: {first}")
         log(f"  [stage] time={float(block['start']):.3f}s..{float(block['end']):.3f}s duration={duration:.2f}s")
@@ -3631,12 +4051,12 @@ def main() -> None:
         range_dir = write_range_debug_files(block, subranges, debug_dir)
 
         if not should_generate:
-            if not clip_local.exists():
+            if not unscaled_clip.exists():
                 raise FileNotFoundError(
-                    f"Existing clip required but not found: {clip_local}\n"
+                    f"Existing unscaled clip required but not found: {unscaled_clip}\n"
                     "Run full generation first, or include this block in --rework."
                 )
-            log(f"  [stage] reuse existing clip: {clip_local}")
+            log(f"  [stage] reuse unscaled clip: {unscaled_clip}")
             generation_info[block_i] = {
                 "run_id": run_id,
                 "segment_subdir": None,
@@ -3644,19 +4064,17 @@ def main() -> None:
                 "generated_in_this_run": False,
             }
             clips_reused += 1
-            clips.append(clip_local)
             continue
 
         stats_start(stats, "video_generation")
 
-        block_subclips_dir = subclips_root / f"block_{block_i:03d}"
+        block_subclips_raw_dir = subclips_raw_root / f"block_{block_i:03d}"
+        block_subclips_video_dir = subclips_video_root / f"block_{block_i:03d}"
         block_frames_dir = frames_root / f"block_{block_i:03d}"
-        if block_subclips_dir.exists():
-            shutil.rmtree(block_subclips_dir)
-        if block_frames_dir.exists():
-            shutil.rmtree(block_frames_dir)
-        block_subclips_dir.mkdir(parents=True, exist_ok=True)
-        block_frames_dir.mkdir(parents=True, exist_ok=True)
+        for path in (block_subclips_raw_dir, block_subclips_video_dir, block_frames_dir):
+            if path.exists():
+                shutil.rmtree(path)
+            path.mkdir(parents=True, exist_ok=True)
 
         if kind == "instrumental":
             local_context = build_instrumental_local_context(
@@ -3784,12 +4202,12 @@ def main() -> None:
             if not video_path:
                 raise RuntimeError(f"Video result not found for block {block_i:03d} part {sub_i:03d}")
 
-            raw_part = raw_dir / f"{clip_local.stem}_part_{sub_i:03d}{video_path.suffix}"
+            raw_part = block_subclips_raw_dir / f"part_{sub_i:03d}{video_path.suffix}"
             shutil.copy2(video_path, raw_part)
 
-            subclip_local = block_subclips_dir / f"part_{sub_i:03d}.mp4"
-            log("  [stage] trim/pad subclip to exact subrange duration; remove raw workflow audio")
-            trim_or_pad_video(raw_part, sub_duration, subclip_local, ffmpeg_cmd)
+            subclip_local = block_subclips_video_dir / f"part_{sub_i:03d}.mp4"
+            log("  [stage] copy subclip video stream only; keep generated duration")
+            copy_video_only(raw_part, subclip_local, ffmpeg_cmd)
             extract_last_frame(subclip_local, last_frame_local, ffmpeg_cmd)
 
             previous_subclip = subclip_local
@@ -3819,11 +4237,8 @@ def main() -> None:
             subrange_infos.append(subrange_info)
             write_json(part_debug_dir / "video_generation.json", subrange_info)
 
-        semantic_raw = raw_dir / f"{clip_local.stem}_semantic_raw.mp4"
-        concat_or_copy_subclips(subclip_paths, semantic_raw, ffmpeg_cmd)
-
-        log("  [stage] trim/pad semantic clip to exact block duration")
-        trim_or_pad_video(semantic_raw, duration, clip_local, ffmpeg_cmd)
+        log("  [stage] assemble unscaled semantic clip from generated subclips")
+        concat_or_copy_subclips(subclip_paths, unscaled_clip, ffmpeg_cmd)
 
         scene_summary = " / ".join(x.get("scene_summary", "") for x in subrange_infos if x.get("scene_summary"))
         if not scene_summary:
@@ -3851,15 +4266,40 @@ def main() -> None:
             "segment_subdir": f"aligned_song/{run_id}/block_{block_i:03d}",
             "generated_in_this_run": True,
             "range_debug": str(range_dir.relative_to(output_root)) if range_dir.is_relative_to(output_root) else str(range_dir),
+            "unscaled_clip": str(unscaled_clip.relative_to(output_root)) if unscaled_clip.is_relative_to(output_root) else str(unscaled_clip),
             "subranges": subrange_infos,
         }
         write_json(debug_dir / f"video_generation_{block_i:03d}.json", generation_info[block_i])
 
         clips_generated += 1
         stats_end(stats, "video_generation")
-        clips.append(clip_local)
 
-    log("\n[stage] concat video clips")
+    log("\n[stage] scale unscaled clips to current timeline")
+    stats_start(stats, "clip_scaling")
+    scaling_report: List[Dict[str, Any]] = []
+    for block in blocks:
+        block_i = int(block["block_index"])
+        unscaled_clip = block_clip_path(clips_unscaled_dir, block)
+        clip_local = block_clip_path(clips_dir, block)
+        if not unscaled_clip.exists():
+            raise FileNotFoundError(f"Unscaled clip not found for block {block_i:03d}: {unscaled_clip}")
+        log(f"  [scale] block {block_i:03d}: {unscaled_clip.name} -> {clip_local.name}")
+        scale_info = retime_video_copy(
+            unscaled_clip,
+            max(0.1, float(block["duration"])),
+            clip_local,
+            ffmpeg_cmd,
+            ffprobe_cmd,
+            int(config["fps"]),
+        )
+        scale_info["block_index"] = block_i
+        scale_info["kind"] = str(block.get("kind", ""))
+        scaling_report.append(scale_info)
+        clips.append(clip_local)
+    write_json(debug_dir / "clip_scaling_report.json", scaling_report)
+    stats_end(stats, "clip_scaling")
+
+    log("\n[stage] concat scaled video clips")
     stats_start(stats, "concat")
     video_only = out_dir / "video" / "video_only.mp4"
     concat_videos(clips, video_only, ffmpeg_cmd)
@@ -3868,7 +4308,7 @@ def main() -> None:
     log("[stage] final mux audio + burn subtitles")
     stats_start(stats, "final_mux")
     final = output_root / "final_video.mp4"
-    final_mux(video_only, final_audio, ass_path, final, ffmpeg_cmd)
+    final_mux(video_only, final_audio, ass_path, final, ffmpeg_cmd, int(config["fps"]))
     stats_end(stats, "final_mux")
 
     write_timeline_manifest(
