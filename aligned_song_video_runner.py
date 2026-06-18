@@ -881,10 +881,785 @@ def match_expected_range_words(
     return out, cursor, stats
 
 
+
+def analyze_matched_line_timing(
+    line_text: str,
+    line_words: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    expected = lyric_words(line_text)
+    expected_count = len(expected)
+    matched_count = sum(1 for w in line_words if not w.get("synthetic_timing"))
+    missing_indices = [i for i, w in enumerate(line_words) if w.get("synthetic_timing")]
+    mismatch_count = sum(1 for w in line_words if str(w.get("match_status", "")) == "mismatch")
+    fuzzy_count = sum(1 for w in line_words if str(w.get("match_status", "")) == "fuzzy_match")
+
+    starts = [float(w.get("start", 0.0)) for w in line_words if w.get("start") is not None]
+    ends = [float(w.get("end", 0.0)) for w in line_words if w.get("end") is not None]
+    start = min(starts) if starts else 0.0
+    end = max(ends) if ends else start
+    duration = max(0.0, end - start)
+
+    durations = [
+        max(0.0, float(w.get("end", w.get("start", 0.0))) - float(w.get("start", 0.0)))
+        for w in line_words
+    ]
+    zeroish_count = sum(1 for d in durations if d <= 0.015)
+    zeroish_ratio = zeroish_count / max(1, len(durations))
+    probabilities = [
+        float(w["probability"])
+        for w in line_words
+        if w.get("probability") is not None and not w.get("synthetic_timing")
+    ]
+    mean_probability = sum(probabilities) / len(probabilities) if probabilities else None
+
+    words_per_second = expected_count / max(0.01, duration) if expected_count else 0.0
+    min_plausible_duration = max(0.18, expected_count * 0.09)
+    missing_ratio = len(missing_indices) / max(1, expected_count)
+    mismatch_ratio = mismatch_count / max(1, expected_count)
+
+    issues: List[str] = []
+    status = "GOOD"
+    reliable = True
+
+    if expected_count == 0:
+        status = "EMPTY"
+        reliable = False
+    elif matched_count == 0:
+        status = "MISSING"
+        reliable = False
+        issues.append("no reliable matched words")
+    else:
+        prefix_missing = bool(missing_indices and missing_indices == list(range(0, len(missing_indices))))
+        suffix_missing = bool(missing_indices and missing_indices == list(range(expected_count - len(missing_indices), expected_count)))
+        internal_missing = bool(missing_indices and not prefix_missing and not suffix_missing)
+
+        if missing_indices:
+            if prefix_missing:
+                status = "PARTIAL_PREFIX_MISSING"
+            elif suffix_missing:
+                status = "PARTIAL_SUFFIX_MISSING"
+            elif internal_missing:
+                status = "PARTIAL_INTERNAL_GAP"
+            else:
+                status = "PARTIAL_MISSING"
+            issues.append(f"missing expected words: {len(missing_indices)}")
+            if missing_ratio > float(config.get("alignment_line_reliable_max_missing_ratio", 0.40)):
+                reliable = False
+                issues.append(f"too many missing words for timing anchor: missing_ratio={missing_ratio:.2f}")
+
+        collapsed = (
+            expected_count >= 2
+            and (
+                duration < min_plausible_duration
+                or words_per_second > 14.0
+                or (zeroish_ratio >= 0.65 and duration < max(2.00, expected_count * 0.35))
+            )
+        )
+        if collapsed:
+            status = "COLLAPSED" if status == "GOOD" else f"{status}_COLLAPSED"
+            reliable = False
+            issues.append(
+                f"collapsed timing: duration={duration:.2f}s, zeroish_ratio={zeroish_ratio:.2f}, words_per_second={words_per_second:.2f}"
+            )
+
+        if mean_probability is not None and mean_probability < 0.10:
+            issues.append(f"low mean probability: {mean_probability:.3f}")
+            if status == "GOOD":
+                status = "LOW_CONFIDENCE"
+            if mean_probability < 0.05 and (zeroish_ratio >= 0.50 or duration < max(1.50, expected_count * 0.25)):
+                reliable = False
+                issues.append("low-confidence timing is not usable as an anchor")
+
+        if mismatch_count:
+            issues.append(f"mismatched words: {mismatch_count}")
+            if mismatch_ratio > float(config.get("alignment_line_reliable_max_mismatch_ratio", 0.25)):
+                reliable = False
+                issues.append(f"too many mismatched words for timing anchor: mismatch_ratio={mismatch_ratio:.2f}")
+            if status == "GOOD":
+                status = "HAS_MISMATCH"
+
+    return {
+        "status": status,
+        "timing_reliable": reliable,
+        "expected_words": expected_count,
+        "matched_words": matched_count,
+        "missing_words": len(missing_indices),
+        "fuzzy_words": fuzzy_count,
+        "mismatch_words": mismatch_count,
+        "missing_ratio": missing_ratio,
+        "mismatch_ratio": mismatch_ratio,
+        "start": start,
+        "end": end,
+        "duration": duration,
+        "zeroish_word_ratio": zeroish_ratio,
+        "mean_probability": mean_probability,
+        "words_per_second": words_per_second,
+        "issues": issues,
+    }
+
+
+def redistribute_line_word_timings(line: Dict[str, Any], start: float, end: float, estimated: bool) -> None:
+    line["start"] = float(start)
+    line["end"] = max(float(start) + 0.01, float(end))
+    line["timing_estimated"] = bool(estimated)
+    words = line.get("words", []) or []
+    if not words:
+        return
+
+    duration = max(0.01, float(line["end"]) - float(line["start"]))
+    slot = duration / max(1, len(words))
+    for i, w in enumerate(words):
+        ws = float(line["start"]) + slot * i
+        we = float(line["start"]) + slot * (i + 1)
+        w["start"] = ws
+        w["end"] = max(ws + 0.001, we)
+        if estimated:
+            w["timing_estimated"] = True
+            w["timing_source"] = "estimated_line_window"
+
+
+def estimate_unreliable_line_timings(lines: List[Dict[str, Any]], config: Dict[str, Any]) -> None:
+    if not lines:
+        return
+
+    i = 0
+    while i < len(lines):
+        if lines[i].get("timing_reliable", False):
+            i += 1
+            continue
+
+        run_start = i
+        while i < len(lines) and not lines[i].get("timing_reliable", False):
+            i += 1
+        run_end = i
+
+        prev_line = lines[run_start - 1] if run_start > 0 else None
+        next_line = lines[run_end] if run_end < len(lines) else None
+
+        word_counts = [max(1, int(lines[j].get("diagnostics", {}).get("expected_words", 0))) for j in range(run_start, run_end)]
+        total_weight = max(1, sum(word_counts))
+
+        if prev_line is not None and next_line is not None:
+            start = float(prev_line["end"])
+            end = float(next_line["start"])
+            if end <= start + 0.05:
+                # No usable gap: keep a very small monotonic window rather than
+                # damaging the neighboring reliable anchors.
+                end = start + max(0.05 * total_weight, 0.10)
+        elif prev_line is not None:
+            start = float(prev_line["end"])
+            estimated_duration = max(0.25 * total_weight, 0.50)
+            raw_end = max(float(lines[j].get("end", start)) for j in range(run_start, run_end))
+            end = max(start + estimated_duration, raw_end)
+        elif next_line is not None:
+            end = float(next_line["start"])
+            estimated_duration = max(0.25 * total_weight, 0.50)
+            raw_start = min(float(lines[j].get("start", end)) for j in range(run_start, run_end))
+            start = min(raw_start, max(0.0, end - estimated_duration))
+        else:
+            start = min(float(lines[j].get("start", 0.0)) for j in range(run_start, run_end))
+            end = max(float(lines[j].get("end", start + 0.01)) for j in range(run_start, run_end))
+            if end <= start + 0.05:
+                end = start + max(0.25 * total_weight, 0.50)
+
+        cursor = start
+        available = max(0.01, end - start)
+        for j, weight in zip(range(run_start, run_end), word_counts):
+            part = available * (weight / total_weight)
+            line_start = cursor
+            line_end = end if j == run_end - 1 else cursor + part
+            redistribute_line_word_timings(lines[j], line_start, line_end, estimated=True)
+            lines[j]["timing_reliable"] = False
+            lines[j]["timing_estimated"] = True
+            lines[j].setdefault("diagnostics", {}).setdefault("issues", []).append("timing estimated from neighboring reliable lines")
+            cursor = line_end
+
+
+
+def actual_word_duration(word: Dict[str, Any]) -> float:
+    return max(0.0, float(word.get("end", 0.0)) - float(word.get("start", 0.0)))
+
+
+def build_line_candidate_from_start(
+    expected_line_words: List[str],
+    words: List[Dict[str, Any]],
+    actual_start: int,
+    expected_offset: int,
+    config: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build one monotonic candidate line match.
+
+    The candidate contains only real word matches. Missing lyric words are
+    added later as synthetic subtitle words. No mismatch pair is allowed here:
+    a bad actual span should lose to a later good candidate instead of being
+    used as timing evidence.
+    """
+    if not expected_line_words or actual_start >= len(words):
+        return None
+
+    threshold = float(config.get("alignment_match_similarity_threshold", 0.72))
+    lookahead = max(3, int(config.get("alignment_line_candidate_lookahead_words", config.get("alignment_match_lookahead_words", 5))))
+    max_extra = max(4, int(config.get("alignment_line_candidate_max_extra_words", len(expected_line_words) + lookahead)))
+    max_actual_end = min(len(words), actual_start + len(expected_line_words) + max_extra)
+
+    actual_index = actual_start
+    pairs: List[Dict[str, Any]] = []
+    fuzzy = 0
+    for expected_index in range(expected_offset, len(expected_line_words)):
+        found: Optional[Tuple[int, float, str]] = None
+        search_end = min(max_actual_end, actual_index + lookahead + 1)
+        for j in range(actual_index, search_end):
+            ok, sim, status = words_are_match(expected_line_words[expected_index], str(words[j].get("text", "")), threshold)
+            if ok:
+                found = (j, sim, status)
+                break
+        if found is None:
+            continue
+        j, sim, status = found
+        pairs.append({
+            "expected_index": expected_index,
+            "actual_index": j,
+            "expected": expected_line_words[expected_index],
+            "actual": words[j],
+            "similarity": sim,
+            "match_status": status,
+        })
+        if status == "fuzzy_match":
+            fuzzy += 1
+        actual_index = j + 1
+
+    if not pairs:
+        return None
+
+    expected_count = len(expected_line_words)
+    matched_count = len(pairs)
+    first_actual = int(pairs[0]["actual_index"])
+    last_actual = int(pairs[-1]["actual_index"])
+    starts = [float(p["actual"].get("start", 0.0)) for p in pairs]
+    ends = [float(p["actual"].get("end", 0.0)) for p in pairs]
+    duration = max(0.0, max(ends) - min(starts)) if starts and ends else 0.0
+    zeroish = sum(1 for p in pairs if actual_word_duration(p["actual"]) <= 0.035)
+    zeroish_ratio = zeroish / max(1, matched_count)
+    probabilities = [float(p["actual"].get("probability")) for p in pairs if p["actual"].get("probability") is not None]
+    mean_probability = (sum(probabilities) / len(probabilities)) if probabilities else None
+    matched_ratio = matched_count / max(1, expected_count)
+    missing_count = expected_count - matched_count
+
+    # Collapsed clusters can contain many exact words, but they are not useful
+    # timing anchors. Penalize them hard so a later plausible candidate wins.
+    words_per_second = matched_count / max(0.01, duration)
+    collapsed = False
+    if matched_count >= 2:
+        if duration < max(0.20, 0.08 * matched_count):
+            collapsed = True
+        if words_per_second > 14.0:
+            collapsed = True
+        if zeroish_ratio >= 0.80 and duration < max(1.00, 0.14 * matched_count):
+            collapsed = True
+
+    # Prefer complete, plausible, local matches, but allow partial lines.
+    score = 100.0 * matched_ratio
+    score -= 4.0 * expected_offset
+    score -= 1.5 * max(0, first_actual - actual_start)
+    score -= 3.0 * missing_count
+    if fuzzy:
+        score -= 1.0 * fuzzy
+    if mean_probability is not None and mean_probability < 0.04:
+        score -= 8.0
+    elif mean_probability is not None and mean_probability < 0.10:
+        score -= 3.0
+    if duration >= max(0.40, 0.12 * matched_count):
+        score += 10.0
+    if collapsed:
+        score -= 90.0
+
+    return {
+        "score": score,
+        "expected_count": expected_count,
+        "matched_count": matched_count,
+        "missing_count": missing_count,
+        "matched_ratio": matched_ratio,
+        "expected_offset": expected_offset,
+        "first_actual": first_actual,
+        "last_actual": last_actual,
+        "new_cursor": last_actual + 1,
+        "duration": duration,
+        "zeroish_word_ratio": zeroish_ratio,
+        "mean_probability": mean_probability,
+        "collapsed_candidate": collapsed,
+        "pairs": pairs,
+    }
+
+
+def find_best_line_candidate(
+    expected_line_words: List[str],
+    words: List[Dict[str, Any]],
+    cursor: int,
+    config: Dict[str, Any],
+    allow_long_start_gap: bool = False,
+) -> Optional[Dict[str, Any]]:
+    if not expected_line_words or cursor >= len(words):
+        return None
+
+    scan_words = max(20, int(config.get("alignment_line_scan_words", 120)))
+    min_words_default = 1 if len(expected_line_words) <= 2 else 2
+    min_words = max(1, int(config.get("alignment_line_match_min_words", min_words_default)))
+    min_ratio = float(config.get("alignment_line_match_min_ratio", 0.45))
+    scan_end = min(len(words), cursor + scan_words)
+
+    best: Optional[Dict[str, Any]] = None
+    for actual_start in range(cursor, scan_end):
+        for expected_offset in range(0, len(expected_line_words)):
+            # Large skipped lyric prefixes are allowed only when they produce a
+            # strong suffix match. This covers quiet/missing lyric prefixes
+            # without letting one common word steal a future line.
+            candidate = build_line_candidate_from_start(expected_line_words, words, actual_start, expected_offset, config)
+            if candidate is None:
+                continue
+            if not allow_long_start_gap and cursor < len(words):
+                cursor_time = float(words[cursor].get("start", 0.0))
+                first_time = float(words[int(candidate["first_actual"])].get("start", cursor_time))
+                max_start_gap = float(config.get("alignment_line_max_start_gap_seconds", 18.0))
+                if first_time - cursor_time > max_start_gap:
+                    continue
+            if candidate["matched_count"] < min(min_words, len(expected_line_words)):
+                continue
+            if candidate["matched_ratio"] < min_ratio:
+                continue
+            if (1.0 - candidate["matched_ratio"]) > float(config.get("alignment_line_candidate_max_missing_ratio", 0.55)):
+                continue
+            if candidate["collapsed_candidate"] and candidate["score"] < 35.0:
+                continue
+            if best is None or candidate["score"] > best["score"]:
+                best = candidate
+
+    if best is None:
+        return None
+
+    # A weak candidate is worse than an explicit missing line: it would advance
+    # the cursor into unrelated/collapsed words and damage following lines.
+    if best["score"] < float(config.get("alignment_line_candidate_min_score", 35.0)):
+        return None
+    return best
+
+
+def materialize_line_candidate(
+    expected_line_words: List[str],
+    words: List[Dict[str, Any]],
+    cursor: int,
+    candidate: Optional[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    extras: List[Dict[str, Any]] = []
+    stats = {
+        "expected": len(expected_line_words),
+        "matched": 0,
+        "fuzzy": 0,
+        "mismatch": 0,
+        "missing": 0,
+        "extra": 0,
+        "start_cursor": cursor,
+        "end_cursor": cursor,
+        "events": events,
+        "extra_actual": extras,
+        "boundary_reason": "line_candidate",
+        "candidate_score": None,
+    }
+
+    if candidate is None:
+        out: List[Dict[str, Any]] = []
+        previous_end: Optional[float] = None
+        next_start = float(words[cursor]["start"]) if cursor < len(words) else None
+        for ew in expected_line_words:
+            item = synthesize_word_timing(ew, previous_end, next_start)
+            item["timing_source"] = "missing_line_no_candidate"
+            out.append(item)
+            previous_end = float(item["end"])
+            stats["missing"] += 1
+            events.append({"status": "missing_expected", "expected": ew, "reason": "no_line_candidate"})
+        stats["boundary_reason"] = "no_line_candidate"
+        return out, cursor, stats
+
+    pairs_by_expected = {int(p["expected_index"]): p for p in candidate["pairs"]}
+    out = []
+    previous_end: Optional[float] = None
+    for expected_index, ew in enumerate(expected_line_words):
+        pair = pairs_by_expected.get(expected_index)
+        if pair is not None:
+            aw = pair["actual"]
+            item = {
+                "text": ew,
+                "aligned_text": aw.get("text"),
+                "start": aw.get("start"),
+                "end": aw.get("end"),
+                "probability": aw.get("probability"),
+                "match_status": pair.get("match_status", "match"),
+                "synthetic_timing": False,
+                "similarity": pair.get("similarity", 1.0),
+            }
+            out.append(item)
+            stats["matched"] += 1
+            if item["match_status"] == "fuzzy_match":
+                stats["fuzzy"] += 1
+            events.append({
+                "status": item["match_status"],
+                "expected": ew,
+                "actual": aw.get("text"),
+                "start": aw.get("start"),
+                "end": aw.get("end"),
+                "similarity": item["similarity"],
+            })
+            previous_end = float(item["end"])
+            continue
+
+        next_pair = next((pairs_by_expected[i] for i in range(expected_index + 1, len(expected_line_words)) if i in pairs_by_expected), None)
+        next_start = float(next_pair["actual"].get("start")) if next_pair is not None else None
+        item = synthesize_word_timing(ew, previous_end, next_start)
+        item["timing_source"] = "missing_word_in_line_candidate"
+        out.append(item)
+        stats["missing"] += 1
+        events.append({"status": "missing_expected", "expected": ew, "reason": "not_in_best_line_candidate"})
+        previous_end = float(item["end"])
+
+    first_actual = int(candidate["first_actual"])
+    if first_actual > cursor:
+        for j in range(cursor, first_actual):
+            extra = words[j]
+            extra_event = {"status": "extra_actual_before_line", "actual": extra.get("text"), "start": extra.get("start"), "end": extra.get("end")}
+            extras.append(extra_event)
+            events.append(extra_event)
+            stats["extra"] += 1
+
+    stats["end_cursor"] = int(candidate["new_cursor"])
+    stats["candidate_score"] = float(candidate["score"])
+    stats["candidate_matched_ratio"] = float(candidate["matched_ratio"])
+    stats["candidate_collapsed"] = bool(candidate["collapsed_candidate"])
+    stats["candidate_duration"] = float(candidate["duration"])
+    stats["candidate_first_actual"] = int(candidate["first_actual"])
+    stats["candidate_last_actual"] = int(candidate["last_actual"])
+    return out, int(candidate["new_cursor"]), stats
+
+def match_lyrics_line_words(
+    expected_line_words: List[str],
+    words: List[Dict[str, Any]],
+    cursor: int,
+    next_expected_words: List[str],
+    config: Dict[str, Any],
+    allow_long_start_gap: bool = False,
+) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+    del next_expected_words  # Candidate scoring replaces greedy boundary guards.
+    candidate = find_best_line_candidate(expected_line_words, words, cursor, config, allow_long_start_gap=allow_long_start_gap)
+    matched_words, new_cursor, report = materialize_line_candidate(expected_line_words, words, cursor, candidate)
+    report["line_start_cursor"] = cursor
+    report["line_end_cursor"] = new_cursor
+    return matched_words, new_cursor, report
+
+
+def build_line_aware_verses_from_json_words(
+    words: List[Dict[str, Any]],
+    lyrics_verses: List[Dict[str, Any]],
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    """Match lyrics line-by-line against the alignment word stream.
+
+    lyrics.txt remains the text truth. Stable-ts words are timing evidence.
+    Missing or collapsed words stay in subtitle output, but unreliable timing is
+    estimated from neighboring reliable lines and reported explicitly.
+    """
+    config = config or {}
+
+    ignored_meta_words: List[Dict[str, Any]] = []
+    clean_words: List[Dict[str, Any]] = []
+    for w in words:
+        if is_alignment_meta_token(str(w.get("text", ""))):
+            ignored_meta_words.append(w)
+        else:
+            clean_words.append(w)
+
+    if not lyrics_verses:
+        ly = {
+            "index": 1,
+            "text": " ".join(w["text"] for w in clean_words),
+            "lines_text": [" ".join(w["text"] for w in clean_words)],
+            "bracket_directives": [],
+        }
+        lyrics_verses = [ly]
+
+    report: Dict[str, Any] = {
+        "mode": "lyrics_driven_line_aware",
+        "alignment_words_total": len(words),
+        "alignment_words_clean": len(clean_words),
+        "ignored_meta_words": ignored_meta_words,
+        "ranges": [],
+        "trailing_extra_actual": [],
+    }
+    diagnostics: Dict[str, Any] = {
+        "mode": "line_aware_alignment_diagnostics",
+        "summary": {
+            "ranges": len(lyrics_verses),
+            "lines": 0,
+            "good_lines": 0,
+            "warning_lines": 0,
+            "estimated_lines": 0,
+            "collapsed_lines": 0,
+            "missing_lines": 0,
+            "partial_lines": 0,
+        },
+        "ranges": [],
+    }
+
+    cursor = 0
+    verses: List[Dict[str, Any]] = []
+
+    # Flatten the following line lookup so each line can use the next lyric line
+    # prefix as a local boundary guard.
+    verse_line_words: List[List[List[str]]] = [
+        [lyric_words(line) for line in ly.get("lines_text", [])]
+        for ly in lyrics_verses
+    ]
+
+    for vi, ly in enumerate(lyrics_verses):
+        out_lines: List[Dict[str, Any]] = []
+        range_events: List[Dict[str, Any]] = []
+        range_extra: List[Dict[str, Any]] = []
+        range_stats = {
+            "expected": 0,
+            "matched": 0,
+            "fuzzy": 0,
+            "mismatch": 0,
+            "missing": 0,
+            "extra": 0,
+            "start_cursor": cursor,
+            "end_cursor": cursor,
+            "events": range_events,
+            "extra_actual": range_extra,
+            "boundary_reason": "line_aware_expected_exhausted",
+            "line_statuses": [],
+        }
+
+        line_reports: List[Dict[str, Any]] = []
+        for li, line_text in enumerate(ly.get("lines_text", []), 1):
+            expected_line_words = verse_line_words[vi][li - 1]
+            if li < len(verse_line_words[vi]):
+                next_expected = verse_line_words[vi][li]
+            elif vi + 1 < len(verse_line_words) and verse_line_words[vi + 1]:
+                next_expected = verse_line_words[vi + 1][0]
+            else:
+                next_expected = []
+
+            matched_words, cursor, line_report = match_lyrics_line_words(
+                expected_line_words,
+                clean_words,
+                cursor,
+                next_expected,
+                config,
+                allow_long_start_gap=(li == 1),
+            )
+
+            starts = [float(w["start"]) for w in matched_words if w.get("start") is not None]
+            ends = [float(w["end"]) for w in matched_words if w.get("end") is not None]
+            if starts and ends:
+                line_start = min(starts)
+                line_end = max(ends)
+            elif out_lines:
+                line_start = float(out_lines[-1]["end"])
+                line_end = line_start + 0.01
+            else:
+                line_start = 0.0
+                line_end = 0.01
+
+            diag = analyze_matched_line_timing(line_text, matched_words, config)
+            line = {
+                "index": li,
+                "text": line_text,
+                "start": line_start,
+                "end": max(line_start + 0.01, line_end),
+                "words": matched_words,
+                "timing_reliable": bool(diag.get("timing_reliable", False)),
+                "timing_estimated": False,
+                "diagnostics": diag,
+                "alignment_match": line_report,
+            }
+            out_lines.append(line)
+            line_reports.append({
+                "line_index": li,
+                "text": line_text,
+                **line_report,
+                "diagnostics": diag,
+            })
+
+            for key in ("expected", "matched", "fuzzy", "mismatch", "missing", "extra"):
+                range_stats[key] += int(line_report.get(key, 0))
+            range_events.extend(line_report.get("events", []))
+            range_extra.extend(line_report.get("extra_actual", []))
+
+        estimate_unreliable_line_timings(out_lines, config)
+
+        # Recompute diagnostics after estimating timings so reports reflect the
+        # final timing used by subtitles/ranges while preserving original issues.
+        diagnostic_lines: List[Dict[str, Any]] = []
+        for line in out_lines:
+            diag = dict(line.get("diagnostics", {}))
+            diag["final_start"] = float(line.get("start", 0.0))
+            diag["final_end"] = float(line.get("end", 0.0))
+            diag["final_duration"] = max(0.0, diag["final_end"] - diag["final_start"])
+            diag["timing_estimated"] = bool(line.get("timing_estimated", False))
+            line["diagnostics"] = diag
+            range_stats["line_statuses"].append(diag.get("status"))
+
+            diagnostics["summary"]["lines"] += 1
+            status = str(diag.get("status", ""))
+            if status == "GOOD":
+                diagnostics["summary"]["good_lines"] += 1
+            else:
+                diagnostics["summary"]["warning_lines"] += 1
+            if line.get("timing_estimated"):
+                diagnostics["summary"]["estimated_lines"] += 1
+            if "COLLAPSED" in status:
+                diagnostics["summary"]["collapsed_lines"] += 1
+            if status == "MISSING":
+                diagnostics["summary"]["missing_lines"] += 1
+            if status.startswith("PARTIAL"):
+                diagnostics["summary"]["partial_lines"] += 1
+
+            diagnostic_lines.append({
+                "line_index": line.get("index"),
+                "text": line.get("text"),
+                **diag,
+            })
+
+        starts = [float(line["start"]) for line in out_lines]
+        ends = [float(line["end"]) for line in out_lines]
+        start = min(starts) if starts else 0.0
+        end = max(ends) if ends else start + 0.01
+
+        verse_report = {
+            "range_index": vi + 1,
+            "lyric_index": ly.get("index", vi + 1),
+            "text_preview": str(ly.get("text", "")).splitlines()[0] if str(ly.get("text", "")).splitlines() else "",
+            **range_stats,
+            "end_cursor": cursor,
+            "start": start,
+            "end": end,
+            "duration": max(0.01, end - start),
+            "lines": line_reports,
+        }
+        report["ranges"].append(verse_report)
+        diagnostics["ranges"].append({
+            "range_index": vi + 1,
+            "lyric_index": ly.get("index", vi + 1),
+            "text_preview": verse_report["text_preview"],
+            "start": start,
+            "end": end,
+            "duration": max(0.01, end - start),
+            "status": "WARN" if any(str(x.get("status")) != "GOOD" for x in diagnostic_lines) else "OK",
+            "lines": diagnostic_lines,
+        })
+
+        verses.append({
+            "index": vi + 1,
+            "start": start,
+            "end": end,
+            "duration": max(0.01, end - start),
+            "text": ly["text"],
+            "lines": out_lines,
+            "alignment_mode": "word_json_line_aware",
+            "bracket_directives": list(ly.get("bracket_directives", [])),
+            "alignment_match": verse_report,
+        })
+
+    # Final global timing estimation across range boundaries. A whole range can
+    # be missing/collapsed while the next range has a reliable anchor; estimating
+    # only inside each range would leave such ranges near-zero. This pass keeps
+    # the full song timeline monotonic and distributes unreliable lyric lines
+    # between neighboring reliable anchors.
+    all_lines: List[Dict[str, Any]] = []
+    for verse in verses:
+        all_lines.extend(verse.get("lines", []) or [])
+    estimate_unreliable_line_timings(all_lines, config)
+
+    diagnostics["summary"] = {
+        "ranges": len(lyrics_verses),
+        "lines": 0,
+        "good_lines": 0,
+        "warning_lines": 0,
+        "estimated_lines": 0,
+        "collapsed_lines": 0,
+        "missing_lines": 0,
+        "partial_lines": 0,
+    }
+
+    for vi, verse in enumerate(verses):
+        out_lines = verse.get("lines", []) or []
+        starts = [float(line["start"]) for line in out_lines]
+        ends = [float(line["end"]) for line in out_lines]
+        start = min(starts) if starts else 0.0
+        end = max(ends) if ends else start + 0.01
+        verse["start"] = start
+        verse["end"] = end
+        verse["duration"] = max(0.01, end - start)
+        if vi < len(report.get("ranges", [])):
+            report["ranges"][vi]["start"] = start
+            report["ranges"][vi]["end"] = end
+            report["ranges"][vi]["duration"] = max(0.01, end - start)
+        if vi < len(diagnostics.get("ranges", [])):
+            range_diag = diagnostics["ranges"][vi]
+            range_diag["start"] = start
+            range_diag["end"] = end
+            range_diag["duration"] = max(0.01, end - start)
+            diagnostic_lines: List[Dict[str, Any]] = []
+            range_has_warning = False
+            for line in out_lines:
+                diag = dict(line.get("diagnostics", {}))
+                diag["final_start"] = float(line.get("start", 0.0))
+                diag["final_end"] = float(line.get("end", 0.0))
+                diag["final_duration"] = max(0.0, diag["final_end"] - diag["final_start"])
+                diag["timing_estimated"] = bool(line.get("timing_estimated", False))
+                line["diagnostics"] = diag
+
+                diagnostics["summary"]["lines"] += 1
+                status = str(diag.get("status", ""))
+                if status == "GOOD":
+                    diagnostics["summary"]["good_lines"] += 1
+                else:
+                    diagnostics["summary"]["warning_lines"] += 1
+                    range_has_warning = True
+                if line.get("timing_estimated"):
+                    diagnostics["summary"]["estimated_lines"] += 1
+                if "COLLAPSED" in status:
+                    diagnostics["summary"]["collapsed_lines"] += 1
+                if status == "MISSING":
+                    diagnostics["summary"]["missing_lines"] += 1
+                if status.startswith("PARTIAL"):
+                    diagnostics["summary"]["partial_lines"] += 1
+
+                diagnostic_lines.append({
+                    "line_index": line.get("index"),
+                    "text": line.get("text"),
+                    **diag,
+                })
+            range_diag["status"] = "WARN" if range_has_warning else "OK"
+            range_diag["lines"] = diagnostic_lines
+
+    while cursor < len(clean_words):
+        w = clean_words[cursor]
+        report["trailing_extra_actual"].append({
+            "actual": w.get("text"),
+            "start": w.get("start"),
+            "end": w.get("end"),
+        })
+        cursor += 1
+
+    return verses, report, diagnostics
+
+
 def split_matched_words_into_lines(
     ly: Dict[str, Any],
     matched_words: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
+    # Kept for compatibility with non-JSON fallback helpers. JSON alignment now
+    # uses build_line_aware_verses_from_json_words().
     cursor = 0
     out_lines: List[Dict[str, Any]] = []
 
@@ -1301,6 +2076,79 @@ def build_verses_from_json_words(
         })
 
     # Any remaining actual words are extra. They are not used in subtitles.
+    # Final global timing estimation across range boundaries. A whole range can
+    # be missing/collapsed while the next range has a reliable anchor; estimating
+    # only inside each range would leave such ranges near-zero. This pass keeps
+    # the full song timeline monotonic and distributes unreliable lyric lines
+    # between neighboring reliable anchors.
+    all_lines: List[Dict[str, Any]] = []
+    for verse in verses:
+        all_lines.extend(verse.get("lines", []) or [])
+    estimate_unreliable_line_timings(all_lines, config)
+
+    diagnostics["summary"] = {
+        "ranges": len(lyrics_verses),
+        "lines": 0,
+        "good_lines": 0,
+        "warning_lines": 0,
+        "estimated_lines": 0,
+        "collapsed_lines": 0,
+        "missing_lines": 0,
+        "partial_lines": 0,
+    }
+
+    for vi, verse in enumerate(verses):
+        out_lines = verse.get("lines", []) or []
+        starts = [float(line["start"]) for line in out_lines]
+        ends = [float(line["end"]) for line in out_lines]
+        start = min(starts) if starts else 0.0
+        end = max(ends) if ends else start + 0.01
+        verse["start"] = start
+        verse["end"] = end
+        verse["duration"] = max(0.01, end - start)
+        if vi < len(report.get("ranges", [])):
+            report["ranges"][vi]["start"] = start
+            report["ranges"][vi]["end"] = end
+            report["ranges"][vi]["duration"] = max(0.01, end - start)
+        if vi < len(diagnostics.get("ranges", [])):
+            range_diag = diagnostics["ranges"][vi]
+            range_diag["start"] = start
+            range_diag["end"] = end
+            range_diag["duration"] = max(0.01, end - start)
+            diagnostic_lines: List[Dict[str, Any]] = []
+            range_has_warning = False
+            for line in out_lines:
+                diag = dict(line.get("diagnostics", {}))
+                diag["final_start"] = float(line.get("start", 0.0))
+                diag["final_end"] = float(line.get("end", 0.0))
+                diag["final_duration"] = max(0.0, diag["final_end"] - diag["final_start"])
+                diag["timing_estimated"] = bool(line.get("timing_estimated", False))
+                line["diagnostics"] = diag
+
+                diagnostics["summary"]["lines"] += 1
+                status = str(diag.get("status", ""))
+                if status == "GOOD":
+                    diagnostics["summary"]["good_lines"] += 1
+                else:
+                    diagnostics["summary"]["warning_lines"] += 1
+                    range_has_warning = True
+                if line.get("timing_estimated"):
+                    diagnostics["summary"]["estimated_lines"] += 1
+                if "COLLAPSED" in status:
+                    diagnostics["summary"]["collapsed_lines"] += 1
+                if status == "MISSING":
+                    diagnostics["summary"]["missing_lines"] += 1
+                if status.startswith("PARTIAL"):
+                    diagnostics["summary"]["partial_lines"] += 1
+
+                diagnostic_lines.append({
+                    "line_index": line.get("index"),
+                    "text": line.get("text"),
+                    **diag,
+                })
+            range_diag["status"] = "WARN" if range_has_warning else "OK"
+            range_diag["lines"] = diagnostic_lines
+
     while cursor < len(clean_words):
         w = clean_words[cursor]
         report["trailing_extra_actual"].append({
@@ -1527,10 +2375,12 @@ def parse_alignment(
         if not lyrics_verses:
             raise RuntimeError("lyrics.txt is required for generated alignment.json parsing")
 
-        verses, match_report = build_verses_from_json_words(words, lyrics_verses, config)
+        verses, match_report, diagnostics = build_line_aware_verses_from_json_words(words, lyrics_verses, config)
         write_json(debug_dir / "json_words.json", words[:200])
         write_json(debug_dir / "alignment_match_report.json", match_report)
+        write_json(debug_dir / "alignment_diagnostics.json", diagnostics)
         write_json(debug_dir / "alignment_ignored_meta_words.json", match_report.get("ignored_meta_words", []))
+        write_alignment_diagnostics_report(diagnostics, debug_dir / "alignment_diagnostics.txt")
         return verses, "json"
 
     if lrc_path.exists():
@@ -2980,6 +3830,11 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
     max_seconds = float(config["max_workflow_seconds"])
     recommended = float(config["recommended_workflow_seconds"])
 
+    # Keep a small safety margin below the workflow hard limit. Some aligned
+    # word/line timestamps have millisecond rounding, and a visually harmless
+    # 16.01s part would still exceed a 16.00s workflow cap. Subrange durations
+    # are only planning windows for visual generation; the complete range clip
+    # is retimed later to the exact lyric timeline.
     safe_max_seconds = max(0.5, max_seconds - 0.05)
     target_seconds = max(0.5, min(recommended, safe_max_seconds))
     min_segment_seconds = 0.5
@@ -3468,6 +4323,52 @@ def load_continuity_from_plans(plans_dir: Path, before_block_index: int) -> List
             out.append({"segment": str(idx), "scene_summary": summary})
 
     return out
+
+
+def write_alignment_diagnostics_report(diagnostics: Dict[str, Any], out_path: Path) -> None:
+    summary = diagnostics.get("summary", {})
+    lines: List[str] = [
+        "alignment diagnostics",
+        f"ranges          : {summary.get('ranges', 0)}",
+        f"lines           : {summary.get('lines', 0)}",
+        f"good lines      : {summary.get('good_lines', 0)}",
+        f"warning lines   : {summary.get('warning_lines', 0)}",
+        f"estimated lines : {summary.get('estimated_lines', 0)}",
+        f"collapsed lines : {summary.get('collapsed_lines', 0)}",
+        f"missing lines   : {summary.get('missing_lines', 0)}",
+        f"partial lines   : {summary.get('partial_lines', 0)}",
+        "",
+    ]
+
+    for r in diagnostics.get("ranges", []):
+        status = r.get("status", "")
+        lines.append(
+            f"range {int(r.get('range_index', 0)):03d}: {status}; "
+            f"duration={float(r.get('duration', 0.0)):.2f}s; "
+            f"{float(r.get('start', 0.0)):.2f}..{float(r.get('end', 0.0)):.2f}; "
+            f"{r.get('text_preview', '')}"
+        )
+        for item in r.get("lines", []):
+            st = str(item.get("status", ""))
+            if st == "GOOD" and not item.get("timing_estimated"):
+                continue
+            issues = item.get("issues", []) or []
+            issue_text = "; ".join(str(x) for x in issues[:4])
+            lines.append(
+                f"  line {int(item.get('line_index', 0)):02d}: {st}; "
+                f"final={float(item.get('final_start', item.get('start', 0.0))):.2f}.."
+                f"{float(item.get('final_end', item.get('end', 0.0))):.2f}; "
+                f"matched={int(item.get('matched_words', 0))}/{int(item.get('expected_words', 0))}; "
+                f"estimated={bool(item.get('timing_estimated', False))}; "
+                f"{issue_text}"
+            )
+            text = str(item.get("text", "")).strip()
+            if text:
+                lines.append(f"    {text}")
+        lines.append("")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def write_alignment_match_report(verses: List[Dict[str, Any]], out_path: Path) -> None:
@@ -4031,14 +4932,16 @@ def main() -> None:
                 "ratio_delta": ratio_delta,
                 "tolerance": reuse_tolerance,
             }
-            if args.refresh_alignment and rework_indices and ratio_delta > reuse_tolerance:
+            if args.refresh_alignment and ratio_delta > reuse_tolerance and block_i not in rework_indices:
+                # Refresh-alignment must not silently regenerate or silently reuse
+                # clips whose visual duration no longer matches the new timeline.
+                # The user should inspect subtitle_preview.mp4 and explicitly
+                # request --rework for affected ranges, or run a clean generation.
                 raise RuntimeError(
                     f"Existing unscaled clip is not compatible with refreshed alignment for block {block_i:03d}:\n"
                     f"  clip duration={source_duration:.3f}s current range duration={duration:.3f}s ratio_delta={ratio_delta:.3f}\n"
-                    f"  tolerance={reuse_tolerance:.3f}. Add --rework {block_i} or run full generation."
+                    f"  tolerance={reuse_tolerance:.3f}. Add --rework {block_i} or run a clean generation."
                 )
-            if args.refresh_alignment and not rework_indices and ratio_delta > reuse_tolerance:
-                should_generate = True
 
         if not should_generate and not unscaled_clip.exists():
             if args.rebuild_final:
