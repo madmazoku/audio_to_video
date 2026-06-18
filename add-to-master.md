@@ -25,7 +25,7 @@ This skill generates all branch and PR metadata automatically from the current c
 
 ## Workflow steps
 
-1. Validate repository root.
+1. Validate repository root and ensure on `master` branch.
 2. Run `git status --short` and ensure the working tree is ready.
 3. Summarize the current diff into a concise phrase describing the change.
 4. Determine the next unused AI number `n` by inspecting existing branches and merged PRs using `AI-<n>` naming.
@@ -39,9 +39,18 @@ This skill generates all branch and PR metadata automatically from the current c
    - `git add -A`
 10. Commit with the generated message.
 11. Push the generated branch to `origin`.
-12. Create a PR into `master` using the generated title and body.
-13. Merge the PR with a merge commit.
-14. Do not delete the branch during merge.
+12. Create a PR into `master` using the generated title and body via `gh pr create`.
+13. **Merge the PR using `gh pr merge --merge`** (merge commit strategy, no branch deletion flag).
+14. **Wait for GitHub to confirm the merge and update `master`**.
+15. **Do NOT use local `git merge` commands.**
+16. The branch is preserved on `origin` by default (no `--delete-branch` flag).
+
+## Critical implementation notes
+
+- Always use `gh pr merge <pr_number> --merge` without `--delete-branch`.
+- Never use `git merge` locally after pushing to origin; PR merging via GitHub CLI ensures clean history and integration with branch protection rules.
+- After `gh pr merge` completes, the local `master` may lag behind; use `git pull origin master` to sync if needed.
+- The branch name remains available on `origin` for future work or reference.
 
 ## Usage examples
 
@@ -68,3 +77,29 @@ In this repository, use the saved AI PR workflow skill to create a branch, commi
 - `short-description` should be slugified from the change summary.
 - The branch must remain on `origin` after merge.
 - This skill is intended as a reusable pattern for future AI-enabled changes.
+
+## Common errors and how to avoid them
+
+### Error: Dupe merge commits in git history
+
+**Symptom:** git log shows both `Merge pull request #N from...` and `Merge AI-<n>...` for the same branch.
+
+**Cause:** Using local `git merge` after `gh pr merge` has already completed. This creates two separate merge commits.
+
+**Fix:** Never use `git merge` locally once the branch is pushed to origin. Always use `gh pr merge <pr_number> --merge` via GitHub CLI. After merge, sync with `git pull origin master` if needed.
+
+### Error: PR not created
+
+**Symptom:** `gh pr create` command fails or reports "already exists".
+
+**Cause:** PR may have been created manually on GitHub, or the remote branch name differs from what the skill expects.
+
+**Fix:** Always verify the exact branch name matches before running the skill. Use `git branch --show-current` to confirm.
+
+### Error: Branch is deleted after merge
+
+**Symptom:** Branch no longer exists on `origin` after PR merge.
+
+**Cause:** The `--delete-branch` flag was used in `gh pr merge`, or GitHub repository settings auto-delete branches.
+
+**Fix:** Use `gh pr merge <pr_number> --merge` **without** `--delete-branch`. Ensure GitHub repository settings do not have auto-delete enabled.
