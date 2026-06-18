@@ -638,7 +638,7 @@ semantic block -> subrange(s) -> one semantic clip
 
 If the block duration is within `max_workflow_seconds`, it has exactly one subrange. That single subrange has empty subrange text, so the prompt does not repeat the full lyrics twice.
 
-If the block is longer than `max_workflow_seconds`, it is split near `recommended_workflow_seconds`, preferring line/word timing boundaries when available.
+If the block is longer than `max_workflow_seconds`, lyric-aware line/word boundaries are used only when they naturally fit under the workflow cap. Any remaining oversized segment is split evenly into near-`recommended_workflow_seconds` pieces, so the result is several medium subranges rather than one oversized subrange plus a tiny remainder.
 
 Rendering flow:
 
