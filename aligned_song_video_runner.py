@@ -2980,17 +2980,31 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
     max_seconds = float(config["max_workflow_seconds"])
     recommended = float(config["recommended_workflow_seconds"])
 
-    if duration <= max_seconds:
-        return [start, end]
+    safe_max_seconds = max(0.5, max_seconds - 0.05)
+    target_seconds = max(0.5, min(recommended, safe_max_seconds))
+    min_segment_seconds = 0.5
 
-    parts = max(2, int(math.ceil(duration / max(1.0, recommended))))
-    target = duration / parts
+    def even_boundaries(seg_start: float, seg_end: float) -> List[float]:
+        """Split one oversized segment into near-target pieces under safe max."""
+        seg_duration = max(0.01, seg_end - seg_start)
+        if seg_duration <= safe_max_seconds + 1e-6:
+            return [seg_start, seg_end]
+
+        pieces = max(2, int(math.ceil(seg_duration / target_seconds)))
+        while seg_duration / pieces > safe_max_seconds:
+            pieces += 1
+
+        return [seg_start + seg_duration * i / pieces for i in range(pieces + 1)]
+
+    if duration <= safe_max_seconds:
+        return [start, end]
 
     candidates = {start, end}
     if str(block.get("kind")) == "verse":
         for seg in timed_line_segments_for_block(block):
-            if start < float(seg["end"]) < end:
-                candidates.add(float(seg["end"]))
+            seg_end = float(seg["end"])
+            if start < seg_end < end:
+                candidates.add(seg_end)
             for w in seg.get("words") or []:
                 we = float(w.get("end", start))
                 if start < we < end:
@@ -3000,30 +3014,56 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
     boundaries = [start]
     previous = start
 
-    for part in range(1, parts):
-        desired = start + target * part
-        min_remaining = (parts - part) * 1.0
-        valid = [c for c in sorted_candidates if previous + 1.0 <= c <= end - min_remaining]
-        if valid:
-            chosen = min(valid, key=lambda c: abs(c - desired))
-        else:
-            chosen = min(max(desired, previous + 1.0), end - min_remaining)
+    # First pass: use natural lyric boundaries when they are available near the
+    # desired target duration and do not create an immediate oversized part.
+    # Do not synthesize "optimal" cut points here. If lyric-aware splitting
+    # cannot keep a segment under the limit, the second pass below splits that
+    # segment evenly into near-target pieces. That avoids a big part plus a tiny
+    # remainder and keeps the policy simple.
+    while end - previous > safe_max_seconds:
+        remaining = end - previous
+        remaining_parts = max(2, int(math.ceil(remaining / target_seconds)))
+        desired = previous + remaining / remaining_parts
+        desired = min(desired, previous + target_seconds)
 
-        if chosen <= previous + 0.05:
-            chosen = min(end - min_remaining, previous + 1.0)
+        earliest = previous + min_segment_seconds
+        latest = min(previous + safe_max_seconds, end - min_segment_seconds)
+        if latest < earliest:
+            break
+
+        valid = [c for c in sorted_candidates if earliest <= c <= latest]
+        if not valid:
+            break
+
+        chosen = min(valid, key=lambda c: abs(c - desired))
+        if chosen <= previous + 0.01:
+            break
         boundaries.append(float(chosen))
         previous = float(chosen)
 
-    boundaries.append(end)
+    if boundaries[-1] < end:
+        boundaries.append(end)
 
     clean = [boundaries[0]]
     for b in boundaries[1:]:
-        if b > clean[-1] + 0.05:
-            clean.append(b)
+        if b > clean[-1] + 0.01:
+            clean.append(float(b))
     if clean[-1] < end:
         clean.append(end)
-    return clean
 
+    # Second pass: any remaining oversized segment is split evenly into pieces
+    # sized around recommended_workflow_seconds while staying below the safe
+    # workflow cap. This is the fallback for lyric passages where no good
+    # word/line boundary exists.
+    validated = [clean[0]]
+    for segment_end in clean[1:]:
+        segment_start = validated[-1]
+        pieces = even_boundaries(segment_start, segment_end)
+        for b in pieces[1:]:
+            if b > validated[-1] + 0.01:
+                validated.append(float(b))
+
+    return validated
 
 def build_subranges_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
     boundaries = split_boundaries_for_block(block, config)
