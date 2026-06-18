@@ -306,7 +306,7 @@ Build full-song preview subtitles, build debug-only `work/subs/preview_debug.ass
 --refresh-alignment
 ```
 
-Rebuild `output/work/alignment/` from the current `input/lyrics.txt` and the current alignment source before parsing timeline blocks. Use this after editing lyrics to match the actual vocals. With `--preview-subtitles-only`, this lets you validate new karaoke timing and range/subrange boundaries before any visual generation. During visual reuse, existing `clips_unscaled/` files are matched by the same block index and checked by duration ratio only; the default tolerance is `clip_reuse_duration_tolerance_ratio = 0.05`.
+Rebuild `output/work/alignment/` from the current `input/lyrics.txt` and the current alignment source before parsing timeline blocks. Use this after editing lyrics to match the actual vocals. With `--preview-subtitles-only`, this lets you validate new karaoke timing and range/subrange boundaries before any visual generation. During visual reuse, existing `clips_unscaled/` files are matched by the same block index and checked by duration ratio only; the default tolerance is `clip_reuse_duration_tolerance_ratio = 0.05`. If a non-reworked existing clip is outside that tolerance after refresh, the run fails and tells you which block to add to `--rework`; it does not silently regenerate or silently reuse incompatible clips.
 
 ```text
 --comfy-url URL
@@ -402,7 +402,7 @@ regenerate subtitles and final video
 write manifest
 ```
 
-Internal raw subclips are not required for `--rebuild-final`; `clips_unscaled/` is required.
+Internal raw subclips are not required for `--rebuild-final`; `clips_unscaled/` is required. With `--refresh-alignment`, `--rebuild-final` still performs compatibility checks. If an existing unscaled clip is outside duration tolerance, the run fails so the affected block can be explicitly regenerated with `--rework`.
 
 ## 7. Input folder
 
@@ -580,6 +580,8 @@ output/work/
     parsed_verses_all.json
     alignment_match_report.txt
     alignment_match_report.json
+    alignment_diagnostics.txt
+    alignment_diagnostics.json
     alignment_ignored_meta_words.json
     alignment_lyrics_clean.txt
     timeline_blocks.json
@@ -1038,13 +1040,42 @@ That is expected. A normal run is a fresh creative attempt and cleans `--output-
 
 Regenerate alignment by running a normal fresh generation. New alignment should be generated from cleaned sung-only lyrics. The runner can ignore metadata-looking words from old alignment files, but clean alignment is more reliable.
 
-### alignment mismatch warnings
+### alignment diagnostics and line-aware matching
+
+For `alignment.json`, the runner uses a lyrics-driven line-aware matcher. `lyrics.txt` remains the text truth, and stable-ts words are treated as timing evidence. The matcher walks the song monotonically from start to end, matches one lyric line at a time, allows partial line matches, and reports low-confidence timing instead of silently accepting collapsed timestamps.
 
 Check:
 
 ```text
 output/work/debug/alignment_match_report.txt
 output/work/debug/alignment_match_report.json
+output/work/debug/alignment_diagnostics.txt
+output/work/debug/alignment_diagnostics.json
 ```
 
-The matcher is intentionally tolerant: fuzzy matches, missing expected words, and extra actual words are reported so that small differences between `lyrics.txt` and stable-ts output do not silently shift the rest of the song.
+Important statuses include:
+
+```text
+GOOD
+PARTIAL_PREFIX_MISSING
+PARTIAL_SUFFIX_MISSING
+PARTIAL_INTERNAL_GAP
+MISSING
+COLLAPSED
+LOW_CONFIDENCE
+HAS_MISMATCH
+```
+
+The full lyrics are still written to subtitles even when stable-ts misses part of a line. Missing, partial, or collapsed words are kept in the subtitle text, but unreliable timing is marked internally and estimated from neighboring reliable lines so it does not distort range/subrange boundaries or the following lines.
+
+### Line-aware matching improvements
+
+The alignment matcher now scores candidate lyric-line spans instead of greedily pairing words. It rejects collapsed/low-confidence spans as timing anchors, supports partial lines without dropping lyric text, and performs a final global timing-estimation pass across range boundaries so missing/collapsed ranges do not become near-zero length.
+
+Diagnostic files:
+
+- `work/debug/alignment_diagnostics.json`
+- `work/debug/alignment_diagnostics.txt`
+- `work/debug/alignment_match_report.json`
+- `work/debug/alignment_match_report.txt`
+
