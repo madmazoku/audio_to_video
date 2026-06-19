@@ -306,7 +306,7 @@ Reuse or lazily build full-song preview subtitles, debug-only `work/subs/preview
 --refresh-alignment
 ```
 
-Rebuild `output/work/alignment/` from the current `input/lyrics.txt` and the current alignment source before parsing timeline blocks. Use this after editing lyrics to match the actual vocals. With `--preview-subtitles-only`, this lets you validate new karaoke timing and range/subrange boundaries before any visual generation. During visual reuse, existing `clips_unscaled/` files are matched by the same zero-based range id and checked by duration ratio only; the default tolerance is `clip_reuse_duration_tolerance_ratio = 0.05`. If a non-reworked existing clip is outside that tolerance after refresh, the run fails and tells you which range id to add to `--rework`; it does not silently regenerate or silently reuse incompatible clips.
+Invalidate `output/work/alignment/` and matching-derived subtitle/preview artifacts, then rebuild them lazily when needed from the current `input/lyrics.txt` and the current alignment source. Use this after editing lyrics to match the actual vocals. With `--preview-subtitles-only`, this lets you validate new karaoke timing and range/subrange boundaries before any visual generation. Existing `clips_unscaled/` files are matched by the same zero-based range id and validated by their actual MP4 duration against the current selected range duration.
 
 ```text
 --comfy-url URL
@@ -400,7 +400,7 @@ reuse or lazily create subtitles, then regenerate final video
 write manifest
 ```
 
-Internal raw subclips are not required for `--rebuild-final`; `clips_unscaled/` is required. With `--refresh-alignment`, `--rebuild-final` still performs compatibility checks. If an existing unscaled clip is outside duration tolerance, the run fails so the affected block can be explicitly regenerated with `--rework`.
+Internal raw subclips are not required for `--rebuild-final`; `clips_unscaled/` is required. `--rebuild-final` validates each selected unscaled clip by actual file duration against the current range duration, then retimes/scales each clip into `work/clips/`. If a clip is missing or too far outside the configured duration tolerance, regenerate that range explicitly with `--rework` or increase `clip_duration_tolerance_ratio` in `input/config.json`.
 
 ## 7. Input folder
 
@@ -422,7 +422,7 @@ python.exe .\aligned_song_video_runner.py --input-dir .\my-song-input
 video_style.txt
 ```
 
-Art direction for the whole video. This is prompt style only. Technical width/height/fps live in `config.json`.
+Art direction for the whole video. This is prompt style only. Technical video_width/video_height/video_fps live in `config.json`.
 
 ```text
 vocals.mp3
@@ -588,7 +588,7 @@ output/work/
     subtitle_styles_map.json
     timing_report.json
     video_generation_NNN.json
-    clip_reuse_plan.json
+    clip_validation_report.json
     clip_scaling_report.json
 
     ranges/
@@ -614,7 +614,7 @@ output/work/
           video_generation.json
 ```
 
-`output/work/clips_unscaled/` contains semantic range visual material as generated/assembled, without duration fitting. `output/work/clips/` contains timestamp-retimed copies fitted to the current timeline and used by final assembly. `output/work/subclips_raw/`, `output/work/subclips_video/`, and `output/work/frames/` are internal artifacts for long-range rendering.
+`output/work/clips_unscaled/` contains semantic range visual material as generated/assembled, without duration fitting. `output/work/clips/` contains timestamp-retimed copies fitted to the current timeline and used by final assembly. Final assembly validates each unscaled clip by actual MP4 duration against the selected range duration using `clip_duration_tolerance_ratio`. `output/work/subclips_raw/`, `output/work/subclips_video/`, and `output/work/frames/` are internal artifacts for long-range rendering.
 
 ## 9. Semantic blocks and internal subranges
 
@@ -808,9 +808,10 @@ Default technical/timeline configuration:
 {
   "comfy_url": "http://127.0.0.1:8188",
   "comfy_output_dir": "..\\ComfyUI\\output",
-  "width": 1280,
-  "height": 720,
-  "fps": 24,
+  "video_width": 1280,
+  "video_height": 720,
+  "video_fps": 24,
+  "clip_duration_tolerance_ratio": 0.05,
   "recommended_workflow_seconds": 12,
   "max_workflow_seconds": 16,
   "instrumental_gap_min_seconds": 8.0,
@@ -822,10 +823,11 @@ Default technical/timeline configuration:
   "alignment_match_lookahead_words": 5,
   "alignment_match_similarity_threshold": 0.72,
   "alignment_match_warn_ratio": 0.2,
-  "alignment_match_max_extra_ratio": 0.5,
-  "clip_reuse_duration_tolerance_ratio": 0.05
+  "alignment_match_max_extra_ratio": 0.5
 }
 ```
+
+`clip_duration_tolerance_ratio` is the allowed relative difference between an unscaled clip file duration and the current range duration before final retime/scale. The same validation is applied to freshly generated and reused clips.
 
 Input override:
 
@@ -906,7 +908,7 @@ CreateVideo
 SaveVideo
 ```
 
-The runner patches start image, video prompt, negative prompt, duration, fps, width, height, seeds, and output prefix.
+The runner patches start image, video prompt, negative prompt, float duration seconds, fps, width, height, seeds, and output prefix. The workflow converts duration seconds and fps to an LTXV-valid frame count.
 
 ## 15. External repositories and tools
 

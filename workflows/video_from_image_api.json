@@ -481,7 +481,7 @@
     },
     "class_type": "CR Float To Integer",
     "_meta": {
-      "title": "🔧 CR Float To Integer"
+      "title": "CR Float To Integer"
     }
   },
   "318": {
@@ -560,9 +560,9 @@
   },
   "322": {
     "inputs": {
-      "value": 14
+      "value": 14.0
     },
-    "class_type": "INTConstant",
+    "class_type": "PrimitiveFloat",
     "_meta": {
       "title": "Length (Max 20 Secs)"
     }
