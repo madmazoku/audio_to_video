@@ -42,13 +42,14 @@ This skill generates all branch and PR metadata automatically from the current c
 10. Commit with the generated message: `git commit -m "AI-<n>: ..."`
 11. Push the generated branch to `origin`: `git push origin AI-<n>-<short-description>`
 
-**STEPS 12-16: Create PR and merge via GitHub CLI ONLY**
+**STEPS 12-17: Create PR and merge via GitHub CLI ONLY**
 12. Create a PR into `master` using: `gh pr create --head AI-<n>-<short-description> --base master --title "AI-<n>: ..." --body "..."`
 13. Note the PR number from the output (e.g., PR #7).
 14. **Merge using GitHub CLI ONLY**: `gh pr merge <PR_NUMBER> --merge` (merge commit, no `--delete-branch`).
 15. Switch back to `master`: `git checkout master`
 16. Sync local `master`: `git pull origin master`
-17. **The branch is automatically preserved on `origin` after merge** (no deletion flag was used).
+17. Verify the merge completed and local `master` is current: `git status --short --branch` and `git log --oneline --decorate -1` should show the merge commit on `master`.
+18. **The branch is automatically preserved on `origin` after merge** (no deletion flag was used).
 
 **CRITICAL: DO NOT create local merge commits.** After step 11 (`git push`), proceed directly to step 12-14 using `gh pr` commands. Never use `git merge` locally.
 
