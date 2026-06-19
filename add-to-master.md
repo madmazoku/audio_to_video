@@ -25,32 +25,56 @@ This skill generates all branch and PR metadata automatically from the current c
 
 ## Workflow steps
 
+**STEPS 1-7: Prepare metadata**
 1. Validate repository root and ensure on `master` branch.
 2. Run `git status --short` and ensure the working tree is ready.
 3. Summarize the current diff into a concise phrase describing the change.
 4. Determine the next unused AI number `n` by inspecting existing branches and merged PRs using `AI-<n>` naming.
-5. Construct branch name:
-   - `AI-<n>-<short-description>`
-6. Construct commit message:
-   - `AI-<n>: <short description>`
+5. Construct branch name: `AI-<n>-<short-description>`
+6. Construct commit message: `AI-<n>: <short description>`
 7. Construct PR body describing the fix from the diff.
-8. Create or switch to the generated branch.
-9. Stage all changes:
-   - `git add -A`
-10. Commit with the generated message.
-11. Push the generated branch to `origin`.
-12. Create a PR into `master` using the generated title and body via `gh pr create`.
-13. **Merge the PR using `gh pr merge --merge`** (merge commit strategy, no branch deletion flag).
-14. **Wait for GitHub to confirm the merge and update `master`**.
-15. **Do NOT use local `git merge` commands.**
-16. The branch is preserved on `origin` by default (no `--delete-branch` flag).
+
+**STEPS 8-11: Create and push branch**
+8. Create or switch to the generated branch: `git checkout -b AI-<n>-<short-description>`
+9. Stage all changes: `git add -A`
+10. Commit with the generated message: `git commit -m "AI-<n>: ..."`
+11. Push the generated branch to `origin`: `git push origin AI-<n>-<short-description>`
+
+**STEPS 12-16: Create PR and merge via GitHub CLI ONLY**
+12. Create a PR into `master` using: `gh pr create --head AI-<n>-<short-description> --base master --title "AI-<n>: ..." --body "..."`
+13. Note the PR number from the output (e.g., PR #7).
+14. **Merge using GitHub CLI ONLY**: `gh pr merge <PR_NUMBER> --merge` (merge commit, no `--delete-branch`).
+15. Sync local `master`: `git pull origin master`
+16. **The branch is automatically preserved on `origin` after merge** (no deletion flag was used).
+
+**CRITICAL: DO NOT create local merge commits.** After step 11 (`git push`), proceed directly to step 12-14 using `gh pr` commands. Never use `git merge` locally.
 
 ## Critical implementation notes
 
-- Always use `gh pr merge <pr_number> --merge` without `--delete-branch`.
-- Never use `git merge` locally after pushing to origin; PR merging via GitHub CLI ensures clean history and integration with branch protection rules.
-- After `gh pr merge` completes, the local `master` may lag behind; use `git pull origin master` to sync if needed.
-- The branch name remains available on `origin` for future work or reference.
+**The ONLY correct workflow after `git push`:**
+```
+git push origin AI-<n>-<short-description>     # Step 11: Push branch
+gh pr create ... --head AI-<n>-... --base master   # Step 12: Create PR (get PR number)
+gh pr merge <PR_NUMBER> --merge                # Step 14: Merge via GitHub CLI ONLY
+git pull origin master                         # Step 15: Sync local
+```
+
+**Do NOT:**
+- ❌ Use `git merge` locally after pushing (creates duplicate merge commits)
+- ❌ Use `git merge` instead of `gh pr merge` (bypasses branch protection and creates wrong commit messages)
+- ❌ Skip the PR creation step (violates repository standards)
+- ❌ Use `--delete-branch` flag with `gh pr merge` (deletes the source branch, we want to preserve it)
+
+**Why this matters:**
+- `gh pr merge` creates a GitHub merge commit with metadata and shows the PR in history
+- Local `git merge` creates a separate, redundant merge commit
+- Using both creates a forked merge history that's hard to untangle
+- Always let GitHub handle the merge via `gh pr merge`
+
+**After merge completes:**
+- GitHub automatically updates the PR to "Merged"
+- Local `master` may lag; use `git pull origin master` to sync
+- The AI-<n> branch remains on `origin` for reference/debugging (not deleted)
 
 ## Usage examples
 
