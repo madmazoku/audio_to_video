@@ -1,0 +1,94 @@
+﻿diff --git a/aligned_song_video_runner.py b/aligned_song_video_runner.py
+index 89c1538..773fab7 100644
+--- a/aligned_song_video_runner.py
++++ b/aligned_song_video_runner.py
+@@ -239,6 +239,65 @@ def write_json(path: Path, obj: Any) -> None:
+     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+ 
+ 
++def format_lrc_timestamp(seconds: float) -> str:
++    seconds = max(0.0, float(seconds))
++    total_centiseconds = int(round(seconds * 100.0))
++    minutes = total_centiseconds // 6000
++    rem = total_centiseconds % 6000
++    whole_seconds = rem // 100
++    centiseconds = rem % 100
++    return f"[{minutes:02d}:{whole_seconds:02d}.{centiseconds:02d}]"
++
++
++def write_line_level_lrc_from_matched_verses(verses: List[Dict[str, Any]], out_path: Path) -> None:
++    """Write standard line-level LRC from matched lyric line timings.
++
++    This is a human-readable alignment artifact. It uses lyrics.txt text from the
++    matched timeline and one timestamp per sung line. Word-level/enhanced LRC is
++    intentionally not emitted here; the goal is a simple standard synced-lyrics
++    file that can be inspected or imported by common tools.
++    """
++    rows: List[Tuple[float, str]] = []
++    for verse in verses:
++        verse_start = verse.get("start")
++        for line in verse.get("lines") or []:
++            text = str(line.get("text") or "").strip()
++            if not text:
++                continue
++            start = line.get("start", verse_start)
++            try:
++                start_f = float(start)
++            except (TypeError, ValueError):
++                continue
++            if not math.isfinite(start_f):
++                continue
++            rows.append((start_f, text))
++
++        # Some imported/cached alignments may only have a verse-level text block.
++        if not verse.get("lines"):
++            text_block = str(verse.get("text") or "").strip()
++            try:
++                start_f = float(verse_start)
++            except (TypeError, ValueError):
++                continue
++            if text_block and math.isfinite(start_f):
++                for offset, text in enumerate(t.strip() for t in text_block.splitlines() if t.strip()):
++                    # Keep a deterministic order without inventing meaningful line timings.
++                    rows.append((start_f + offset * 0.01, text))
++
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    out_path.write_text("\n".join(f"{format_lrc_timestamp(start)}{text}" for start, text in rows) + ("\n" if rows else ""), encoding="utf-8")
++
++
++def ensure_line_level_lrc_from_matched_verses(verses: List[Dict[str, Any]], alignment_dir: Path) -> Path:
++    lrc_path = alignment_dir / "alignment.lrc"
++    if lrc_path.exists():
++        return lrc_path
++    write_line_level_lrc_from_matched_verses(verses, lrc_path)
++    log(f"[stage] write line-level LRC: {lrc_path}")
++    return lrc_path
++
++
+ REQUIRED_RULE_FILES = [
+     "song_context_system.txt",
+     "song_context_user.txt",
+@@ -2498,6 +2557,7 @@ def parse_alignment(
+             mode = "cached"
+         if not isinstance(verses, list) or not verses:
+             raise RuntimeError(f"Invalid matched alignment cache: {matched_cache_path}")
++        ensure_line_level_lrc_from_matched_verses(verses, alignment_dir)
+         log(f"[stage] use cached matched alignment: {matched_cache_path}")
+         return verses, mode
+ 
+@@ -2522,6 +2582,7 @@ def parse_alignment(
+         write_json(debug_dir / "alignment_ignored_meta_words.json", match_report.get("ignored_meta_words", []))
+         write_alignment_diagnostics_report(diagnostics, debug_dir / "alignment_diagnostics.txt")
+         write_json(matched_cache_path, {"alignment_mode": "json", "verses": verses})
++        ensure_line_level_lrc_from_matched_verses(verses, alignment_dir)
+         return verses, "json"
+ 
+     if lrc_path.exists():
+@@ -2535,6 +2596,7 @@ def parse_alignment(
+         write_json(debug_dir / "lrc_match_report.json", lrc_report)
+         write_lrc_match_report(lrc_report, debug_dir / "lrc_match_report.txt")
+         write_json(matched_cache_path, {"alignment_mode": "lrc", "verses": verses})
++        ensure_line_level_lrc_from_matched_verses(verses, alignment_dir)
+         return verses, "lrc"
+ 
+     raise FileNotFoundError(

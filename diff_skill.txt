@@ -1,0 +1,73 @@
+﻿diff --git a/add-to-master.md b/add-to-master.md
+index 540b5cd..33bbb31 100644
+--- a/add-to-master.md
++++ b/add-to-master.md
+@@ -17,7 +17,7 @@ Use this skill when you want to add a change to `master` with the standard AI br
+ 
+ This skill generates all branch and PR metadata automatically from the current changes.
+ 
+-- infer a short descriptive summary from the current diff content;
++- infer a short descriptive summary from the current diff content only, not from previous branch names, past PR titles, or earlier feature ideas;
+ - determine the next unused `AI-<n>` number by scanning existing branch names and merged PR titles for `AI-<n>`;
+ - construct branch name as `AI-<n>-<short-description>`;
+ - construct commit message as `AI-<n>: <short description>`;
+@@ -26,13 +26,15 @@ This skill generates all branch and PR metadata automatically from the current c
+ ## Workflow steps
+ 
+ **STEPS 1-7: Prepare metadata**
+-1. Validate repository root and ensure on `master` branch.
+-2. Run `git status --short` and ensure the working tree is ready.
+-3. Summarize the current diff into a concise phrase describing the change.
+-4. Determine the next unused AI number `n` by inspecting existing branches and merged PRs using `AI-<n>` naming.
+-5. Construct branch name: `AI-<n>-<short-description>`
+-6. Construct commit message: `AI-<n>: <short description>`
+-7. Construct PR body describing the fix from the diff.
++1. Validate repository root and ensure on `master` branch. If you are currently on an existing `AI-<n>` branch or a merge commit branch, switch back to `master` before creating a new branch. Do not start a new AI branch from an already merged AI branch or from a PR merge commit branch.
++2. Run `git status --short` and ensure the working tree is ready. Confirm that the current changes are the ones you want to include in the new AI change and are not already part of another branch's commit.
++3. Summarize the current diff into a concise phrase describing the change. Use the exact changed files and current task, not the previous branch purpose or an earlier feature idea.
++4. Confirm the summary by reading the diff of the changed files. If the summary does not match the actual changes, rewrite it until it clearly describes the current work.
++5. Determine the next unused AI number `n` by inspecting existing branches and merged PRs using `AI-<n>` naming.
++6. Construct branch name from the actual change summary: `AI-<n>-<short-description>`.
++7. Construct commit message from the actual change summary: `AI-<n>: <short description>`.
++8. Construct PR title and body from the same generated summary.
++9. Do not use task labels, previous branch names, or old feature scopes to name the branch, commit, or PR.
+ 
+ **STEPS 8-11: Create and push branch**
+ 8. Create or switch to the generated branch: `git checkout -b AI-<n>-<short-description>`
+@@ -44,11 +46,23 @@ This skill generates all branch and PR metadata automatically from the current c
+ 12. Create a PR into `master` using: `gh pr create --head AI-<n>-<short-description> --base master --title "AI-<n>: ..." --body "..."`
+ 13. Note the PR number from the output (e.g., PR #7).
+ 14. **Merge using GitHub CLI ONLY**: `gh pr merge <PR_NUMBER> --merge` (merge commit, no `--delete-branch`).
+-15. Sync local `master`: `git pull origin master`
+-16. **The branch is automatically preserved on `origin` after merge** (no deletion flag was used).
++15. Switch back to `master`: `git checkout master`
++16. Sync local `master`: `git pull origin master`
++17. **The branch is automatically preserved on `origin` after merge** (no deletion flag was used).
+ 
+ **CRITICAL: DO NOT create local merge commits.** After step 11 (`git push`), proceed directly to step 12-14 using `gh pr` commands. Never use `git merge` locally.
+ 
++**ADDITIONAL SAFETY RULES**
++- If the current branch name already contains `AI-<n>`, do not reuse that branch name for a new change.
++- Always start a new AI branch from `master`; do not start from `AI-6`, `AI-7`, or any other existing AI branch.
++- If you have unstaged changes after a failed workflow attempt, stash or reset them and then return to `master` before creating the new AI branch.
++- If a PR already exists for the generated branch name, do not create a duplicate PR; instead use the existing PR number.
++- If a merge commit is present in the current working branch (`Merge pull request #...`), return to `master` and create a clean branch from there.
++- Generate the branch name, commit message, and PR metadata from the current diff only. Do not reuse titles, labels, or feature areas from previous work.
++- Do not label a new branch with a previous feature area (for example, `-video-config-validation`) unless the current diff actually changes that area.
++- If the branch summary is not clearly tied to the changed files, pause and rewrite the branch name until it matches the current work.
++- After the PR is merged, always checkout `master` and confirm the merge with `git pull origin master` before continuing.
++
+ ## Critical implementation notes
+ 
+ **The ONLY correct workflow after `git push`:**
+@@ -64,6 +78,10 @@ git pull origin master                         # Step 15: Sync local
+ - Γ¥î Use `git merge` instead of `gh pr merge` (bypasses branch protection and creates wrong commit messages)
+ - Γ¥î Skip the PR creation step (violates repository standards)
+ - Γ¥î Use `--delete-branch` flag with `gh pr merge` (deletes the source branch, we want to preserve it)
++- Γ¥î Copy a branch name, commit message, or PR title from a previous AI branch or PR if it is unrelated to the current diff.
++- Γ¥î Name the new branch after a past task area unless the current changed files actually belong to that area.
++- Γ¥î Assume the current commit is about the previous task; always inspect the actual changed files before naming.
++- Γ¥î Let old PR metadata or old commit history determine the new branch name; current diff content must be the source of truth.
+ 
+ **Why this matters:**
+ - `gh pr merge` creates a GitHub merge commit with metadata and shows the PR in history
