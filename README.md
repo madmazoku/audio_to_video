@@ -230,7 +230,7 @@ input/lyrics.txt
 input/video_style.txt
 ```
 
-`output/work/alignment/alignment.json` is generated automatically by the runner on a normal fresh run when `input/vocals.*` is available. If there are no vocals, provide `input/alignment.lrc` for line-level timing without stable-ts.
+`output/work/alignment/alignment.json`, `output/work/alignment/matched_verses.json`, release subtitles, preview subtitles, debug preview subtitles, and `output/subtitle_preview.mp4` are lazy artifacts. If raw alignment is missing, the runner creates it from `input/vocals.*`; if there are no vocals, provide `input/alignment.lrc` for line-level timing without stable-ts. If `matched_verses.json` exists, the runner reads it and does not rematch lyrics. If subtitle artifacts already exist, the runner reuses them. Use `--refresh-alignment` to invalidate alignment/matching/timeline/subtitle/preview caches after editing lyrics. To refresh subtitle styling only, delete the relevant files under `output/work/subs/` and/or `output/subtitle_preview.mp4`; they will be recreated lazily.
 
 Start ComfyUI in another terminal.
 
@@ -282,31 +282,31 @@ Generated artifact folder. Default: `./output`.
 --limit N
 ```
 
-Use only the first `N` parsed lyric verses for testing. If `N` equals the total verse count, it behaves like a full-song run. The limit is by semantic lyric verse, not by internal subrange.
+Use only the first `N` public zero-based ranges for testing/final assembly. Range numbers are exactly the numbers shown in `subtitle_preview.mp4`: `R000`, `R001`, ... `RNNN`. For example, `--limit 3` selects `R000..R002`; `--limit 27` selects `R000..R026` when the preview shows `/027`. The limit is by semantic range, not by internal subrange.
 
 ```text
 --rework N [N ...]
 ```
 
-Regenerate only selected semantic blocks and reuse existing unscaled clips for all others. `--rework` expects existing output from a previous normal run. If a selected semantic block is internally split into subranges, the whole semantic block is regenerated as a new unscaled range clip.
+Regenerate only selected public zero-based ranges and reuse existing unscaled clips for all other selected ranges. Use the same number shown in preview without the `R` prefix: `--rework 3` regenerates `R003`. If a selected range is internally split into subranges, the whole range is regenerated as a new unscaled clip.
 
 ```text
 --rebuild-final
 ```
 
-Do not run LLM/image/video generation. Reuse existing unscaled semantic clips from `output/work/clips_unscaled/`, retime them into `output/work/clips/`, regenerate subtitles/final concat/mux, and write a fresh manifest.
+Do not run LLM/image/video generation. Reuse existing unscaled semantic clips from `output/work/clips_unscaled/`, retime them into `output/work/clips/`, reuse or lazily create subtitles, rebuild final concat/mux, and write a fresh manifest.
 
 ```text
 --preview-subtitles-only
 ```
 
-Build full-song preview subtitles, build debug-only `work/subs/preview_debug.ass`, and render `subtitle_preview.mp4`, then stop before any ComfyUI song-context/planner/image/video work. The preview is always generated for the whole song, regardless of `--limit`; `--limit` only affects visual generation/final assembly. This is the fastest way to check voice/subtitle alignment, karaoke timing, and semantic range/subrange boundaries.
+Reuse or lazily build full-song preview subtitles, debug-only `work/subs/preview_debug.ass`, and `subtitle_preview.mp4`, then stop before any ComfyUI song-context/planner/image/video work. The preview is always full song, regardless of `--limit`; `--limit` only affects visual generation/final assembly. This is the fastest way to check voice/subtitle alignment, karaoke timing, and semantic range/subrange boundaries.
 
 ```text
 --refresh-alignment
 ```
 
-Rebuild `output/work/alignment/` from the current `input/lyrics.txt` and the current alignment source before parsing timeline blocks. Use this after editing lyrics to match the actual vocals. With `--preview-subtitles-only`, this lets you validate new karaoke timing and range/subrange boundaries before any visual generation. During visual reuse, existing `clips_unscaled/` files are matched by the same block index and checked by duration ratio only; the default tolerance is `clip_reuse_duration_tolerance_ratio = 0.05`. If a non-reworked existing clip is outside that tolerance after refresh, the run fails and tells you which block to add to `--rework`; it does not silently regenerate or silently reuse incompatible clips.
+Rebuild `output/work/alignment/` from the current `input/lyrics.txt` and the current alignment source before parsing timeline blocks. Use this after editing lyrics to match the actual vocals. With `--preview-subtitles-only`, this lets you validate new karaoke timing and range/subrange boundaries before any visual generation. During visual reuse, existing `clips_unscaled/` files are matched by the same zero-based range id and checked by duration ratio only; the default tolerance is `clip_reuse_duration_tolerance_ratio = 0.05`. If a non-reworked existing clip is outside that tolerance after refresh, the run fails and tells you which range id to add to `--rework`; it does not silently regenerate or silently reuse incompatible clips.
 
 ```text
 --comfy-url URL
@@ -358,17 +358,15 @@ A normal run means no `--rework` and no `--rebuild-final`.
 Behavior:
 
 ```text
-clean --output-dir
-generate output/work/alignment/alignment.json with stable-ts when vocals are available
-generate song context
-generate all selected semantic block plans
-generate all selected semantic clips
-generate subtitles
+create missing alignment artifacts if needed
+generate or reuse lazy song_context.json only if clip generation is needed
+generate all selected semantic block plans/clips unless --rework or --rebuild-final changes the generation list
+reuse or lazily create subtitles and subtitle preview
 generate final video
 write manifest
 ```
 
-A normal run is treated as a new creative attempt. Existing files in `--output-dir` are removed first.
+A normal run is a new creative attempt for the selected ranges. To force a completely clean start, delete the output folder first.
 
 ### Rework run
 
@@ -379,14 +377,14 @@ Behavior:
 ```text
 keep --output-dir
 reuse existing alignment.json
-reuse frozen song_context.json
+load song_context.json if present, otherwise build it lazily
 reuse unscaled semantic clips not listed in --rework
 regenerate selected semantic blocks
-regenerate subtitles and final video
+reuse or lazily create subtitles, then regenerate final video
 write manifest
 ```
 
-If `song_context.json` does not exist, `--rework` fails. Run a normal generation first.
+If `song_context.json` does not exist and `--rework` needs visual generation, it is built lazily.
 
 ### Rebuild-final run
 
@@ -398,7 +396,7 @@ Behavior:
 keep --output-dir
 reuse existing alignment.json
 reuse unscaled semantic clips from output/work/clips_unscaled/
-regenerate subtitles and final video
+reuse or lazily create subtitles, then regenerate final video
 write manifest
 ```
 
@@ -430,7 +428,7 @@ Art direction for the whole video. This is prompt style only. Technical width/he
 vocals.mp3
 ```
 
-Optional but recommended for word-level timing. If `vocals.*` exists, a normal fresh run uses it with stable-ts to create `output/work/alignment/alignment.json`.
+Optional but recommended for word-level timing. If `vocals.*` exists and `output/work/alignment/alignment.json` is missing, the runner uses stable-ts to create it. Use `--refresh-alignment` after editing lyrics to invalidate alignment-derived caches.
 
 ```text
 alignment.lrc
@@ -476,15 +474,15 @@ Overrides defaults from `data/config.json`.
 video_style_N.txt
 ```
 
-Art direction override for semantic block `N`.
+Art direction override for public zero-based range `N`.
 
 Examples:
 
 ```text
-video_style_0.txt      # intro
-video_style_1.txt      # first semantic block after intro, usually verse 1
-video_style_2.txt
-video_style_001.txt    # also accepted
+video_style_0.txt      # R000
+video_style_1.txt      # R001
+video_style_2.txt      # R002
+video_style_001.txt    # also accepted for R001
 ```
 
 Duplicate numeric ids are an error:
@@ -503,7 +501,7 @@ Song-level ASS style override.
 subtitle_styles_N.ass
 ```
 
-ASS style override for semantic block `N`.
+ASS style override for public zero-based range `N`.
 
 Examples:
 
@@ -540,13 +538,13 @@ output/work/
     final_audio.wav
 
   clips_unscaled/
-    clip_000_intro.mp4
-    clip_001_verse_001.mp4
+    clip_000.mp4
+    clip_001.mp4
     ...
 
   clips/
-    clip_000_intro.mp4
-    clip_001_verse_001.mp4
+    clip_000.mp4
+    clip_001.mp4
     ...
 
   subclips_raw/
@@ -604,8 +602,9 @@ output/work/
           planner_context.json
           planner_request.txt
           planner_request.json
-          planner_template.txt
-          planner_raw.json
+          planner_response.txt
+          planner_response.json
+          planner_parsed.json
           planner_result.json
           planner_history.json
           image_patched.json
@@ -668,7 +667,7 @@ For lyric ranges, `range_visual_preroll_seconds` lets the semantic clip start sl
 
 Word-level karaoke is gap-aware: gaps between word timestamps are preserved instead of compressing all words together. Silent gaps inside the karaoke overlay are consumed without making the next word highlight early.
 
-After subtitles are generated, the runner immediately writes `subtitle_preview.mp4`: a black-screen video with the full song audio track, burned full-song preview karaoke subtitles from `work/subs/preview_karaoke.ass`, and a separate debug overlay from `work/subs/preview_debug.ass`. This preview is independent of `--limit`; release/final subtitles remain in `work/subs/karaoke.ass` for the selected final timeline. The debug overlay is vector-drawn ASS graphics with three progress bars: full song progress with range/subrange boundary ticks, current range progress, and current subrange progress. Range labels use compact `Rnumber/count` labels without the range kind, where `count` is always the total full-song range count, independent of `--limit`; this total is the maximum useful value for `--limit`. Subranges use `Snumber/count`. `preview_debug.ass` is never used for the final video. This happens before song-context LLM, planner LLM, image generation, or video generation. Use `--preview-subtitles-only` to stop after this file is created.
+Subtitle artifacts are lazy. `work/subs/karaoke.ass` is the full-song release subtitle file used by final rendering, `work/subs/preview_karaoke.ass` is the full-song preview karaoke subtitle file, `work/subs/preview_debug.ass` is the debug overlay, and `subtitle_preview.mp4` is a black-screen full-song preview video with audio, preview subtitles, and debug overlay. Existing files are reused until deleted or invalidated by `--refresh-alignment`. The preview is independent of `--limit`; a limited final render naturally burns only release subtitle events that fall inside the limited video/audio duration. The debug overlay is vector-drawn ASS graphics with three progress bars: full song progress with range/subrange boundary ticks, current range progress, and current subrange progress. Range labels use compact zero-based `Rnumber/count` labels without the range kind. `count` is always the total full-song range count, independent of `--limit`; this total is the maximum useful value for `--limit`. For example, `R000/027` through `R026/027` means `--limit 27` selects the whole song. Subranges use `Snumber/count`. `preview_debug.ass` is never used for the final video. This happens before song-context LLM, planner LLM, image generation, or video generation. Use `--preview-subtitles-only` to stop after this file is created.
 
 Intro, outro, and instrumental gaps use the same threshold predicate. A silent gap becomes its own semantic block only when its duration is at least `instrumental_gap_threshold`; shorter intro/outro gaps are merged into the nearest lyric range.
 
@@ -1027,13 +1026,13 @@ Open the workflow in ComfyUI and check the failing loader node. Place the model 
 
 Make sure `ffmpeg -version` and `ffprobe -version` work in the same terminal.
 
-### `--rework` fails because song context is missing
+### `--rework` needs song context but it is missing
 
-Run a normal generation first. `--rework` intentionally keeps existing `song_context.json` frozen.
+The runner builds `output/work/plans/song_context.json` lazily when clip generation needs it. Rebuild-final and preview-only runs do not read or build song context.
 
-### A normal run removed my output folder
+### How do I force a completely fresh output?
 
-That is expected. A normal run is a fresh creative attempt and cleans `--output-dir` first. Use a new `--output-dir` to keep multiple attempts side by side.
+Delete the output folder before running. The runner no longer treats the absence of `--rework` as permission to delete `--output-dir`; it regenerates the selected ranges and overwrites their generated artifacts.
 
 
 ### alignment contains bracket directives or `***`
@@ -1042,7 +1041,7 @@ Regenerate alignment by running a normal fresh generation. New alignment should 
 
 ### alignment diagnostics and line-aware matching
 
-For `alignment.json`, the runner uses a lyrics-driven line-aware matcher. `lyrics.txt` remains the text truth, and stable-ts words are treated as timing evidence. The matcher walks the song monotonically from start to end, matches one lyric line at a time, allows partial line matches, and reports low-confidence timing instead of silently accepting collapsed timestamps.
+For `alignment.json`, the runner uses a lyrics-driven line-aware matcher. `lyrics.txt` remains the text truth, and stable-ts words are treated as timing evidence. The matcher walks the song monotonically from start to end, matches one lyric line at a time, allows partial line matches, and reports low-confidence timing instead of silently accepting collapsed timestamps. The matched result is saved as `output/work/alignment/matched_verses.json`; later runs reuse it until the file is removed or `--refresh-alignment` invalidates the alignment cache.
 
 Check:
 

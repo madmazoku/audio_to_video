@@ -12,7 +12,7 @@ import time
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 import random
@@ -47,10 +47,132 @@ def log(msg: str) -> None:
 
 
 def clean_fresh_output_dir(output_root: Path) -> None:
-    """Remove previous generated artifacts for a normal fresh run."""
+    """Remove previous generated artifacts for a manual clean run helper."""
     if output_root.exists():
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+
+
+def remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def invalidate_alignment_related_artifacts(output_root: Path) -> None:
+    """Invalidate caches derived from lyrics/audio alignment.
+
+    This intentionally preserves visual source material in work/clips_unscaled
+    and raw generated clips. Scaled clips and preview/final outputs are derived
+    from the current timeline and must be rebuilt after rematching.
+    """
+    work = output_root / "work"
+    for path in [
+        work / "alignment",
+        work / "clips",
+        work / "subs" / "karaoke.ass",
+        work / "subs" / "preview_karaoke.ass",
+        work / "subs" / "preview_debug.ass",
+        output_root / "subtitle_preview.mp4",
+        output_root / "final_video.mp4",
+        output_root / "manifest.json",
+    ]:
+        remove_path(path)
+
+    debug = work / "debug"
+    for pattern in [
+        "alignment_*.json",
+        "alignment_*.txt",
+        "parsed_verses_all.json",
+        "timeline_blocks.json",
+        "preview_timeline_blocks.json",
+        "timing_report.json",
+        "preview_timing_report.json",
+        "clip_scaling_report.json",
+        "clip_reuse_plan.json",
+    ]:
+        for path in debug.glob(pattern):
+            remove_path(path)
+
+
+def ensure_alignment_artifact(
+    input_dir: Path,
+    out_dir: Path,
+    debug_dir: Path,
+    alignment_dir: Path,
+    stable_ts_cmd: str,
+    lyrics_language: str,
+) -> None:
+    """Create the alignment artifact if it is missing.
+
+    Alignment is a lazy artifact: --refresh-alignment invalidates it, and this
+    function recreates it only when the timeline/subtitles stage needs it.
+    """
+    json_path = alignment_dir / "alignment.json"
+    lrc_path = alignment_dir / "alignment.lrc"
+    if json_path.exists() or lrc_path.exists():
+        log(f"[stage] use cached alignment: {json_path if json_path.exists() else lrc_path}")
+        return
+
+    align_kind, align_path, _ = detect_alignment_source(input_dir)
+    alignment_dir.mkdir(parents=True, exist_ok=True)
+    if align_kind == "vocals":
+        run_stable_ts_alignment(
+            input_dir,
+            out_dir,
+            debug_dir,
+            stable_ts_cmd,
+            lyrics_language,
+        )
+    elif align_kind == "lrc":
+        target_lrc = alignment_dir / "alignment.lrc"
+        shutil.copy2(align_path, target_lrc)
+        write_json(debug_dir / "lrc_alignment_source.json", {
+            "source": str(align_path),
+            "copied_to": str(target_lrc),
+            "mode": "line_level_no_stable_ts",
+        })
+        log(f"[stage] use LRC line timing without stable-ts: {align_path}")
+
+
+def format_range_id(index: int) -> str:
+    return f"R{int(index):03d}"
+
+
+def format_range_id_list(indices: Iterable[int]) -> str:
+    return ", ".join(format_range_id(i) for i in indices)
+
+
+def select_ranges_for_final(all_blocks: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    if not limit:
+        return list(all_blocks)
+    if limit < 0:
+        raise RuntimeError("--limit must be >= 0")
+    if limit > len(all_blocks):
+        last = len(all_blocks) - 1
+        raise RuntimeError(
+            f"--limit {limit} is greater than available range count {len(all_blocks)} "
+            f"({format_range_id(0)}..{format_range_id(last)})."
+        )
+    return list(all_blocks[:limit])
+
+
+def select_ranges_to_generate(ranges_for_final: List[Dict[str, Any]], rework: Optional[List[int]]) -> List[Dict[str, Any]]:
+    if not rework:
+        return list(ranges_for_final)
+    by_index = {int(b["block_index"]): b for b in ranges_for_final}
+    missing = [idx for idx in rework if idx not in by_index]
+    if missing:
+        available = sorted(by_index)
+        selected_desc = "none"
+        if available:
+            selected_desc = f"{format_range_id(available[0])}..{format_range_id(available[-1])}"
+        raise RuntimeError(
+            f"--rework contains range(s) outside selected range set: {format_range_id_list(missing)}. "
+            f"Selected ranges are {selected_desc}. Increase --limit or remove invalid indices."
+        )
+    return [by_index[idx] for idx in rework]
 
 
 def fmt_duration(seconds: float) -> str:
@@ -2361,6 +2483,24 @@ def parse_alignment(
     debug_dir: Path,
     config: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], str]:
+    # Matched lyrics/timeline input is a lazy artifact. If it exists, trust it
+    # until --refresh-alignment invalidates the alignment directory. This keeps
+    # normal rework/rebuild runs from rematching lyrics when neither the raw
+    # alignment nor lyrics were intentionally refreshed.
+    matched_cache_path = alignment_dir / "matched_verses.json"
+    if matched_cache_path.exists():
+        cached = load_json(matched_cache_path)
+        if isinstance(cached, dict):
+            verses = cached.get("verses")
+            mode = str(cached.get("alignment_mode") or cached.get("mode") or "cached")
+        else:
+            verses = cached
+            mode = "cached"
+        if not isinstance(verses, list) or not verses:
+            raise RuntimeError(f"Invalid matched alignment cache: {matched_cache_path}")
+        log(f"[stage] use cached matched alignment: {matched_cache_path}")
+        return verses, mode
+
     lyrics_text = read_text(input_dir / "lyrics.txt", required=False)
     lyrics_verses = parse_lyrics_txt(lyrics_text) if lyrics_text else []
 
@@ -2381,6 +2521,7 @@ def parse_alignment(
         write_json(debug_dir / "alignment_diagnostics.json", diagnostics)
         write_json(debug_dir / "alignment_ignored_meta_words.json", match_report.get("ignored_meta_words", []))
         write_alignment_diagnostics_report(diagnostics, debug_dir / "alignment_diagnostics.txt")
+        write_json(matched_cache_path, {"alignment_mode": "json", "verses": verses})
         return verses, "json"
 
     if lrc_path.exists():
@@ -2393,6 +2534,7 @@ def parse_alignment(
         verses, lrc_report = build_verses_from_lrc_and_lyrics(lrc_lines, lyrics_verses)
         write_json(debug_dir / "lrc_match_report.json", lrc_report)
         write_lrc_match_report(lrc_report, debug_dir / "lrc_match_report.txt")
+        write_json(matched_cache_path, {"alignment_mode": "lrc", "verses": verses})
         return verses, "lrc"
 
     raise FileNotFoundError(
@@ -3417,7 +3559,6 @@ def patch_planner_workflow(
     block_kind: str,
     block_index: int,
     request_path: Optional[Path] = None,
-    template_debug_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     wf = json.loads(json.dumps(template))
     if "2" not in wf or "3" not in wf:
@@ -3436,8 +3577,6 @@ def patch_planner_workflow(
 
     if request_path is not None:
         save_prompt_debug(request_path, user_prompt)
-    if template_debug_path is not None:
-        save_prompt_debug(template_debug_path, rules[template_name])
 
     wf["2"]["inputs"]["system_prompt"] = rules["block_planner_system.txt"]
     wf["2"]["inputs"]["user_prompt"] = user_prompt
@@ -3466,11 +3605,12 @@ def run_comfy_planner(
 ) -> Dict[str, str]:
     plans_dir.mkdir(parents=True, exist_ok=True)
     base_name = f"plan_{index:03d}{plan_suffix}"
-    raw_path = plans_dir / f"{base_name}_raw.json"
+    raw_path = plans_dir / f"{base_name}_response.txt"
     clean_path = plans_dir / f"{base_name}.json"
+    response_json_path = plans_dir / f"{base_name}_response.json"
+    parsed_json_path = plans_dir / f"{base_name}_parsed.json"
     request_path = plans_dir / f"{base_name}_request.txt"
     request_json_path = plans_dir / f"{base_name}_request.json"
-    template_debug_path = plans_dir / f"{base_name}_template.txt"
 
     if raw_path.exists():
         raw_path.unlink()
@@ -3498,7 +3638,6 @@ def run_comfy_planner(
         block_kind,
         index,
         request_path=request_path,
-        template_debug_path=template_debug_path,
     )
     pid, client_id = queue_prompt(wf, comfy_url)
     log(f"  [planner] prompt_id={pid}")
@@ -3516,8 +3655,11 @@ def run_comfy_planner(
         raise RuntimeError(f"Planner JSON missing keys: {missing}. Raw response saved to {raw_path}")
 
     # Do not modify visual prompts in code. Prompt policy belongs in rules/*.txt templates.
+    response_json_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     clean_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {k: str(plan[k]) for k in required}
+    parsed = {k: str(plan[k]) for k in required}
+    parsed_json_path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+    return parsed
 
 
 
@@ -3540,7 +3682,6 @@ def patch_song_context_workflow(
     verses: List[Dict[str, Any]],
     raw_path: Path,
     request_path: Path,
-    template_debug_path: Path,
 ) -> Dict[str, Any]:
     wf = json.loads(json.dumps(template))
     if "2" not in wf or "3" not in wf:
@@ -3548,7 +3689,6 @@ def patch_song_context_workflow(
 
     prompt = build_song_context_prompt(rules, video_style, verses)
     save_prompt_debug(request_path, prompt)
-    save_prompt_debug(template_debug_path, rules["song_context_user.txt"])
 
     wf["2"]["inputs"]["system_prompt"] = rules["song_context_system.txt"]
     wf["2"]["inputs"]["user_prompt"] = prompt
@@ -3561,53 +3701,28 @@ def patch_song_context_workflow(
     return wf
 
 
-def run_or_load_song_context(
+def get_or_create_song_context(
     planner_template: Dict[str, Any],
     rules: Dict[str, str],
     video_style: str,
     verses: List[Dict[str, Any]],
     comfy_url: str,
     plans_dir: Path,
-    mode: str,
 ) -> Dict[str, Any]:
-    """Handle global song context according to run mode.
-
-    mode values:
-      fresh  : always generate song_context.json
-      frozen : require existing song_context.json and load it
-      skip   : do not call LLM; return empty context
-    """
+    """Load cached song_context.json or build it when visual generation needs it."""
     plans_dir.mkdir(parents=True, exist_ok=True)
     clean_path = plans_dir / "song_context.json"
-    raw_path = plans_dir / "song_context_raw.json"
+    raw_path = plans_dir / "song_context_response.txt"
+    response_json_path = plans_dir / "song_context_response.json"
     request_path = plans_dir / "song_context_request.txt"
-    template_debug_path = plans_dir / "song_context_template.txt"
 
-    if mode == "skip":
-        if clean_path.exists():
-            log(f"[stage] load existing song context for debug/reference: {clean_path}")
-            return load_json(clean_path)
-        log("[stage] skip song context: not needed for rebuild-final")
-        return {}
-
-    if mode == "frozen":
-        if not clean_path.exists():
-            raise FileNotFoundError(
-                "Frozen song context is required for --rework, but it does not exist:\n"
-                f"{clean_path}\n"
-                "Run a normal full/limit generation first, or remove --rework."
-            )
-        log(f"[stage] use frozen song context: {clean_path}")
+    if clean_path.exists():
+        log(f"[stage] use cached song context: {clean_path}")
         return load_json(clean_path)
 
-    if mode != "fresh":
-        raise RuntimeError(f"Unknown song context mode: {mode}")
-
-    log("[stage] generate song context for a fresh generation run")
+    log("[stage] build missing song context")
     if raw_path.exists():
         raw_path.unlink()
-    if clean_path.exists():
-        clean_path.unlink()
 
     wf = patch_song_context_workflow(
         planner_template,
@@ -3616,7 +3731,6 @@ def run_or_load_song_context(
         verses,
         raw_path,
         request_path,
-        template_debug_path,
     )
     pid, client_id = queue_prompt(wf, comfy_url)
     log(f"[song-context] prompt_id={pid}")
@@ -3641,6 +3755,7 @@ def run_or_load_song_context(
     for k, v in defaults.items():
         ctx.setdefault(k, v)
 
+    response_json_path.write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
     clean_path.write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
     return ctx
 
@@ -4042,12 +4157,12 @@ def patch_video_from_image_workflow(
 
     if duration > max_seconds:
         raise RuntimeError(
-            f"Block {block_index:03d} part {sub_index:03d} duration is {duration:.2f}s, "
+            f"{format_range_id(block_index)} part {sub_index:03d} duration is {duration:.2f}s, "
             f"but this video workflow hard-limits at {max_seconds:.2f}s."
         )
     if duration > recommended_seconds:
         log(
-            f"  [warn] block {block_index:03d} part {sub_index:03d} duration is {duration:.2f}s; "
+            f"  [warn] {format_range_id(block_index)} part {sub_index:03d} duration is {duration:.2f}s; "
             f"workflow is optimized for <= {recommended_seconds:.2f}s and quality may degrade."
         )
 
@@ -4281,15 +4396,7 @@ def make_timeline_blocks(
 
 def clip_filename_for_block(block: Dict[str, Any]) -> str:
     idx = int(block["block_index"])
-    kind = str(block["kind"])
-    if kind == "intro":
-        return "clip_000_intro.mp4"
-    if kind == "outro":
-        return f"clip_{idx:03d}_outro.mp4"
-    if kind == "instrumental":
-        return f"clip_{idx:03d}_instrumental.mp4"
-    verse_index = int(block.get("verse_index", idx))
-    return f"clip_{idx:03d}_verse_{verse_index:03d}.mp4"
+    return f"clip_{idx:03d}.mp4"
 
 
 def block_clip_path(clips_dir: Path, block: Dict[str, Any]) -> Path:
@@ -4567,8 +4674,9 @@ def copy_planner_artifacts_to_part_debug(
 ) -> None:
     copy_file_if_exists(plans_dir / f"{base_name}_request.txt", part_debug_dir / "planner_request.txt")
     copy_file_if_exists(plans_dir / f"{base_name}_request.json", part_debug_dir / "planner_request.json")
-    copy_file_if_exists(plans_dir / f"{base_name}_template.txt", part_debug_dir / "planner_template.txt")
-    copy_file_if_exists(plans_dir / f"{base_name}_raw.json", part_debug_dir / "planner_raw.json")
+    copy_file_if_exists(plans_dir / f"{base_name}_response.txt", part_debug_dir / "planner_response.txt")
+    copy_file_if_exists(plans_dir / f"{base_name}_response.json", part_debug_dir / "planner_response.json")
+    copy_file_if_exists(plans_dir / f"{base_name}_parsed.json", part_debug_dir / "planner_parsed.json")
     copy_file_if_exists(plans_dir / f"{base_name}.json", part_debug_dir / "planner_result.json")
     copy_file_if_exists(plans_dir / f"{base_name}_history.json", part_debug_dir / "planner_history.json")
 
@@ -4622,11 +4730,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Generate a ComfyUI music video from input-dir files.")
     ap.add_argument("--input-dir", default="input", help="Folder containing all song input files. Defaults to ./input.")
     ap.add_argument("--output-dir", default="output", help="Folder for all generated artifacts. Defaults to ./output.")
-    ap.add_argument("--limit", type=int, default=0, help="Use only first N verses/clips for testing.")
-    ap.add_argument("--rework", nargs="*", type=int, default=None, help="Generate only these block numbers; reuse existing clips for other selected blocks. 0=intro, 1..N=verses, N+1=outro.")
+    ap.add_argument("--limit", type=int, default=0, help="Use only first N zero-based ranges for testing/final assembly. Example: --limit 3 selects R000..R002.")
+    ap.add_argument("--rework", nargs="*", type=int, default=None, help="Generate only these zero-based range IDs; reuse existing clips for other selected ranges. Use the same RNNN numbers shown in subtitle_preview, without the R prefix.")
     ap.add_argument("--rebuild-final", action="store_true", help="Do not generate video; reuse existing unscaled clips and rebuild scaled clips/final only.")
-    ap.add_argument("--refresh-alignment", action="store_true", help="Rebuild alignment/timeline from current input lyrics before deciding which visual clips to reuse or regenerate.")
-    ap.add_argument("--preview-subtitles-only", action="store_true", help="Build karaoke subtitles and subtitle_preview.mp4, then stop before any ComfyUI LLM/image/video generation.")
+    ap.add_argument("--refresh-alignment", action="store_true", help="Invalidate alignment/matching/subtitle/preview caches; missing artifacts are recreated lazily.")
+    ap.add_argument("--preview-subtitles-only", action="store_true", help="Reuse or lazily build karaoke subtitles and subtitle_preview.mp4, then stop before any ComfyUI LLM/image/video generation.")
     ap.add_argument("--comfy-url", default=None, help="Override comfy_url from config.json.")
     ap.add_argument("--comfy-output-dir", default=None, help="Override comfy_output_dir from config.json.")
     ap.add_argument("--lyrics-language", default="en", help="Language code for stable-ts alignment. Default: en.")
@@ -4637,7 +4745,6 @@ def main() -> None:
     clips_reused = 0
     run_id = make_run_id()
     generation_info: Dict[int, Dict[str, Any]] = {}
-    fresh_generation_run = not args.rebuild_final and not args.rework and not args.refresh_alignment
     rework_indices = set(args.rework or [])
 
     script_dir = Path(__file__).resolve().parent
@@ -4663,9 +4770,9 @@ def main() -> None:
     log(f"[stage] ffprobe   : {ffprobe_cmd}")
     log(f"[stage] stable-ts : {stable_ts_cmd}")
 
-    if fresh_generation_run:
-        log(f"[stage] fresh run: clean output dir {output_root}")
-        clean_fresh_output_dir(output_root)
+    if args.refresh_alignment:
+        log("[stage] refresh alignment: invalidate alignment/timeline/subtitle/scaled artifacts")
+        invalidate_alignment_related_artifacts(output_root)
 
     log("[stage] read style/workflows/rules")
     rules = load_rules(rules_dir)
@@ -4686,30 +4793,14 @@ def main() -> None:
     log(f"[stage] comfy out : {output_dir}")
     block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
 
-    if fresh_generation_run or args.refresh_alignment:
-        align_kind, align_path, _ = detect_alignment_source(input_dir)
-        alignment_dir.mkdir(parents=True, exist_ok=True)
-        for stale_alignment in (alignment_dir / "alignment.json", alignment_dir / "alignment.lrc"):
-            if stale_alignment.exists():
-                stale_alignment.unlink()
-        if align_kind == "vocals":
-            run_stable_ts_alignment(
-                input_dir,
-                out_dir,
-                debug_dir,
-                stable_ts_cmd,
-                args.lyrics_language,
-            )
-        elif align_kind == "lrc":
-            target_lrc = alignment_dir / "alignment.lrc"
-            shutil.copy2(align_path, target_lrc)
-            write_json(debug_dir / "lrc_alignment_source.json", {
-                "source": str(align_path),
-                "copied_to": str(target_lrc),
-                "mode": "line_level_no_stable_ts",
-            })
-            log(f"[stage] use LRC line timing without stable-ts: {align_path}")
-
+    ensure_alignment_artifact(
+        input_dir,
+        out_dir,
+        debug_dir,
+        alignment_dir,
+        stable_ts_cmd,
+        args.lyrics_language,
+    )
 
     log("[stage] parse alignment")
     stats_start(stats, "parse_alignment")
@@ -4723,13 +4814,6 @@ def main() -> None:
     plans_dir = out_dir / "plans"
 
     total_verses = len(verses)
-    has_effective_limit = bool(args.limit and args.limit < total_verses)
-    if args.limit and args.limit > total_verses:
-        raise RuntimeError(f"--limit {args.limit} is greater than total verses {total_verses}")
-
-    selected = verses[: args.limit] if args.limit and args.limit < total_verses else verses
-    if not selected:
-        raise RuntimeError("No selected verses.")
 
     log("[stage] prepare full audio")
     stats_start(stats, "prepare_audio")
@@ -4741,45 +4825,44 @@ def main() -> None:
     stats_end(stats, "prepare_audio")
 
     stats_start(stats, "timeline")
-    blocks, audio_end = make_timeline_blocks(verses, selected, audio_duration, has_effective_limit, config)
-    if not blocks:
-        raise RuntimeError("No timeline blocks created.")
-
-    # Subtitle preview is always full-song, regardless of --limit.
-    # --limit affects generation/final assembly only.
-    preview_blocks, preview_audio_end = make_timeline_blocks(verses, verses, audio_duration, False, config)
+    # Build the full range timeline first. Public range IDs are zero-based and
+    # match preview labels: R000..RNNN. --limit is a count over this range list.
+    preview_blocks, _preview_audio_end = make_timeline_blocks(verses, verses, audio_duration, False, config)
     if not preview_blocks:
-        raise RuntimeError("No full-song preview timeline blocks created.")
+        raise RuntimeError("No full-song timeline blocks created.")
+    blocks = select_ranges_for_final(preview_blocks, args.limit)
+    if not blocks:
+        raise RuntimeError("No selected ranges.")
+    has_effective_limit = len(blocks) < len(preview_blocks)
+    audio_end = float(blocks[-1]["end"]) if has_effective_limit else None
+    selected = [v for v in verses if audio_end is None or float(v.get("start", 0.0)) < float(audio_end)]
     stats_end(stats, "timeline")
 
     block_indices = {int(b["block_index"]) for b in blocks}
     if rework_indices:
         outside = sorted(rework_indices - block_indices)
         if outside:
+            selected_desc = f"{format_range_id(min(block_indices))}..{format_range_id(max(block_indices))}" if block_indices else "none"
             raise RuntimeError(
-                f"--rework contains block(s) outside current selected timeline: {outside}. "
-                f"Available blocks are {sorted(block_indices)}. "
-                f"Use 0 for intro, 1..N for verses, N+1 for outro on full song."
+                f"--rework contains range(s) outside selected range set: {format_range_id_list(outside)}. "
+                f"With --limit {args.limit}, selected ranges are {selected_desc}. "
+                f"Increase --limit or remove invalid indices."
             )
 
-    log(f"[stage] verses total={total_verses} selected={len(selected)} alignment={alignment_mode}")
-    log(f"[stage] timeline blocks={len(blocks)} range=0.000s..{blocks[-1]['end']:.3f}s")
+    log(f"[stage] verses total={total_verses} selected_for_subtitles={len(selected)} alignment={alignment_mode}")
+    log(f"[stage] selected ranges={format_range_id(int(blocks[0]['block_index']))}..{format_range_id(int(blocks[-1]['block_index']))} count={len(blocks)}")
     log(f"[stage] subtitle preview timeline blocks={len(preview_blocks)} range=0.000s..{preview_blocks[-1]['end']:.3f}s (full song)")
     if has_effective_limit:
-        log(f"[stage] limit mode: audio/video ends at start of verse {len(selected) + 1:03d}")
+        log(f"[stage] limit mode: audio/video ends at selected range {format_range_id(int(blocks[-1]['block_index']))} end={float(blocks[-1]['end']):.3f}s")
     else:
-        log("[stage] full-song mode: audio is not cut by verse boundaries")
+        log("[stage] full-song mode: audio is not cut by range boundaries")
 
     if args.rebuild_final:
-        log("[stage] rebuild-final mode: no video generation; rebuild scaled clips/final only")
-    elif args.refresh_alignment and rework_indices:
-        log(f"[stage] refresh-alignment + rework mode: regenerate blocks {sorted(rework_indices)} and validate/reuse the rest")
-    elif args.refresh_alignment:
-        log("[stage] refresh-alignment mode: reuse compatible unscaled clips and generate missing/incompatible ranges")
+        log("[stage] rebuild-final: skip visual generation and rebuild final from existing unscaled clips")
     elif rework_indices:
-        log(f"[stage] rework mode: regenerate blocks {sorted(rework_indices)} and reuse the rest")
+        log(f"[stage] rework: generate only ranges {format_range_id_list(sorted(rework_indices))} and reuse the rest")
     else:
-        log("[stage] full generation mode for selected timeline blocks")
+        log("[stage] generate selected ranges")
 
     write_json(debug_dir / "timeline_blocks.json", blocks)
     write_json(debug_dir / "preview_timeline_blocks.json", preview_blocks)
@@ -4791,68 +4874,94 @@ def main() -> None:
     log(f"[stage] render audio duration={render_duration:.2f}s")
     stats_end(stats, "render_audio")
 
-    log("[stage] build karaoke subtitles")
-    stats_start(stats, "subtitles")
     subtitle_mode = "word" if alignment_mode == "json" else "line"
     ass_path = out_dir / "subs" / "karaoke.ass"
     preview_ass_path = out_dir / "subs" / "preview_karaoke.ass"
-    style_section, subtitle_style_map, subtitle_style_report = build_subtitle_styles_for_blocks(
-        preview_blocks,
-        input_dir,
-        data_dir,
-        debug_dir,
-    )
-    # Release subtitles follow the selected timeline used by final assembly.
-    build_ass_subtitles(
-        selected,
-        blocks,
-        0.0,
-        width,
-        height,
-        ass_path,
-        subtitle_mode,
-        style_section,
-        subtitle_style_map,
-        config,
-        debug_dir / "timing_report.json",
-    )
-    # Preview subtitles are always full-song, independent of --limit.
-    build_ass_subtitles(
-        verses,
-        preview_blocks,
-        0.0,
-        width,
-        height,
-        preview_ass_path,
-        subtitle_mode,
-        style_section,
-        subtitle_style_map,
-        config,
-        debug_dir / "preview_timing_report.json",
-    )
-    log(f"[stage] subtitles: {ass_path} ({subtitle_mode})")
-    log(f"[stage] preview subtitles: {preview_ass_path} ({subtitle_mode}, full song)")
-    stats_end(stats, "subtitles")
-
     preview_debug_ass = out_dir / "subs" / "preview_debug.ass"
-    build_preview_debug_ass(preview_blocks, preview_debug_ass, width, height, config, audio_duration)
-
-    log("[stage] render subtitle preview")
-    stats_start(stats, "subtitle_preview")
     subtitle_preview = output_root / "subtitle_preview.mp4"
-    render_subtitle_preview(
-        full_mix,
-        preview_ass_path,
-        subtitle_preview,
-        audio_duration,
-        width,
-        height,
-        int(config["fps"]),
-        ffmpeg_cmd,
-        preview_debug_ass,
-    )
-    log(f"[stage] subtitle preview: {subtitle_preview}")
-    stats_end(stats, "subtitle_preview")
+
+    missing_subtitle_artifacts = [
+        path
+        for path in (ass_path, preview_ass_path, preview_debug_ass)
+        if not path.exists()
+    ]
+    if missing_subtitle_artifacts:
+        log("[stage] build missing karaoke subtitle artifacts")
+        stats_start(stats, "subtitles")
+        style_section, subtitle_style_map, subtitle_style_report = build_subtitle_styles_for_blocks(
+            preview_blocks,
+            input_dir,
+            data_dir,
+            debug_dir,
+        )
+        # Release subtitles are full-song lazy artifacts, just like preview
+        # subtitles. A limited final render naturally burns only events that
+        # fall inside the limited video/audio duration.
+        if not ass_path.exists():
+            build_ass_subtitles(
+                verses,
+                preview_blocks,
+                0.0,
+                width,
+                height,
+                ass_path,
+                subtitle_mode,
+                style_section,
+                subtitle_style_map,
+                config,
+                debug_dir / "timing_report.json",
+            )
+            log(f"[stage] subtitles: {ass_path} ({subtitle_mode}, full song)")
+        else:
+            log(f"[stage] subtitles: {ass_path} (cached)")
+
+        if not preview_ass_path.exists():
+            build_ass_subtitles(
+                verses,
+                preview_blocks,
+                0.0,
+                width,
+                height,
+                preview_ass_path,
+                subtitle_mode,
+                style_section,
+                subtitle_style_map,
+                config,
+                debug_dir / "preview_timing_report.json",
+            )
+            log(f"[stage] preview subtitles: {preview_ass_path} ({subtitle_mode}, full song)")
+        else:
+            log(f"[stage] preview subtitles: {preview_ass_path} (cached)")
+
+        if not preview_debug_ass.exists():
+            build_preview_debug_ass(preview_blocks, preview_debug_ass, width, height, config, audio_duration)
+            log(f"[stage] preview debug subtitles: {preview_debug_ass}")
+        else:
+            log(f"[stage] preview debug subtitles: {preview_debug_ass} (cached)")
+        stats_end(stats, "subtitles")
+    else:
+        log(f"[stage] subtitles: {ass_path} (cached)")
+        log(f"[stage] preview subtitles: {preview_ass_path} (cached)")
+        log(f"[stage] preview debug subtitles: {preview_debug_ass} (cached)")
+
+    if subtitle_preview.exists():
+        log(f"[stage] subtitle preview: {subtitle_preview} (cached)")
+    else:
+        log("[stage] render subtitle preview")
+        stats_start(stats, "subtitle_preview")
+        render_subtitle_preview(
+            full_mix,
+            preview_ass_path,
+            subtitle_preview,
+            audio_duration,
+            width,
+            height,
+            int(config["fps"]),
+            ffmpeg_cmd,
+            preview_debug_ass,
+        )
+        log(f"[stage] subtitle preview: {subtitle_preview}")
+        stats_end(stats, "subtitle_preview")
 
     if args.preview_subtitles_only:
         write_preview_manifest(
@@ -4870,7 +4979,6 @@ def main() -> None:
         )
         write_json(debug_dir / "run_info.json", {
             "run_id": run_id,
-            "fresh_generation_run": fresh_generation_run,
             "preview_subtitles_only": True,
         })
         print_run_stats(
@@ -4895,7 +5003,6 @@ def main() -> None:
     debug_dir.mkdir(parents=True, exist_ok=True)
     write_json(debug_dir / "run_info.json", {
         "run_id": run_id,
-        "fresh_generation_run": fresh_generation_run,
         "refresh_alignment": bool(args.refresh_alignment),
     })
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -4905,24 +5012,24 @@ def main() -> None:
     frames_root.mkdir(parents=True, exist_ok=True)
 
     reuse_tolerance = float(config["clip_reuse_duration_tolerance_ratio"])
-    blocks_to_generate: set = set()
+    ranges_to_generate = select_ranges_to_generate(blocks, args.rework)
+    if args.rebuild_final:
+        ranges_to_generate = []
+    blocks_to_generate = {int(block["block_index"]) for block in ranges_to_generate}
     reuse_plan: Dict[int, Dict[str, Any]] = {}
 
     for block in blocks:
         block_i = int(block["block_index"])
         duration = max(0.1, float(block["duration"]))
         unscaled_clip = block_clip_path(clips_unscaled_dir, block)
+        should_generate = block_i in blocks_to_generate
 
-        if args.rebuild_final:
-            should_generate = False
-        elif rework_indices:
-            should_generate = block_i in rework_indices
-        elif fresh_generation_run:
-            should_generate = True
-        else:
-            should_generate = not unscaled_clip.exists()
-
-        if not should_generate and unscaled_clip.exists():
+        if not should_generate:
+            if not unscaled_clip.exists():
+                raise FileNotFoundError(
+                    f"Existing unscaled clip required but not found for {format_range_id(block_i)}: {unscaled_clip}\n"
+                    "Run visual generation first, remove --rebuild-final, or include this range in --rework."
+                )
             source_duration = ffprobe_duration(unscaled_clip, ffprobe_cmd)
             ratio_delta = duration_ratio_delta(source_duration, duration)
             reuse_plan[block_i] = {
@@ -4932,45 +5039,27 @@ def main() -> None:
                 "ratio_delta": ratio_delta,
                 "tolerance": reuse_tolerance,
             }
-            if args.refresh_alignment and ratio_delta > reuse_tolerance and block_i not in rework_indices:
-                # Refresh-alignment must not silently regenerate or silently reuse
-                # clips whose visual duration no longer matches the new timeline.
-                # The user should inspect subtitle_preview.mp4 and explicitly
-                # request --rework for affected ranges, or run a clean generation.
+            if ratio_delta > reuse_tolerance:
                 raise RuntimeError(
-                    f"Existing unscaled clip is not compatible with refreshed alignment for block {block_i:03d}:\n"
+                    f"Existing unscaled clip is not compatible with current timeline for {format_range_id(block_i)}:\n"
                     f"  clip duration={source_duration:.3f}s current range duration={duration:.3f}s ratio_delta={ratio_delta:.3f}\n"
-                    f"  tolerance={reuse_tolerance:.3f}. Add --rework {block_i} or run a clean generation."
+                    f"  tolerance={reuse_tolerance:.3f}. Add --rework {block_i} or run clean generation for this range."
                 )
-
-        if not should_generate and not unscaled_clip.exists():
-            if args.rebuild_final:
-                raise FileNotFoundError(
-                    f"Existing unscaled clip required but not found: {unscaled_clip}\n"
-                    "Run visual generation first, or remove --rebuild-final."
-                )
-            should_generate = True
-
-        if should_generate:
-            blocks_to_generate.add(block_i)
 
     write_json(debug_dir / "clip_reuse_plan.json", reuse_plan)
 
     song_context: Optional[Dict[str, Any]] = None
     if blocks_to_generate:
-        song_context_mode = "fresh" if (fresh_generation_run or args.refresh_alignment or not rework_indices) else "frozen"
         stats_start(stats, "song_context")
-        song_context = run_or_load_song_context(
+        song_context = get_or_create_song_context(
             planner_template,
             rules,
             video_style,
             verses,
             comfy_url,
             plans_dir,
-            song_context_mode,
         )
         write_json(debug_dir / "song_context_used.json", {
-            "mode": song_context_mode,
             "context": song_context,
         })
         stats_end(stats, "song_context")
@@ -4987,7 +5076,7 @@ def main() -> None:
         unscaled_clip = block_clip_path(clips_unscaled_dir, block)
         should_generate = block_i in blocks_to_generate
 
-        log(f"\n=== block {block_i:03d} / {kind}: {first}")
+        log(f"\n=== {format_range_id(block_i)}: {first}")
         log(f"  [stage] time={float(block['start']):.3f}s..{float(block['end']):.3f}s duration={duration:.2f}s")
 
         subranges = build_subranges_for_block(block, config)
@@ -5107,11 +5196,11 @@ def main() -> None:
                 check_history_status(ih, part_debug_dir / "image_history.json")
                 image_path = find_result_file(ih, output_dir, sub_dir, "start_image", {".png", ".jpg", ".jpeg", ".webp"})
                 if not image_path:
-                    raise RuntimeError(f"Start image result not found for block {block_i:03d} part {sub_i:03d}")
+                    raise RuntimeError(f"Start image result not found for {format_range_id(block_i)} part {sub_i:03d}")
                 shutil.copy2(image_path, start_image_local)
             else:
                 if previous_subclip is None:
-                    raise RuntimeError(f"Internal error: no previous subclip for block {block_i:03d} part {sub_i:03d}")
+                    raise RuntimeError(f"Internal error: no previous subclip for {format_range_id(block_i)} part {sub_i:03d}")
                 log("  [stage] extract previous last frame as next start image")
                 extract_last_frame(previous_subclip, start_image_local, ffmpeg_cmd)
 
@@ -5143,7 +5232,7 @@ def main() -> None:
             check_history_status(vh, part_debug_dir / "video_history.json")
             video_path = find_result_file(vh, output_dir, sub_dir, "video", {".mp4", ".mov", ".webm", ".mkv"})
             if not video_path:
-                raise RuntimeError(f"Video result not found for block {block_i:03d} part {sub_i:03d}")
+                raise RuntimeError(f"Video result not found for {format_range_id(block_i)} part {sub_i:03d}")
 
             raw_part = block_subclips_raw_dir / f"part_{sub_i:03d}{video_path.suffix}"
             shutil.copy2(video_path, raw_part)
@@ -5185,7 +5274,7 @@ def main() -> None:
 
         scene_summary = " / ".join(x.get("scene_summary", "") for x in subrange_infos if x.get("scene_summary"))
         if not scene_summary:
-            scene_summary = f"{kind} block {block_i:03d}, rendered as {len(subrange_infos)} internal subrange(s)"
+            scene_summary = f"{format_range_id(block_i)}, rendered as {len(subrange_infos)} internal subrange(s)"
         aggregate_plan = {
             "scene_summary": scene_summary,
             "split_parts": len(subrange_infos),
@@ -5225,8 +5314,8 @@ def main() -> None:
         unscaled_clip = block_clip_path(clips_unscaled_dir, block)
         clip_local = block_clip_path(clips_dir, block)
         if not unscaled_clip.exists():
-            raise FileNotFoundError(f"Unscaled clip not found for block {block_i:03d}: {unscaled_clip}")
-        log(f"  [scale] block {block_i:03d}: {unscaled_clip.name} -> {clip_local.name}")
+            raise FileNotFoundError(f"Unscaled clip not found for {format_range_id(block_i)}: {unscaled_clip}")
+        log(f"  [scale] {format_range_id(block_i)}: {unscaled_clip.name} -> {clip_local.name}")
         scale_info = retime_video_copy(
             unscaled_clip,
             max(0.1, float(block["duration"])),
