@@ -90,7 +90,7 @@ def invalidate_alignment_related_artifacts(output_root: Path) -> None:
         "timing_report.json",
         "preview_timing_report.json",
         "clip_scaling_report.json",
-        "clip_reuse_plan.json",
+        "clip_validation_report.json",
     ]:
         for path in debug.glob(pattern):
             remove_path(path)
@@ -1830,9 +1830,10 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
     required = {
         "comfy_url": str,
         "comfy_output_dir": str,
-        "width": int,
-        "height": int,
-        "fps": int,
+        "video_width": int,
+        "video_height": int,
+        "video_fps": int,
+        "clip_duration_tolerance_ratio": (int, float),
         "recommended_workflow_seconds": (int, float),
         "max_workflow_seconds": (int, float),
         "instrumental_gap_min_seconds": (int, float),
@@ -1845,7 +1846,6 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         "alignment_match_similarity_threshold": (int, float),
         "alignment_match_warn_ratio": (int, float),
         "alignment_match_max_extra_ratio": (int, float),
-        "clip_reuse_duration_tolerance_ratio": (int, float),
     }
 
     for key, expected_type in required.items():
@@ -1856,9 +1856,10 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
 
     config["comfy_url"] = str(config["comfy_url"])
     config["comfy_output_dir"] = str(config["comfy_output_dir"])
-    config["width"] = int(config["width"])
-    config["height"] = int(config["height"])
-    config["fps"] = int(config["fps"])
+    config["video_width"] = int(config["video_width"])
+    config["video_height"] = int(config["video_height"])
+    config["video_fps"] = int(config["video_fps"])
+    config["clip_duration_tolerance_ratio"] = float(config["clip_duration_tolerance_ratio"])
     config["recommended_workflow_seconds"] = float(config["recommended_workflow_seconds"])
     config["max_workflow_seconds"] = float(config["max_workflow_seconds"])
     config["instrumental_gap_min_seconds"] = float(config["instrumental_gap_min_seconds"])
@@ -1871,7 +1872,6 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
     config["alignment_match_similarity_threshold"] = float(config["alignment_match_similarity_threshold"])
     config["alignment_match_warn_ratio"] = float(config["alignment_match_warn_ratio"])
     config["alignment_match_max_extra_ratio"] = float(config["alignment_match_max_extra_ratio"])
-    config["clip_reuse_duration_tolerance_ratio"] = float(config["clip_reuse_duration_tolerance_ratio"])
     config["_source"] = source
     return config
 
@@ -3432,11 +3432,6 @@ def retime_video_copy(
     }
 
 
-def duration_ratio_delta(source_duration: float, target_duration: float) -> float:
-    target_duration = max(0.1, float(target_duration))
-    return abs(float(source_duration) - target_duration) / target_duration
-
-
 def final_mux(video_in: Path, audio_in: Path, ass_path: Path, out: Path, ffmpeg: str, fps: int) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     sub_arg = ffmpeg_sub_path(ass_path)
@@ -4122,8 +4117,8 @@ def patch_image_workflow(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     wf = json.loads(json.dumps(template))
-    width = int(config["width"])
-    height = int(config["height"])
+    width = int(config["video_width"])
+    height = int(config["video_height"])
     segment_dir = comfy_block_part_subdir(run_id, block_index, sub_index)
 
     wf[IMAGE_N["image_prompt"]]["inputs"]["text"] = image_prompt
@@ -4148,12 +4143,12 @@ def patch_video_from_image_workflow(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     wf = json.loads(json.dumps(template))
-    width = int(config["width"])
-    height = int(config["height"])
-    fps = int(config["fps"])
+    width = int(config["video_width"])
+    height = int(config["video_height"])
+    fps = float(config["video_fps"])
     recommended_seconds = float(config["recommended_workflow_seconds"])
     max_seconds = float(config["max_workflow_seconds"])
-    seconds = max(1, min(int(max_seconds), math.ceil(duration)))
+    seconds = max(0.001, float(duration))
 
     if duration > max_seconds:
         raise RuntimeError(
@@ -4401,6 +4396,54 @@ def clip_filename_for_block(block: Dict[str, Any]) -> str:
 
 def block_clip_path(clips_dir: Path, block: Dict[str, Any]) -> Path:
     return clips_dir / clip_filename_for_block(block)
+
+
+def relpath_or_abs(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def validate_unscaled_clip_for_timeline(
+    block: Dict[str, Any],
+    unscaled_clip: Path,
+    output_root: Path,
+    config: Dict[str, Any],
+    ffprobe_cmd: str,
+) -> Dict[str, Any]:
+    block_i = int(block["block_index"])
+    if not unscaled_clip.exists():
+        raise FileNotFoundError(
+            f"Unscaled clip not found for {format_range_id(block_i)}: {unscaled_clip}\n"
+            f"Generate this range with --rework {block_i} or run clean generation."
+        )
+
+    target_duration = max(0.1, float(block.get("duration", 0.0)))
+    source_duration = ffprobe_duration(unscaled_clip, ffprobe_cmd)
+    tolerance = max(0.0, float(config.get("clip_duration_tolerance_ratio", 0.05)))
+    ratio_delta = abs(source_duration - target_duration) / max(target_duration, 0.001)
+    ok = ratio_delta <= tolerance
+    info = {
+        "range_id": block_i,
+        "range_label": format_range_id(block_i),
+        "clip": relpath_or_abs(unscaled_clip, output_root),
+        "source_duration": source_duration,
+        "target_duration": target_duration,
+        "ratio_delta": ratio_delta,
+        "tolerance": tolerance,
+        "validated": ok,
+    }
+    if not ok:
+        raise RuntimeError(
+            f"Unscaled clip duration is not compatible with current timeline for {format_range_id(block_i)}:\n"
+            f"  clip duration={source_duration:.3f}s current range duration={target_duration:.3f}s "
+            f"ratio_delta={ratio_delta:.3f}\n"
+            f"  tolerance={tolerance:.3f}. Add --rework {block_i}, run clean generation for this range, "
+            f"or increase clip_duration_tolerance_ratio in input/config.json.\n"
+            f"  clip={unscaled_clip}"
+        )
+    return info
 
 
 
@@ -4781,8 +4824,8 @@ def main() -> None:
         raise FileNotFoundError(f"Required file not found: {video_style_path}")
     video_style = read_text(video_style_path)
     config = load_config(input_dir, data_dir)
-    width = int(config["width"])
-    height = int(config["height"])
+    width = int(config["video_width"])
+    height = int(config["video_height"])
     comfy_url = args.comfy_url or str(config["comfy_url"])
     output_dir = Path(args.comfy_output_dir).resolve() if args.comfy_output_dir else resolve_config_path(str(config["comfy_output_dir"]), script_dir)
     planner_template = load_json(workflow_dir / "planner_visual_prompts_api.json")
@@ -4956,7 +4999,7 @@ def main() -> None:
             audio_duration,
             width,
             height,
-            int(config["fps"]),
+            int(config["video_fps"]),
             ffmpeg_cmd,
             preview_debug_ass,
         )
@@ -5011,42 +5054,10 @@ def main() -> None:
     subclips_video_root.mkdir(parents=True, exist_ok=True)
     frames_root.mkdir(parents=True, exist_ok=True)
 
-    reuse_tolerance = float(config["clip_reuse_duration_tolerance_ratio"])
     ranges_to_generate = select_ranges_to_generate(blocks, args.rework)
     if args.rebuild_final:
         ranges_to_generate = []
     blocks_to_generate = {int(block["block_index"]) for block in ranges_to_generate}
-    reuse_plan: Dict[int, Dict[str, Any]] = {}
-
-    for block in blocks:
-        block_i = int(block["block_index"])
-        duration = max(0.1, float(block["duration"]))
-        unscaled_clip = block_clip_path(clips_unscaled_dir, block)
-        should_generate = block_i in blocks_to_generate
-
-        if not should_generate:
-            if not unscaled_clip.exists():
-                raise FileNotFoundError(
-                    f"Existing unscaled clip required but not found for {format_range_id(block_i)}: {unscaled_clip}\n"
-                    "Run visual generation first, remove --rebuild-final, or include this range in --rework."
-                )
-            source_duration = ffprobe_duration(unscaled_clip, ffprobe_cmd)
-            ratio_delta = duration_ratio_delta(source_duration, duration)
-            reuse_plan[block_i] = {
-                "source": str(unscaled_clip.relative_to(output_root)) if unscaled_clip.is_relative_to(output_root) else str(unscaled_clip),
-                "source_duration": source_duration,
-                "target_duration": duration,
-                "ratio_delta": ratio_delta,
-                "tolerance": reuse_tolerance,
-            }
-            if ratio_delta > reuse_tolerance:
-                raise RuntimeError(
-                    f"Existing unscaled clip is not compatible with current timeline for {format_range_id(block_i)}:\n"
-                    f"  clip duration={source_duration:.3f}s current range duration={duration:.3f}s ratio_delta={ratio_delta:.3f}\n"
-                    f"  tolerance={reuse_tolerance:.3f}. Add --rework {block_i} or run clean generation for this range."
-                )
-
-    write_json(debug_dir / "clip_reuse_plan.json", reuse_plan)
 
     song_context: Optional[Dict[str, Any]] = None
     if blocks_to_generate:
@@ -5271,7 +5282,6 @@ def main() -> None:
 
         log("  [stage] assemble unscaled semantic clip from generated subclips")
         concat_or_copy_subclips(subclip_paths, unscaled_clip, ffmpeg_cmd)
-
         scene_summary = " / ".join(x.get("scene_summary", "") for x in subrange_infos if x.get("scene_summary"))
         if not scene_summary:
             scene_summary = f"{format_range_id(block_i)}, rendered as {len(subrange_infos)} internal subrange(s)"
@@ -5297,8 +5307,8 @@ def main() -> None:
             "run_id": run_id,
             "segment_subdir": f"aligned_song/{run_id}/block_{block_i:03d}",
             "generated_in_this_run": True,
-            "range_debug": str(range_dir.relative_to(output_root)) if range_dir.is_relative_to(output_root) else str(range_dir),
-            "unscaled_clip": str(unscaled_clip.relative_to(output_root)) if unscaled_clip.is_relative_to(output_root) else str(unscaled_clip),
+            "range_debug": relpath_or_abs(range_dir, output_root),
+            "unscaled_clip": relpath_or_abs(unscaled_clip, output_root),
             "subranges": subrange_infos,
         }
         write_json(debug_dir / f"video_generation_{block_i:03d}.json", generation_info[block_i])
@@ -5306,15 +5316,22 @@ def main() -> None:
         clips_generated += 1
         stats_end(stats, "video_generation")
 
-    log("\n[stage] scale unscaled clips to current timeline")
+    log("\n[stage] validate and scale unscaled clips to current timeline")
     stats_start(stats, "clip_scaling")
     scaling_report: List[Dict[str, Any]] = []
+    validation_report: List[Dict[str, Any]] = []
     for block in blocks:
         block_i = int(block["block_index"])
         unscaled_clip = block_clip_path(clips_unscaled_dir, block)
         clip_local = block_clip_path(clips_dir, block)
-        if not unscaled_clip.exists():
-            raise FileNotFoundError(f"Unscaled clip not found for {format_range_id(block_i)}: {unscaled_clip}")
+        validation_info = validate_unscaled_clip_for_timeline(
+            block,
+            unscaled_clip,
+            output_root,
+            config,
+            ffprobe_cmd,
+        )
+        validation_report.append(validation_info)
         log(f"  [scale] {format_range_id(block_i)}: {unscaled_clip.name} -> {clip_local.name}")
         scale_info = retime_video_copy(
             unscaled_clip,
@@ -5322,12 +5339,13 @@ def main() -> None:
             clip_local,
             ffmpeg_cmd,
             ffprobe_cmd,
-            int(config["fps"]),
+            int(config["video_fps"]),
         )
         scale_info["block_index"] = block_i
         scale_info["kind"] = str(block.get("kind", ""))
         scaling_report.append(scale_info)
         clips.append(clip_local)
+    write_json(debug_dir / "clip_validation_report.json", validation_report)
     write_json(debug_dir / "clip_scaling_report.json", scaling_report)
     stats_end(stats, "clip_scaling")
 
@@ -5340,7 +5358,7 @@ def main() -> None:
     log("[stage] final mux audio + burn subtitles")
     stats_start(stats, "final_mux")
     final = output_root / "final_video.mp4"
-    final_mux(video_only, final_audio, ass_path, final, ffmpeg_cmd, int(config["fps"]))
+    final_mux(video_only, final_audio, ass_path, final, ffmpeg_cmd, int(config["video_fps"]))
     stats_end(stats, "final_mux")
 
     write_timeline_manifest(
