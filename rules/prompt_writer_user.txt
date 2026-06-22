@@ -1,0 +1,80 @@
+Write a prompt package from this semantic plan, identity contract, and style contract.
+
+SEMANTIC PLAN:
+{{SEMANTIC_PLAN_JSON}}
+
+IDENTITY CONTRACT:
+{{IDENTITY_CONTRACT_JSON}}
+
+STYLE CONTRACT:
+{{STYLE_CONTRACT_JSON}}
+
+RANGE TEXT:
+{{RANGE_TEXT}}
+
+CURRENT SUBRANGE TEXT:
+{{SUBRANGE_TEXT}}
+
+RANGE VISUAL STATE / SAME-RANGE CONTINUITY LOCK:
+{{RANGE_VISUAL_STATE_JSON}}
+
+SUBRANGE CONTINUITY INSTRUCTION:
+{{SUBRANGE_CONTINUITY_INSTRUCTION}}
+
+PREVIOUS FAILED RESULT, IF ANY:
+{{PREVIOUS_RESULT_JSON}}
+
+Rules:
+
+Anchor containment:
+- Do not introduce concrete identity/song-context anchors that are absent from semantic_plan.must_show and semantic_plan.identity_anchors_to_show.
+- Even when an anchor is listed in identity_anchors_to_show, keep it in the role implied by the semantic plan. If it is supporting/background/contextual, do not make it the main subject, primary setting, destination, final reveal, landmark, or composition center.
+- Never copy anchors from identity_contract.required_recurring_anchors, style_continuity_rules, song_context.continuity_rules, or previous visuals directly into the prompt unless the semantic plan explicitly selected them for this current lyric event.
+
+- image_prompt describes the first frame / starting keyframe.
+- video_prompt describes one continuous visible motion arc after the first frame. It must read like a single uninterrupted shot, not a sequence of edited shots.
+- video_prompt may use explicit temporal structure such as "At the start... Then... By the end...", but all clauses must describe the same subject(s), same location, same dominant lighting/color grade, and same composition family unless the semantic plan explicitly requires a scene transition.
+- The main subject and main action from the semantic plan must remain grammatically central.
+- For later subranges inside the same semantic range, explicitly continue the established scene when accurate.
+- Do not silently change subject type, apparent size/scale, species/faction, or location inside the same semantic range unless current subrange text demands it.
+
+STYLE PRESERVATION:
+- image_prompt MUST begin with style_contract.required_style_prefix when that field is non-empty.
+- video_prompt MUST include the rendering medium/look early.
+- Include explicit terms from required_medium_terms and required_rendering_techniques when present.
+- Never include positive terms that appear in negative_medium_terms/style_must_not.
+- Do not infer a different medium from mood words. If required_medium_terms exists, use it.
+
+LYRIC ACTION:
+- image_prompt must show semantic plan main_subject doing or preparing main_action.
+- video_prompt must have a start state, action escalation, and a small visible consequence inside the same continuous scene. The final state must be the result of the same motion, not a new tableau, reveal, location, or composition reset.
+- If semantic plan uses a group subject, keep a group subject.
+- Do not replace the main action with generic posing, static landmark worship, idle standing, ambient particles, or camera-only motion.
+
+SINGLE-SHOT CONTINUITY / NO INTERNAL MONTAGE:
+- A generated clip/range should be a continuous shot. Do not write a video_prompt that implies an edit, cut, montage, hard transition, scene change, time jump, jump cut, smash cut, crossfade, new establishing shot, or a separate final tableau.
+- The "By the end" clause must not introduce a new primary location, new landmark, new destination, new dominant lighting setup, new color grade, new scale, new camera angle family, or new composition center unless the semantic plan explicitly says the current range is a scene transition.
+- Identity anchors listed in identity_anchors_to_show must stay at the scale/role implied by the semantic plan. If the semantic plan describes an anchor as distant, background, minor, symbolic, or contextual, do not promote it into the end-state destination or final composition center.
+- Prefer language such as "the same group", "in the same place", "under the same lighting", "continues", "advances a few steps", "the environment reacts", and "the final frame shows the direct consequence of that motion".
+- Avoid packing multiple visual beats into one clip just because the range is long. If several distinct events are needed, they belong in separate subranges/clips, not as internal montage inside one video_prompt.
+- Maintain stable rendering medium, palette, and color grade across the clip unless the semantic plan explicitly requires a lighting change. Colored lights may appear as local accents, but do not make the entire image drift to a new grade and then reset.
+
+ANCHOR DISCIPLINE:
+- Include only semantic_plan.identity_anchors_to_show as concrete visual nouns when they do not contradict the action. Do not independently add concrete anchors from song_context or identity_contract.
+- Use identity anchors as setting/costume/props/world context, not as replacement action.
+- Avoid identity_anchors_to_avoid and avoid_as_main_subject.
+- Do not add recurring anchors that are not in semantic plan except as minor non-central background texture. Do not use an unplanned anchor as destination, central landmark, main prop, or composition center.
+
+NEGATIVE PROMPT:
+- Always include fixed motion/composition negatives that prevent failed video behavior: poster layout, idle animation, looping motion, camera-only movement.
+- Also include style_contract.negative_medium_terms, negative_style_terms, negative_content_terms, song_context.avoid, and relevant style_must_not terms that describe forbidden visual outputs.
+- Do not add default bans on visible text, captions, signs, typography, logos, or watermarks unless they are present in style_contract negative terms, song_context.avoid, current lyrics/context, or other source-grounded negative constraints.
+- Do not put required subjects/actions into the negative prompt.
+
+Return ONLY valid JSON with exactly these keys:
+{
+  "scene_summary": "one sentence summary of the literal visual event plus the identity/world lens; mention same-scene continuity when continuing a prior subrange",
+  "image_prompt": "English prompt for the still starting image; do not quote raw lyrics as visible words unless explicitly requested by source/style",
+  "video_prompt": "English prompt for animation as a complete visible action arc; do not quote raw lyrics as visible words unless explicitly requested by source/style",
+  "negative_prompt": "comma-separated things to avoid"
+}

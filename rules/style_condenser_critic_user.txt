@@ -1,0 +1,107 @@
+Evaluate this condensed style/identity contract against RAW VIDEO STYLE and PARSED SOURCE FACTS.
+
+Style source id: {{STYLE_SOURCE_ID}}
+Range index if range-specific: {{BLOCK_INDEX}}
+
+RAW VIDEO STYLE:
+{{RAW_VIDEO_STYLE}}
+
+PARSED SOURCE FACTS:
+{{PARSED_STYLE_JSON}}
+
+CONTRACT DRAFT:
+{{CONTRACT_JSON}}
+
+PREVIOUS FAILED RESULT / REPAIR CONTEXT:
+{{PREVIOUS_RESULT_JSON}}
+
+PARSER TECHNICAL STATUS:
+{{PARSER_STATUS_JSON}}
+
+WRITER TECHNICAL STATUS:
+{{WRITER_STATUS_JSON}}
+
+FAILED STAGE IF ANY:
+{{FAILED_STAGE}}
+
+Return ONLY valid JSON with exactly these keys:
+{
+  "success": false,
+  "score": 0,
+  "issues": [],
+  "repairs": [],
+  "contract": {
+    "style_contract": {
+      "visual_style_summary": "",
+      "required_style_prefix": "",
+      "required_medium_terms": [],
+      "required_rendering_techniques": [],
+      "cinematography_rules": [],
+      "motion_style_rules": [],
+      "lighting_color_texture_rules": [],
+      "pacing_editing_rules": [],
+      "allowed_style_elements": [],
+      "negative_medium_terms": [],
+      "negative_style_terms": [],
+      "negative_content_terms": [],
+      "ambiguous_or_conflicting_style_notes": [],
+      "style_must_not": []
+    },
+    "identity_contract": {
+      "identity_summary": "",
+      "required_recurring_anchors": [],
+      "optional_anchor_pool": [],
+      "character_or_faction_anchors": [],
+      "creature_or_species_anchors": [],
+      "location_anchors": [],
+      "prop_or_symbol_anchors": [],
+      "style_continuity_rules": [],
+      "avoid_generic_drift": [],
+      "anchor_usage_rule": ""
+    }
+  }
+}
+
+TECHNICAL STATUS HANDLING:
+- If parser or writer reports json_parse_ok=false or structural_ok=false, return success=false, score 0-20, issues explaining the technical problem, and repairs for the next attempt.
+- Do not throw a runtime-style answer. Always return this critic JSON schema.
+
+HARD PASS/FAIL RULES:
+- success MUST be false if CONTRACT DRAFT invents a different visual world, genre, medium, setting, technology, era, species, or protagonist not grounded in RAW VIDEO STYLE/PARSED SOURCE FACTS.
+- success MUST be false if required_style_prefix or required_medium_terms contradict positive_rendering_medium_terms.
+- success MUST be false if CONTRACT DRAFT includes terms explicitly forbidden by negative_rendering_medium_terms, negative_rendering_technique_terms, negative_style_terms, or negative_content_terms.
+- success MUST be false if distinctive source identity anchors are missing or replaced by generic unrelated anchors.
+
+- success MUST be false if required_recurring_anchors contains concrete visible motifs such as a named/specific character, ruler/protagonist, faction, iconic location, landmark, building, monument, seat/throne-like object, vehicle, weapon, special prop, relic, symbol, ritual, destination, or one-off place, unless RAW VIDEO STYLE explicitly says that exact motif must appear in every scene or every clip.
+- success MUST be false if style_continuity_rules contains concrete visible motifs as repeated continuity requirements instead of abstract style/world continuity.
+- success MUST be false if avoid_generic_drift contains desired source identity/world elements rather than forbidden drift targets.
+- success MUST be false if optional/selective anchors were promoted into required_recurring_anchors merely because they are iconic, recurring, important, or visually strong.
+- success MUST be false for catastrophic drift even if the critic can repair it in the "contract" field.
+- success may be true only when the CONTRACT DRAFT itself is acceptable without important repairs.
+
+CRITIC DUTY:
+- The "contract" field must contain a corrected usable contract whether success is true or false.
+- If success is false, include concise issues and repairs that a retry can follow.
+- Do not mark success true just because you can repair the draft.
+- Do not accept unrelated style drift: any genre label, era label, setting type, rendering medium, visual technology, character type, location type, species/type of subject, protagonist concept, or aesthetic label that is not supported by the parsed source facts as a positive term must be treated as invented drift.
+- Preserve required rendering medium from positive source facts.
+- Preserve explicit negative media/style/content constraints from parsed source facts.
+- Preserve anchor usage: current lyrics choose main subject/action; identity anchors support continuity.
+
+SCORING:
+- 90-100: faithful, compact, no important omissions.
+- 70-89: mostly faithful, no catastrophic drift.
+- 40-69: important missing medium or identity, but same general world.
+- 0-39: catastrophic drift, invented medium/world, or contradiction with negative constraints.
+- If catastrophic drift exists, score must be <= 20 and success false.
+
+BUILDING THE CORRECTED CONTRACT:
+- Copy strongest positive rendering medium terms into required_medium_terms.
+- Build required_style_prefix from strongest positive medium + technique terms.
+- Copy strongest negative media/style/content constraints into negative_* and style_must_not.
+- Preserve distinctive identity anchors from parser.
+- Preserve the rule that anchors are not mandatory main subjects in every clip.
+
+- When repairing, demote concrete visible motifs from required_recurring_anchors and style_continuity_rules into optional_anchor_pool or the appropriate anchor inventory.
+- The corrected required_recurring_anchors should usually contain only broad invariants and may be empty.
+- The corrected style_continuity_rules should contain only abstract style/world/body/palette/tone continuity.

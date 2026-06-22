@@ -1,0 +1,109 @@
+Evaluate this prompt package against the semantic plan, lyrics/subrange, identity contract, and style contract.
+
+SEMANTIC PLAN:
+{{SEMANTIC_PLAN_JSON}}
+
+PROMPT PACKAGE:
+{{PROMPT_PACKAGE_JSON}}
+
+RANGE TEXT:
+{{RANGE_TEXT}}
+
+CURRENT SUBRANGE TEXT:
+{{SUBRANGE_TEXT}}
+
+IDENTITY CONTRACT:
+{{IDENTITY_CONTRACT_JSON}}
+
+STYLE CONTRACT:
+{{STYLE_CONTRACT_JSON}}
+
+PREVIOUS VISUAL CONTEXT:
+{{PREVIOUS_VISUAL_CONTEXT_JSON}}
+
+RANGE VISUAL STATE / SAME-RANGE CONTINUITY LOCK:
+{{RANGE_VISUAL_STATE_JSON}}
+
+SUBRANGE CONTINUITY INSTRUCTION:
+{{SUBRANGE_CONTINUITY_INSTRUCTION}}
+
+PREVIOUS FAILED RESULT, IF ANY:
+{{PREVIOUS_RESULT_JSON}}
+
+PARSER TECHNICAL STATUS:
+{{PARSER_STATUS_JSON}}
+
+WRITER TECHNICAL STATUS:
+{{WRITER_STATUS_JSON}}
+
+FAILED STAGE IF ANY:
+{{FAILED_STAGE}}
+
+Critic checks:
+- First evaluate whether the semantic plan itself is grounded in RANGE TEXT / CURRENT SUBRANGE TEXT. If the plan promotes a low-priority recurring anchor to main_subject or primary setting without current lyric support, success MUST be false so the next attempt can repair the semantic plan.
+- If the lyrics imply a group subject but the semantic plan or prompt uses a singular iconic character without lyric support, success MUST be false.
+- If the lyrics provide a setting/action/path/environment but the semantic plan or prompt replaces it with a recurring identity location/action/destination/composition center, success MUST be false.
+- Main subject remains the main subject from semantic plan only when that semantic plan is lyric-grounded.
+- Main action is visible and active.
+- Prompt does not ignore current lyrics/subrange.
+- Prompt does not reuse recurring anchors as main subject, primary setting, destination, main prop, or composition center unless the lyric-grounded semantic plan explicitly required it.
+- Style does not become the subject.
+- Image and video prompts describe the same scene.
+- Video prompt contains a concrete temporal action arc and a visible consequence inside one continuous scene, not an internal montage or scene reset.
+- Negative prompt does not remove required subjects or actions.
+- Visible text, captions, subtitles, signs, typography, logos, or watermarks appear only when explicitly required by the source/style; if source-grounded negative constraints forbid them, they must be absent.
+- Required style medium/prefix is present in image_prompt and visible early in video_prompt.
+- Prompt does not include a medium/style forbidden by style_contract negative terms.
+- Identity anchors appear only as world/costume/setting/prop context and do not replace the lyric event, local lyric setting, or action target.
+- Repeated composition patterns are checked: if the prompt repeats the same subject type + action type + setting/destination from recent context without current lyric support, success MUST be false.
+
+
+Plan-vs-lyrics hard checks:
+- success MUST be false if semantic_plan.must_show contains concrete identity/song-context anchors not grounded in CURRENT SUBRANGE TEXT or RANGE TEXT.
+- success MUST be false if semantic_plan.identity_anchors_to_show contains anchors that are only iconic/recurring/allowed/previously used rather than directly supporting the current lyric event.
+- success MUST be false if semantic_plan.main_subject is a named/iconic/global character or global subject while current lyrics imply a different local actor, group, environment, or abstract/ambient beat.
+- success MUST be false if semantic_plan.setting is primarily a global recurring location/landmark instead of a local setting/path/environment named or implied by current lyrics.
+- success MUST be false if semantic_plan.main_action is an action associated with a global anchor rather than the clearest action verb or physical event in the current lyrics.
+- success MUST be false if the plan uses a concrete global anchor as destination, goal, end-state reveal, or composition center without current lyric support, even if the final prompt follows that plan.
+
+Single-shot continuity checks:
+- success MUST be false if the video_prompt implies an edit, cut, montage, hard transition, scene change, time jump, jump cut, smash cut, crossfade, new establishing shot, separate final tableau, or late composition reset within the generated clip, unless the semantic plan explicitly requires a scene transition.
+- success MUST be false if the "By the end" clause introduces a new primary location, new landmark, new destination, new dominant lighting setup, new color grade, new scale, new camera angle family, or new composition center that was not already part of the same continuous scene in the semantic plan.
+- success MUST be false if a supporting/background identity anchor becomes the final destination, final reveal, central landmark, or end-state tableau without explicit semantic-plan support.
+- success MUST be false if a prompt introduces any item from identity_anchors_to_avoid as visible content unless the current lyrics or semantic plan explicitly require it.
+- success MUST be false if image_prompt and video_prompt describe different scenes rather than the same scene evolving continuously.
+- A changed final state is acceptable only when it is a direct physical/emotional/environmental consequence of the same subject performing the same action in the same place.
+
+Technical status handling:
+- If parser or writer reports json_parse_ok=false or structural_ok=false, return success=false with low score, precise issues, and concrete repairs.
+- Within one attempt, technical failure is not a runtime exception; it is a failed attempt.
+
+Return ONLY valid JSON with exactly these keys:
+{
+  "success": true,
+  "score": 0,
+  "issues": [],
+  "repairs": [],
+  "prompt": {
+    "scene_summary": "revised or accepted scene summary",
+    "image_prompt": "revised or accepted image prompt",
+    "video_prompt": "revised or accepted video prompt",
+    "negative_prompt": "revised or accepted negative prompt"
+  }
+}
+
+Rules:
+- success must be true only if the prompt is grounded, active, preserves required style medium, preserves identity, and keeps continuity without overriding meaning.
+- success MUST be false if image_prompt/video_prompt ignore semantic plan main subject/action.
+- success MUST be false if the semantic plan itself ignores current lyrics/subrange in favor of low-priority song_context, identity_contract, continuity_rules, recurring anchors, or previous visuals.
+- success MUST be false if a concrete continuity motif becomes the primary setting, destination, or composition center without current lyric support.
+- success MUST be false if action is idle, poster-like, camera-only, montage-like, or dependent on a late scene reset.
+- success MUST be false if required style medium is absent from image_prompt or video_prompt.
+- success MUST be false if prompt uses a different world/genre/species than current lyrics/song context/identity contract.
+- success MUST be false if prompt includes forbidden medium/style terms from style_contract.
+- success false is fine; always provide issues/repairs and a usable prompt field.
+
+- Do not accept a prompt package merely because the prompt follows the semantic plan; if the semantic plan is anchor-dominated or not lyric-grounded, fail the attempt and repair the prompt around the current lyrics instead.
+- When repairing, demote unsupported global anchors to background, symbolic, distant, or omit them entirely; do not keep them as main subject, primary setting, destination, final reveal, or must_show.
+- score is one overall 0 to 100 score covering semantic grounding, action quality, style fidelity, identity fidelity, and continuity.
+- Do not put unrelated repaired scenes into prompt.

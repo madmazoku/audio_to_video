@@ -1,0 +1,70 @@
+Evaluate this song context against the parsed song facts and technical statuses.
+
+PARSED SONG FACTS:
+{{PARSED_SONG_JSON}}
+
+SONG CONTEXT DRAFT:
+{{SONG_CONTEXT_JSON}}
+
+PREVIOUS FAILED RESULT / REPAIR CONTEXT:
+{{PREVIOUS_RESULT_JSON}}
+
+PARSER TECHNICAL STATUS:
+{{PARSER_STATUS_JSON}}
+
+WRITER TECHNICAL STATUS:
+{{WRITER_STATUS_JSON}}
+
+FAILED STAGE IF ANY:
+{{FAILED_STAGE}}
+
+Critic checks:
+- The song context is grounded in PARSED SONG FACTS.
+- It is compact and reusable for intro, verse clips, subranges, and outro.
+- It preserves recurring characters/entities, locations, props, motifs, tone, and continuity clues when present.
+- It does not quote lyrics verbatim.
+- It does not invent unsupported lore, genres, worlds, species, settings, props, or visual technologies.
+- It does not decide specific image/video prompts or override future current-subrange lyrics.
+- It helps later ranges remain part of the same video without forcing the same event, landmark, character, or prop everywhere.
+- main_characters, recurring_locations, recurring_props, and visual_motifs are inventory lists only.
+- continuity_rules are abstract, low-priority, and contain no concrete anchors that would be repeatedly forced into every clip.
+- success MUST be false if continuity_rules list concrete named characters, iconic locations, special props, weapons, vehicles, factions, monuments, rituals, or motifs as if they must appear in every future range.
+- success MUST be false if continuity_rules say to center, use, show, return to, or make central a concrete motif without parsed facts explicitly requiring it in every clip.
+- success MUST be false if avoid contains desired world/style/identity elements instead of forbidden drift or technical negatives.
+
+Technical status handling:
+- If PARSER_STATUS_JSON or WRITER_STATUS_JSON reports json_parse_ok=false or structural_ok=false, still return a normal critic JSON verdict.
+- Treat invalid parser/writer JSON or missing required structure as success=false with a low score, precise issues, and concrete repairs for the next attempt.
+- Keep the response compact.
+
+- success MUST be false if continuity_rules force a specific concrete object, landmark, character, destination, final reveal, or repeated composition formula across ranges instead of broad style/world continuity.
+
+- success MUST be false if a continuity rule reads like an on-screen checklist item rather than an abstract continuity constraint.
+- success MUST be false if a continuity rule would reasonably make future ranges repeat the same subject, setting, destination, landmark, prop, or composition pattern.
+
+Return ONLY valid JSON with exactly these keys:
+{
+  "success": true,
+  "score": 0,
+  "issues": [],
+  "repairs": [],
+  "song_context": {
+    "song_summary": "accepted or revised short summary of the whole song's story and emotional arc",
+    "main_characters": [],
+    "recurring_locations": [],
+    "recurring_props": [],
+    "visual_motifs": [],
+    "tone": "accepted or revised compact tone description",
+    "continuity_rules": [],
+    "avoid": []
+  }
+}
+
+Rules:
+- success must be true only if the context is grounded, compact, useful, and safe for later visual planning.
+- score is one overall 0 to 100 score covering grounding, compactness, continuity usefulness, and avoidance of invented lore and ungrounded drift.
+- If the draft is weak or technically invalid, return success=false with a usable revised song_context when possible and repair notes.
+- The song_context object must always contain a usable full context, even when success is false.
+- When repairing, move concrete recurring motifs out of continuity_rules and into the appropriate inventory fields.
+- When repairing, keep continuity_rules abstract: broad world identity, tone, rendering/style consistency, design logic, and a warning not to override local lyrics.
+- Do not include markdown, explanations, or <think> tags.

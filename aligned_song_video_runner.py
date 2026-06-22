@@ -299,14 +299,25 @@ def ensure_line_level_lrc_from_matched_verses(verses: List[Dict[str, Any]], alig
 
 
 REQUIRED_RULE_FILES = [
+    "song_context_parser_system.txt",
+    "song_context_parser_user.txt",
     "song_context_system.txt",
     "song_context_user.txt",
-    "block_planner_system.txt",
-    "block_planner_intro.txt",
-    "block_planner_verse.txt",
-    "block_planner_instrumental.txt",
-    "block_planner_outro.txt",
+    "song_context_critic_system.txt",
+    "song_context_critic_user.txt",
     "literal_scene_rules.txt",
+    "style_condenser_parser_system.txt",
+    "style_condenser_parser_user.txt",
+    "style_condenser_system.txt",
+    "style_condenser_user.txt",
+    "style_condenser_critic_system.txt",
+    "style_condenser_critic_user.txt",
+    "semantic_planner_system.txt",
+    "semantic_planner_user.txt",
+    "prompt_writer_system.txt",
+    "prompt_writer_user.txt",
+    "prompt_critic_system.txt",
+    "prompt_critic_user.txt",
 ]
 
 
@@ -389,6 +400,32 @@ def queue_prompt(workflow: Dict[str, Any], comfy_url: str, client_id: Optional[s
 
     return str(data["prompt_id"]), client_id
 
+
+
+
+
+def free_comfy_memory(comfy_url: str, reason: str = "") -> None:
+    """Best-effort ComfyUI VRAM/cache cleanup.
+
+    This only asks the ComfyUI server process to unload models/free memory.
+    It is intentionally non-fatal: unsupported endpoints or transient errors
+    should not stop generation.
+    """
+    payload = {"unload_models": True, "free_memory": True}
+    base = comfy_url.rstrip("/")
+    label = f" ({reason})" if reason else ""
+    for path in ("/free", "/api/free"):
+        url = base + path
+        try:
+            r = requests.post(url, json=payload, timeout=60)
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            log(f"  [comfy] free memory ok{label}: {path}")
+            return
+        except Exception as exc:
+            log(f"  [comfy] free memory failed{label}: {path}: {exc}")
+    log(f"  [comfy] warning: free memory endpoint unavailable{label}")
 
 
 def comfy_ws_url(comfy_url: str, client_id: str) -> str:
@@ -770,8 +807,29 @@ def words_are_match(a: str, b: str, base_threshold: float) -> Tuple[bool, float,
     return False, sim, "mismatch"
 
 
+def block_has_lyric_text(block: Dict[str, Any]) -> bool:
+    lines = block.get("lines_text")
+    if isinstance(lines, list):
+        return any(str(line).strip() for line in lines)
+    lines = block.get("lines")
+    if isinstance(lines, list):
+        return any(str(line.get("text", "")).strip() if isinstance(line, dict) else str(line).strip() for line in lines)
+    return bool(str(block.get("text", "")).strip())
+
+
 def expected_words_for_lyrics_verses(lyrics_verses: List[Dict[str, Any]]) -> List[List[str]]:
-    return [lyric_words(str(v.get("text", ""))) for v in lyrics_verses]
+    return [lyric_words(str(v.get("text", ""))) if block_has_lyric_text(v) else [] for v in lyrics_verses]
+
+
+def next_lyric_line_words(verse_line_words: List[List[List[str]]], verse_index: int, line_index: int) -> List[str]:
+    """Return the next actual lyric line after a block/line, skipping non-lyrical blocks."""
+    current_lines = verse_line_words[verse_index] if 0 <= verse_index < len(verse_line_words) else []
+    if line_index + 1 < len(current_lines):
+        return current_lines[line_index + 1]
+    for vi in range(verse_index + 1, len(verse_line_words)):
+        if verse_line_words[vi]:
+            return verse_line_words[vi][0]
+    return []
 
 
 def find_next_range_prefix(
@@ -1262,6 +1320,109 @@ def actual_word_duration(word: Dict[str, Any]) -> float:
     return max(0.0, float(word.get("end", 0.0)) - float(word.get("start", 0.0)))
 
 
+def estimate_sanitized_word_duration(word_text: str, gap_to_original: float) -> float:
+    letters = max(1, len(norm_word(word_text)))
+    base = max(0.25, min(1.60, letters * 0.11))
+    if gap_to_original >= 3.0:
+        base = max(base, min(4.50, gap_to_original * 0.22))
+    return max(0.05, min(4.50, base))
+
+
+def sanitize_matched_line_word_timings(line_text: str, words: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Repair unusable word anchors without changing normal stable-ts timings.
+
+    stable-ts remains the timing source. This pass only rewrites words that are
+    structurally unusable for karaoke: a later matched word inside the same lyric
+    line has a huge gap after the previous word, zero/near-zero duration, and low
+    alignment confidence. Such anchors usually come from a reverb/echo/end-tail
+    match and would otherwise make one subtitle line stretch across unrelated
+    song blocks.
+    """
+    report = {
+        "line_text": line_text,
+        "repaired_words": [],
+        "checked_words": len(words),
+    }
+    if len(words) < 2:
+        return report
+
+    far_gap_seconds = 2.75
+    far_gap_without_probability_seconds = 7.50
+    zeroish_seconds = 0.04
+    low_probability = 0.15
+
+    previous_end = None
+    for i, word in enumerate(words):
+        try:
+            start = float(word.get("start", 0.0))
+            end = float(word.get("end", start))
+        except Exception:
+            previous_end = previous_end if previous_end is not None else 0.0
+            continue
+
+        if previous_end is None:
+            previous_end = max(start, end)
+            continue
+
+        duration = max(0.0, end - start)
+        gap = start - previous_end
+        probability = word.get("probability")
+        try:
+            probability_value = float(probability) if probability is not None else None
+        except Exception:
+            probability_value = None
+
+        confidence_bad = (probability_value is not None and probability_value <= low_probability)
+        confidence_unknown_but_gap_extreme = probability_value is None and gap >= far_gap_without_probability_seconds
+        should_repair = (
+            gap >= far_gap_seconds
+            and duration <= zeroish_seconds
+            and (confidence_bad or confidence_unknown_but_gap_extreme)
+        )
+
+        if should_repair:
+            new_start = previous_end
+            new_duration = estimate_sanitized_word_duration(str(word.get("text", "")), gap)
+            new_end = min(start, new_start + new_duration) if start > new_start + 0.05 else new_start + new_duration
+            new_end = max(new_start + 0.05, new_end)
+            word["original_start"] = start
+            word["original_end"] = end
+            word["original_probability"] = probability
+            word["start"] = new_start
+            word["end"] = new_end
+            word["timing_sanitized"] = True
+            word["timing_source"] = "sanitized_far_gap_zero_duration_word"
+            word["timing_sanitizer_reason"] = (
+                f"gap={gap:.3f}s duration={duration:.3f}s probability={probability_value}"
+            )
+            report["repaired_words"].append({
+                "word_index": i,
+                "text": word.get("text"),
+                "original_start": start,
+                "original_end": end,
+                "new_start": new_start,
+                "new_end": new_end,
+                "gap": gap,
+                "duration": duration,
+                "probability": probability_value,
+            })
+            previous_end = new_end
+        else:
+            previous_end = max(previous_end, end)
+
+    return report
+
+
+def line_timing_bounds_from_words(words: List[Dict[str, Any]], default_start: float = 0.0) -> Tuple[float, float]:
+    starts = [float(w["start"]) for w in words if w.get("start") is not None]
+    ends = [float(w["end"]) for w in words if w.get("end") is not None]
+    if starts and ends:
+        start = min(starts)
+        end = max(ends)
+        return start, max(start + 0.01, end)
+    return default_start, default_start + 0.01
+
+
 def build_line_candidate_from_start(
     expected_line_words: List[str],
     words: List[Dict[str, Any]],
@@ -1619,15 +1780,46 @@ def build_line_aware_verses_from_json_words(
             "line_statuses": [],
         }
 
+        if not block_has_lyric_text(ly):
+            verse_report = {
+                "range_index": vi + 1,
+                "lyric_index": ly.get("index", vi + 1),
+                "text_preview": "",
+                **range_stats,
+                "boundary_reason": "explicit_non_lyrical_block",
+                "start": 0.0,
+                "end": 0.01,
+                "duration": 0.01,
+                "lines": [],
+            }
+            report["ranges"].append(verse_report)
+            diagnostics["ranges"].append({
+                "range_index": vi + 1,
+                "lyric_index": ly.get("index", vi + 1),
+                "text_preview": "",
+                "start": 0.0,
+                "end": 0.01,
+                "duration": 0.01,
+                "status": "NON_LYRICAL",
+                "lines": [],
+            })
+            verses.append({
+                "index": vi + 1,
+                "start": 0.0,
+                "end": 0.01,
+                "duration": 0.01,
+                "text": "",
+                "lines": [],
+                "alignment_mode": "explicit_gap_fill",
+                "bracket_directives": list(ly.get("bracket_directives", [])),
+                "alignment_match": verse_report,
+            })
+            continue
+
         line_reports: List[Dict[str, Any]] = []
         for li, line_text in enumerate(ly.get("lines_text", []), 1):
             expected_line_words = verse_line_words[vi][li - 1]
-            if li < len(verse_line_words[vi]):
-                next_expected = verse_line_words[vi][li]
-            elif vi + 1 < len(verse_line_words) and verse_line_words[vi + 1]:
-                next_expected = verse_line_words[vi + 1][0]
-            else:
-                next_expected = []
+            next_expected = next_lyric_line_words(verse_line_words, vi, li - 1)
 
             matched_words, cursor, line_report = match_lyrics_line_words(
                 expected_line_words,
@@ -1638,19 +1830,19 @@ def build_line_aware_verses_from_json_words(
                 allow_long_start_gap=(li == 1),
             )
 
-            starts = [float(w["start"]) for w in matched_words if w.get("start") is not None]
-            ends = [float(w["end"]) for w in matched_words if w.get("end") is not None]
-            if starts and ends:
-                line_start = min(starts)
-                line_end = max(ends)
-            elif out_lines:
-                line_start = float(out_lines[-1]["end"])
-                line_end = line_start + 0.01
+            sanitizer_report = sanitize_matched_line_word_timings(line_text, matched_words)
+            if out_lines:
+                default_line_start = float(out_lines[-1]["end"])
             else:
-                line_start = 0.0
-                line_end = 0.01
+                default_line_start = 0.0
+            line_start, line_end = line_timing_bounds_from_words(matched_words, default_line_start)
 
             diag = analyze_matched_line_timing(line_text, matched_words, config)
+            if sanitizer_report.get("repaired_words"):
+                diag.setdefault("issues", []).append(
+                    f"sanitized word timings: {len(sanitizer_report.get('repaired_words', []))}"
+                )
+                diag["timing_sanitizer"] = sanitizer_report
             line = {
                 "index": li,
                 "text": line_text,
@@ -1773,10 +1965,14 @@ def build_line_aware_verses_from_json_words(
 
     for vi, verse in enumerate(verses):
         out_lines = verse.get("lines", []) or []
-        starts = [float(line["start"]) for line in out_lines]
-        ends = [float(line["end"]) for line in out_lines]
-        start = min(starts) if starts else 0.0
-        end = max(ends) if ends else start + 0.01
+        if not block_has_lyric_text(verse):
+            start = float(verse.get("start", 0.0))
+            end = max(start + 0.01, float(verse.get("end", start + 0.01)))
+        else:
+            starts = [float(line["start"]) for line in out_lines]
+            ends = [float(line["end"]) for line in out_lines]
+            start = min(starts) if starts else 0.0
+            end = max(ends) if ends else start + 0.01
         verse["start"] = start
         verse["end"] = end
         verse["duration"] = max(0.01, end - start)
@@ -1839,8 +2035,7 @@ def split_matched_words_into_lines(
     ly: Dict[str, Any],
     matched_words: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    # Kept for compatibility with non-JSON fallback helpers. JSON alignment now
-    # uses build_line_aware_verses_from_json_words().
+    # Converts matched words into line spans for the line-aware alignment path.
     cursor = 0
     out_lines: List[Dict[str, Any]] = []
 
@@ -1893,10 +2088,11 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         "video_height": int,
         "video_fps": int,
         "clip_duration_tolerance_ratio": (int, float),
+        "prompt_max_attempts": int,
+        "llm_max_ctx": int,
+        "llm_max_length": int,
         "recommended_workflow_seconds": (int, float),
         "max_workflow_seconds": (int, float),
-        "instrumental_gap_min_seconds": (int, float),
-        "instrumental_gap_min_ratio_of_median_verse": (int, float),
         "local_context_radius": int,
         "range_visual_preroll_seconds": (int, float),
         "subtitle_line_preroll_seconds": (int, float),
@@ -1919,10 +2115,11 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
     config["video_height"] = int(config["video_height"])
     config["video_fps"] = int(config["video_fps"])
     config["clip_duration_tolerance_ratio"] = float(config["clip_duration_tolerance_ratio"])
+    config["prompt_max_attempts"] = max(1, int(config["prompt_max_attempts"]))
+    config["llm_max_ctx"] = max(1024, int(config["llm_max_ctx"]))
+    config["llm_max_length"] = max(128, int(config["llm_max_length"]))
     config["recommended_workflow_seconds"] = float(config["recommended_workflow_seconds"])
     config["max_workflow_seconds"] = float(config["max_workflow_seconds"])
-    config["instrumental_gap_min_seconds"] = float(config["instrumental_gap_min_seconds"])
-    config["instrumental_gap_min_ratio_of_median_verse"] = float(config["instrumental_gap_min_ratio_of_median_verse"])
     config["local_context_radius"] = int(config["local_context_radius"])
     config["range_visual_preroll_seconds"] = float(config["range_visual_preroll_seconds"])
     config["subtitle_line_preroll_seconds"] = float(config["subtitle_line_preroll_seconds"])
@@ -1978,9 +2175,6 @@ def load_block_video_styles(input_dir: Path, default_video_style: str, debug_dir
     return styles, report
 
 
-def effective_video_style(block_index: int, default_video_style: str, block_video_styles: Dict[int, str]) -> str:
-    return block_video_styles.get(block_index, default_video_style)
-
 
 def is_bracket_directive_line(line: str) -> bool:
     stripped = line.strip()
@@ -1992,12 +2186,21 @@ def strip_bracket_directive(line: str) -> str:
 
 
 def parse_lyrics_txt(text: str) -> List[Dict[str, Any]]:
-    verses: List[Dict[str, Any]] = []
+    """Parse lyrics.txt into ordered song blocks.
+
+    The only structural boundary is the explicit *** separator written in
+    lyrics.txt. Every segment is preserved as a block, including metadata-only
+    and completely empty segments. A block with no lyric_lines is a non-lyrical
+    structural section whose timing is assigned later from the surrounding
+    blocks/audio gap.
+    """
+    blocks: List[Dict[str, Any]] = []
     for raw in text.split("***"):
         lyric_lines: List[str] = []
         directives: List[str] = []
+        raw_lines = raw.splitlines()
 
-        for line in raw.splitlines():
+        for line in raw_lines:
             stripped = line.strip()
             if not stripped:
                 continue
@@ -2008,14 +2211,15 @@ def parse_lyrics_txt(text: str) -> List[Dict[str, Any]]:
                 continue
             lyric_lines.append(stripped)
 
-        if lyric_lines:
-            verses.append({
-                "index": len(verses) + 1,
-                "text": "\n".join(lyric_lines),
-                "lines_text": lyric_lines,
-                "bracket_directives": directives,
-            })
-    return verses
+        blocks.append({
+            "index": len(blocks) + 1,
+            "block_index": len(blocks),
+            "text": "\n".join(lyric_lines),
+            "lines_text": lyric_lines,
+            "bracket_directives": directives,
+            "raw_block_text": raw,
+        })
+    return blocks
 
 
 
@@ -2045,7 +2249,7 @@ def wrap_flat_text(text: str, max_chars: int = 42) -> List[str]:
 
 
 def parse_alignment_top_text_as_lyrics(data: Any) -> List[Dict[str, Any]]:
-    """Fallback when alignment.json has top-level flattened text with *** separators."""
+    """Handle alignment.json with top-level flattened text using *** separators."""
     text = str(data.get("text", "")).strip() if isinstance(data, dict) else ""
     if not text or "***" not in text:
         return []
@@ -2196,7 +2400,7 @@ def build_verses_from_json_words(
     }
 
     if not lyrics_verses:
-        # Fallback when lyrics.txt is absent: treat the whole alignment as one range.
+        # If lyrics.txt is absent, treat the whole alignment as one range.
         ly = {
             "index": 1,
             "text": " ".join(w["text"] for w in clean_words),
@@ -2431,6 +2635,33 @@ def build_verses_from_lrc_and_lyrics(
 
     for vi, ly in enumerate(lyrics_verses):
         expected_lines = list(ly.get("lines_text", []))
+        if not block_has_lyric_text(ly):
+            range_report = {
+                "range_index": vi + 1,
+                "lyric_index": ly.get("index", vi + 1),
+                "expected_lines": 0,
+                "matched_lines": 0,
+                "missing_lines": 0,
+                "line_mismatches": 0,
+                "start": 0.0,
+                "end": 0.01,
+                "duration": 0.01,
+                "boundary_reason": "explicit_non_lyrical_block",
+            }
+            report["ranges"].append(range_report)
+            verses.append({
+                "index": vi + 1,
+                "start": 0.0,
+                "end": 0.01,
+                "duration": 0.01,
+                "text": "",
+                "lines": [],
+                "alignment_mode": "explicit_gap_fill",
+                "bracket_directives": list(ly.get("bracket_directives", [])),
+                "alignment_match": range_report,
+            })
+            continue
+
         matched_lines = clean_lines[cursor:cursor + len(expected_lines)]
         cursor += len(expected_lines)
 
@@ -2547,6 +2778,9 @@ def parse_alignment(
     # normal rework/rebuild runs from rematching lyrics when neither the raw
     # alignment nor lyrics were intentionally refreshed.
     matched_cache_path = alignment_dir / "matched_verses.json"
+    lyrics_text = read_text(input_dir / "lyrics.txt", required=False)
+    lyrics_verses = parse_lyrics_txt(lyrics_text) if lyrics_text else []
+
     if matched_cache_path.exists():
         cached = load_json(matched_cache_path)
         if isinstance(cached, dict):
@@ -2555,14 +2789,17 @@ def parse_alignment(
         else:
             verses = cached
             mode = "cached"
-        if not isinstance(verses, list) or not verses:
-            raise RuntimeError(f"Invalid matched alignment cache: {matched_cache_path}")
-        ensure_line_level_lrc_from_matched_verses(verses, alignment_dir)
-        log(f"[stage] use cached matched alignment: {matched_cache_path}")
-        return verses, mode
-
-    lyrics_text = read_text(input_dir / "lyrics.txt", required=False)
-    lyrics_verses = parse_lyrics_txt(lyrics_text) if lyrics_text else []
+        cache_ok = (
+            isinstance(verses, list)
+            and bool(verses)
+            and (not lyrics_verses or len(verses) == len(lyrics_verses))
+            and all(isinstance(v, dict) for v in verses)
+        )
+        if cache_ok:
+            ensure_line_level_lrc_from_matched_verses(verses, alignment_dir)
+            log(f"[stage] use cached matched alignment: {matched_cache_path}")
+            return verses, mode
+        log(f"[stage] ignore stale matched alignment cache: {matched_cache_path}")
 
     json_path = alignment_dir / "alignment.json"
     lrc_path = alignment_dir / "alignment.lrc"
@@ -2606,13 +2843,13 @@ def parse_alignment(
 
 
 
-def resolve_command(candidates: List[Path], fallback: str) -> str:
+def resolve_command(candidates: List[Path], command_name: str) -> str:
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
 
-    found = shutil.which(fallback)
-    return found or fallback
+    found = shutil.which(command_name)
+    return found or command_name
 
 
 def resolve_stable_ts_command(script_dir: Path) -> str:
@@ -2702,9 +2939,6 @@ def detect_alignment_source(input_dir: Path) -> Tuple[str, Optional[Path], Optio
     if lrc.exists():
         return "lrc", lrc, None
 
-    legacy_lrc = input_dir / "alignment.lrc"
-    if legacy_lrc.exists():
-        return "lrc", legacy_lrc, None
 
     raise FileNotFoundError(
         "No alignment source found. Use input/vocals.* for stable-ts word alignment, "
@@ -3158,7 +3392,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     block_by_index: Dict[int, Dict[str, Any]] = {}
     for block in blocks:
         block_by_index[int(block["block_index"])] = block
-        if block.get("kind") == "verse":
+        if block_has_lyric_text(block):
             verse_to_block[int(block["verse_index"])] = int(block["block_index"])
 
     events: List[str] = []
@@ -3481,7 +3715,7 @@ def retime_video_copy(
             "Retimed clip duration verification failed:\n"
             f"  source: {video_in} duration={source_duration:.3f}s\n"
             f"  target: {video_out} expected={target_duration:.3f}s actual={verified_duration:.3f}s\n"
-            "Intermediate clips are timestamp-retimed with stream copy only; no silent re-encode fallback is used."
+            "Intermediate clips are timestamp-retimed with stream copy only; silent re-encode retry paths are disabled."
         )
     return {
         "source": str(video_in),
@@ -3550,212 +3784,1040 @@ def render_subtitle_preview(
     ])
 
 
+
+def strip_llm_wrappers(text: str) -> str:
+    """Remove common wrapper text around a JSON object without repairing JSON syntax."""
+    cleaned = text.strip()
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.S | re.I).strip()
+
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.S | re.I)
+    if fence:
+        return fence.group(1).strip()
+    return cleaned
+
+
 def extract_json_object(text: str) -> Dict[str, Any]:
-    text = text.strip()
-    text = re.sub(r"^<think>.*?</think>\s*", "", text, flags=re.S | re.I)
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```$", "", text)
+    """Extract exactly one JSON object from an LLM text response.
+
+    This function intentionally does not repair malformed JSON. It only removes
+    common non-JSON wrappers such as <think> blocks or markdown fences and then
+    extracts the first top-level object. Syntax errors remain technical stage
+    failures that are handled by the LLM quality loop.
+    """
+    cleaned = strip_llm_wrappers(text)
     try:
-        return json.loads(text)
+        data = json.loads(cleaned)
+        if not isinstance(data, dict):
+            raise ValueError("LLM JSON root must be an object")
+        return data
     except json.JSONDecodeError:
         pass
-    start = text.find("{")
-    end = text.rfind("}")
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
     if start >= 0 and end > start:
-        return json.loads(text[start:end + 1])
+        snippet = cleaned[start:end + 1]
+        data = json.loads(snippet)
+        if not isinstance(data, dict):
+            raise ValueError("LLM JSON root must be an object")
+        return data
     raise ValueError("LLM response does not contain a JSON object")
 
 
-def build_planner_user_prompt(
-    rules: Dict[str, str],
-    video_style: str,
-    song_context: Dict[str, Any],
-    local_context: str,
-    current_block: str,
-    continuity: List[Dict[str, str]],
-    block_kind: str,
-    block_index: int,
-) -> Tuple[str, str]:
-    continuity_text = "\n".join(f"- segment {x.get('segment')}: {x.get('scene_summary')}" for x in continuity[-5:]) or "- none"
-
-    if block_kind == "intro":
-        template_name = "block_planner_intro.txt"
-    elif block_kind == "instrumental":
-        template_name = "block_planner_instrumental.txt"
-    elif block_kind == "outro":
-        template_name = "block_planner_outro.txt"
-    else:
-        template_name = "block_planner_verse.txt"
-
-    prompt = render_template(
-        rules[template_name],
-        {
-            "VIDEO_STYLE": video_style,
-            "GLOBAL_CONTEXT_JSON": song_context,
-            "LOCAL_CONTEXT": local_context,
-            "CURRENT_BLOCK": current_block,
-            "BLOCK_KIND": block_kind,
-            "BLOCK_INDEX": block_index,
-            "CONTINUITY": continuity_text,
-            "LITERAL_SCENE_RULES": rules["literal_scene_rules.txt"],
-        },
-        template_name,
-    )
-    return prompt, template_name
+def build_stage_record(
+    stage_name: str,
+    raw_path: Path,
+    json_path: Path,
+    raw_text: str = "",
+    data: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "stage": stage_name,
+        "ran": True,
+        "raw_response_path": str(raw_path),
+        "json_response_path": str(json_path),
+        "raw_response_saved": raw_path.exists(),
+        "json_parse_ok": data is not None and error is None,
+        "structural_ok": data is not None and error is None,
+        "technical_error": error,
+        "raw_preview": raw_text[:240],
+    }
 
 
-def patch_planner_workflow(
+def run_comfy_llm_json_stage_record(
     template: Dict[str, Any],
-    rules: Dict[str, str],
-    video_style: str,
-    song_context: Dict[str, Any],
-    local_context: str,
-    current_block: str,
-    plan_path: Path,
-    continuity: List[Dict[str, str]],
-    block_kind: str,
-    block_index: int,
-    request_path: Optional[Path] = None,
+    comfy_url: str,
+    stage_dir: Path,
+    stage_name: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> Dict[str, Any]:
+    """Run one LLM stage and return raw text, parsed JSON if available, and technical status.
+
+    Parse/shape problems are recorded in the returned status instead of being
+    interpreted as stage success/failure. The critic/attempt verdict remains the
+    only owner of success/score.
+    """
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = stage_dir / f"{stage_name}_response.txt"
+    json_path = stage_dir / f"{stage_name}_response.json"
+    request_path = stage_dir / f"{stage_name}_request.txt"
+    history_path = stage_dir / f"{stage_name}_history.json"
+    if raw_path.exists():
+        raw_path.unlink()
+    request_path.write_text(user_prompt, encoding="utf-8")
+    max_ctx_values = []
+    max_length_values = []
+    for node in template.values():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if isinstance(inputs, dict):
+            if "max_ctx" in inputs:
+                max_ctx_values.append(inputs.get("max_ctx"))
+            if "max_length" in inputs:
+                max_length_values.append(inputs.get("max_length"))
+    max_ctx_display = max_ctx_values[0] if max_ctx_values else "unknown"
+    max_length_display = max_length_values[0] if max_length_values else "unknown"
+    approx_tokens = approx_token_count_for_log(system_prompt + "\n" + user_prompt)
+    log(f"  [{stage_name}] context approx_tokens={approx_tokens} chars={len(system_prompt) + len(user_prompt)} max_ctx={max_ctx_display} max_length={max_length_display}")
+    if isinstance(max_ctx_display, int) and isinstance(max_length_display, int) and approx_tokens + max_length_display > max_ctx_display:
+        log(f"  [warning] {stage_name} prompt+max_length may exceed max_ctx: approx_tokens={approx_tokens} max_length={max_length_display} max_ctx={max_ctx_display}")
+    wf = patch_llm_json_workflow(template, system_prompt, user_prompt, raw_path)
+    write_json(stage_dir / f"{stage_name}_workflow.json", wf)
+    pid, client_id = queue_prompt(wf, comfy_url)
+    log(f"  [{stage_name}] prompt_id={pid}")
+    h = wait_history(pid, comfy_url, wf, client_id)
+    check_history_status(h, history_path)
+    if not raw_path.exists():
+        err = f"{stage_name} LLM did not write file: {raw_path}"
+        return {
+            "data": None,
+            "raw_text": "",
+            "status": build_stage_record(stage_name, raw_path, json_path, "", None, err),
+        }
+    raw_text = raw_path.read_text(encoding="utf-8").strip()
+    if raw_text.lower().startswith("requested tokens") and "exceed context window" in raw_text.lower():
+        err = raw_text[:300]
+        return {
+            "data": None,
+            "raw_text": raw_text,
+            "status": build_stage_record(stage_name, raw_path, json_path, raw_text, None, err),
+        }
+    try:
+        data = extract_json_object(raw_text)
+        json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "data": data,
+            "raw_text": raw_text,
+            "status": build_stage_record(stage_name, raw_path, json_path, raw_text, data, None),
+        }
+    except Exception as exc:
+        return {
+            "data": None,
+            "raw_text": raw_text,
+            "status": build_stage_record(stage_name, raw_path, json_path, raw_text, None, str(exc)),
+        }
+
+
+
+def patch_llm_json_workflow(
+    template: Dict[str, Any],
+    system_prompt: str,
+    user_prompt: str,
+    out_path: Path,
 ) -> Dict[str, Any]:
     wf = json.loads(json.dumps(template))
     if "2" not in wf or "3" not in wf:
-        raise RuntimeError("Planner workflow must contain nodes 2=LLM_local and 3=PathSaveStringFile")
-
-    user_prompt, template_name = build_planner_user_prompt(
-        rules=rules,
-        video_style=video_style,
-        song_context=song_context,
-        local_context=local_context,
-        current_block=current_block,
-        continuity=continuity,
-        block_kind=block_kind,
-        block_index=block_index,
-    )
-
-    if request_path is not None:
-        save_prompt_debug(request_path, user_prompt)
-
-    wf["2"]["inputs"]["system_prompt"] = rules["block_planner_system.txt"]
+        raise RuntimeError("LLM workflow must contain nodes 2=LLM_local and 3=PathSaveStringFile")
+    wf["2"]["inputs"]["system_prompt"] = system_prompt
     wf["2"]["inputs"]["user_prompt"] = user_prompt
     wf["2"]["inputs"]["historical_record"] = ""
     wf["2"]["inputs"]["conversation_rounds"] = 1
     wf["2"]["inputs"]["is_memory"] = "disable"
     wf["2"]["inputs"]["is_locked"] = "disable"
     wf["2"]["inputs"]["main_brain"] = "enable"
-    wf["3"]["inputs"]["path"] = str(plan_path)
+    wf["3"]["inputs"]["path"] = str(out_path)
     return wf
 
 
-def run_comfy_planner(
+
+
+def apply_llm_workflow_config(template: Dict[str, Any], llm_max_ctx: int, llm_max_length: int) -> Dict[str, Any]:
+    """Apply LLM runtime settings from config to the ComfyUI LLM workflow template.
+
+    The project uses data/config.json (or input/config.json override) as the
+    source of truth. The workflow file can keep default values, but the runner
+    patches every node that exposes max_ctx and/or max_length inputs before any
+    LLM call. max_ctx controls context window; max_length controls generated
+    response length.
+    """
+    wf = json.loads(json.dumps(template))
+    patched_ctx_nodes: List[str] = []
+    patched_length_nodes: List[str] = []
+    for node_id, node in wf.items():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if isinstance(inputs, dict):
+            if "max_ctx" in inputs:
+                inputs["max_ctx"] = int(llm_max_ctx)
+                patched_ctx_nodes.append(str(node_id))
+            if "max_length" in inputs:
+                inputs["max_length"] = int(llm_max_length)
+                patched_length_nodes.append(str(node_id))
+    if not patched_ctx_nodes:
+        raise RuntimeError("LLM workflow config error: no workflow node exposes a max_ctx input")
+    if not patched_length_nodes:
+        raise RuntimeError("LLM workflow config error: no workflow node exposes a max_length input")
+    return wf
+
+
+def approx_token_count_for_log(text: str) -> int:
+    # Rough tokenizer-independent estimate for context diagnostics only.
+    return max(1, int(len(text) / 4)) if text else 0
+
+
+def prompt_package_from(value: Dict[str, Any]) -> Dict[str, str]:
+    """Extract the image/video prompt package from writer JSON or a wrapper."""
+    src: Any = value.get("prompt") if isinstance(value.get("prompt"), dict) else value
+    if not isinstance(src, dict):
+        raise RuntimeError("Prompt package is not a JSON object")
+    required = ["scene_summary", "image_prompt", "video_prompt", "negative_prompt"]
+    missing = [k for k in required if not str(src.get(k, "")).strip()]
+    if missing:
+        raise RuntimeError(f"Prompt package missing keys: {missing}")
+    return {k: str(src[k]).strip() for k in required}
+
+
+def choose_effective_style_source(
+    block_index: int,
+    default_video_style: str,
+    block_video_styles: Dict[int, str],
+) -> Tuple[str, str]:
+    if block_index in block_video_styles:
+        return block_video_styles[block_index], f"range_{block_index:03d}"
+    return default_video_style, "global"
+
+
+def style_contract_path(style_dir: Path, style_source_id: str) -> Path:
+    if style_source_id == "global":
+        return style_dir / "global_style_contract.json"
+    return style_dir / f"{style_source_id}_style_contract.json"
+
+
+def identity_contract_path(style_dir: Path, style_source_id: str) -> Path:
+    if style_source_id == "global":
+        return style_dir / "global_identity_contract.json"
+    return style_dir / f"{style_source_id}_identity_contract.json"
+
+
+def contract_bundle_from(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract a style/identity contract bundle from writer JSON or a wrapper."""
+    src: Any = value.get("contract") if isinstance(value.get("contract"), dict) else value
+    if not isinstance(src, dict):
+        raise RuntimeError("Style/identity contract bundle is not a JSON object")
+    if not isinstance(src.get("style_contract"), dict):
+        raise RuntimeError("Style condenser JSON must contain top-level object: style_contract")
+    if not isinstance(src.get("identity_contract"), dict):
+        raise RuntimeError("Style condenser JSON must contain top-level object: identity_contract")
+    return {
+        "style_contract": dict(src["style_contract"]),
+        "identity_contract": dict(src["identity_contract"]),
+    }
+
+
+def normalize_style_identity_bundle(contract: Dict[str, Any], raw_style: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Normalize a style/identity bundle after the LLM quality loop selected it.
+
+    This function performs only structural checks needed by the runner. It must not
+    fail the run because a contract is stylistically weak, too generic, or not as
+    identity-preserving as desired. Those are quality failures handled by the
+    condenser critic loop through success/score/issues/repairs and warnings.
+    """
+    bundle = contract_bundle_from(contract)
+    style_required = [
+        "visual_style_summary",
+        "cinematography_rules",
+        "motion_style_rules",
+        "allowed_style_elements",
+        "style_must_not",
+    ]
+    identity_required = [
+        "identity_summary",
+        "required_recurring_anchors",
+        "optional_anchor_pool",
+        "character_or_faction_anchors",
+        "location_anchors",
+        "prop_or_symbol_anchors",
+        "style_continuity_rules",
+        "avoid_generic_drift",
+        "anchor_usage_rule",
+    ]
+
+    style_contract = dict(bundle["style_contract"])
+    identity_contract = dict(bundle["identity_contract"])
+
+    missing_style = [k for k in style_required if k not in style_contract]
+    missing_identity = [k for k in identity_required if k not in identity_contract]
+    if missing_style:
+        raise RuntimeError(f"Style condenser JSON missing style_contract keys: {missing_style}")
+    if missing_identity:
+        raise RuntimeError(f"Style condenser JSON missing identity_contract keys: {missing_identity}")
+
+    list_fields = [
+        "cinematography_rules",
+        "motion_style_rules",
+        "allowed_style_elements",
+        "style_must_not",
+        "required_recurring_anchors",
+        "optional_anchor_pool",
+        "character_or_faction_anchors",
+        "location_anchors",
+        "prop_or_symbol_anchors",
+        "style_continuity_rules",
+        "avoid_generic_drift",
+    ]
+    for field in list_fields:
+        owner = style_contract if field in style_contract else identity_contract
+        if not isinstance(owner.get(field), list):
+            raise RuntimeError(f"style/identity contract field must be a list: {field}")
+
+    return style_contract, identity_contract
+
+
+
+def critic_metrics(critic_json: Dict[str, Any]) -> Dict[str, Any]:
+    if "success" not in critic_json:
+        raise RuntimeError("Critic JSON missing key: success")
+    if "score" not in critic_json:
+        raise RuntimeError("Critic JSON missing key: score")
+    issues = critic_json.get("issues", [])
+    repairs = critic_json.get("repairs", [])
+    return {
+        "success": bool(critic_json.get("success")),
+        "score": float(critic_json.get("score", 0.0)),
+        "issue_count": len(issues) if isinstance(issues, list) else 0,
+        "repair_count": len(repairs) if isinstance(repairs, list) else 0,
+    }
+
+
+def build_quality_loop_summary(
+    task_name: str,
+    attempts: List[Dict[str, Any]],
+    final_result: Dict[str, Any],
+    selection_status: str,
+    max_attempts: int,
+) -> Dict[str, Any]:
+    warning = None
+    if selection_status == "best_failed":
+        warning = (
+            f"{task_name} did not receive critic success=true in {max_attempts} attempts; "
+            f"using best scored attempt {int(final_result.get('attempt', 0)) + 1}."
+        )
+    return {
+        "task_name": task_name,
+        "selection_status": selection_status,
+        "selected_attempt": int(final_result.get("attempt", 0)) + 1,
+        "max_attempts": max_attempts,
+        "selected_score": float(final_result.get("score", 0.0)),
+        "selected_success": bool(final_result.get("success", False)),
+        "warning": warning,
+        "attempt_metrics": [
+            {
+                "attempt": int(a.get("attempt", 0)) + 1,
+                "verdict": a.get("verdict"),
+                "failed_stage": a.get("failed_stage"),
+                "success": bool(a.get("success", False)),
+                "score": float(a.get("score", 0.0)),
+                "issue_count": int(a.get("issue_count", 0)),
+                "repair_count": int(a.get("repair_count", 0)),
+                "parser_json_parse_ok": bool((a.get("parser_status") or {}).get("json_parse_ok", False)),
+                "parser_structural_ok": bool((a.get("parser_status") or {}).get("structural_ok", False)),
+                "writer_json_parse_ok": bool((a.get("writer_status") or {}).get("json_parse_ok", False)),
+                "writer_structural_ok": bool((a.get("writer_status") or {}).get("structural_ok", False)),
+                "critic_json_parse_ok": bool((a.get("critic_status") or {}).get("json_parse_ok", False)),
+                "critic_structural_ok": bool((a.get("critic_status") or {}).get("structural_ok", False)),
+                "parser_error": (a.get("parser_status") or {}).get("technical_error"),
+                "writer_error": (a.get("writer_status") or {}).get("technical_error"),
+                "critic_error": (a.get("critic_status") or {}).get("technical_error"),
+            }
+            for a in attempts
+        ],
+    }
+
+
+def write_quality_loop_artifacts(
+    task_dir: Path,
+    task_name: str,
+    attempts: List[Dict[str, Any]],
+    final_result: Dict[str, Any],
+    selection_status: str,
+    max_attempts: int,
+) -> Dict[str, Any]:
+    task_dir.mkdir(parents=True, exist_ok=True)
+    summary = build_quality_loop_summary(task_name, attempts, final_result, selection_status, max_attempts)
+    write_json(task_dir / "attempts_summary.json", summary)
+    write_json(task_dir / "attempts_full.json", attempts)
+    if summary.get("warning"):
+        log(f"  [warning] {summary['warning']}")
+    return summary
+
+
+def technical_critic_payload(exc: Exception, repair: str) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "score": 0,
+        "issues": [f"Technical attempt failure: {exc}"],
+        "repairs": [repair],
+    }
+
+
+
+def validate_stage_json(
+    stage_name: str,
+    data: Any,
+    status: Dict[str, Any],
+    validator: Optional[Any] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return a JSON object for downstream stages plus updated technical status.
+
+    Parser/writer stages do not have domain success. They only have technical
+    status: parsed/structurally usable or not. On failure we return a technical
+    wrapper so the next role and critic can still run and produce repairs.
+    """
+    if not isinstance(data, dict):
+        err = status.get("technical_error") or f"{stage_name} did not return a JSON object"
+        updated = dict(status)
+        updated["json_parse_ok"] = False
+        updated["structural_ok"] = False
+        updated["technical_error"] = err
+        return {
+            "technical_error": err,
+            "stage": stage_name,
+            "stage_status": updated,
+            "raw_response_path": updated.get("raw_response_path"),
+            "raw_preview": updated.get("raw_preview", ""),
+        }, updated
+    updated = dict(status)
+    updated["json_parse_ok"] = True
+    if validator is not None:
+        try:
+            validator(data)
+            updated["structural_ok"] = True
+            updated["technical_error"] = None
+            return data, updated
+        except Exception as exc:
+            err = str(exc)
+            updated["structural_ok"] = False
+            updated["technical_error"] = err
+            return {
+                "technical_error": err,
+                "stage": stage_name,
+                "writer_json" if "writer" in stage_name else "parser_json": data,
+                "stage_status": updated,
+            }, updated
+    updated["structural_ok"] = True
+    updated["technical_error"] = None
+    return data, updated
+
+
+def make_default_critic_json(reason: str, repair: str) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "score": 0,
+        "issues": [reason],
+        "repairs": [repair],
+    }
+
+
+def run_llm_quality_loop(
     planner_template: Dict[str, Any],
     rules: Dict[str, str],
-    video_style: str,
-    song_context: Dict[str, Any],
-    local_context: str,
-    current_block: str,
-    index: int,
-    block_kind: str,
     comfy_url: str,
-    plans_dir: Path,
-    continuity: List[Dict[str, str]],
-    plan_suffix: str = "",
-) -> Dict[str, str]:
-    plans_dir.mkdir(parents=True, exist_ok=True)
-    base_name = f"plan_{index:03d}{plan_suffix}"
-    raw_path = plans_dir / f"{base_name}_response.txt"
-    clean_path = plans_dir / f"{base_name}.json"
-    response_json_path = plans_dir / f"{base_name}_response.json"
-    parsed_json_path = plans_dir / f"{base_name}_parsed.json"
-    request_path = plans_dir / f"{base_name}_request.txt"
-    request_json_path = plans_dir / f"{base_name}_request.json"
+    task_dir: Path,
+    task_name: str,
+    display_name: str,
+    max_attempts: int,
+    base_context: Dict[str, Any],
+    parser_stage_name: str,
+    parser_system_rule: str,
+    parser_user_rule: str,
+    writer_stage_name: str,
+    writer_system_rule: str,
+    writer_user_rule: str,
+    critic_stage_name: str,
+    critic_system_rule: str,
+    critic_user_rule: str,
+    parser_context_key: str,
+    writer_payload_context_key: str,
+    writer_payload_from: Any,
+    build_previous_result: Any,
+    validate_parser_result: Optional[Any] = None,
+    validate_final_payload: Optional[Any] = None,
+    technical_repair: str = "Return valid JSON that matches the required schema exactly, then preserve the task constraints in the next attempt.",
+) -> Dict[str, Any]:
+    """Run a standardized parser -> writer -> critic LLM quality loop.
 
-    if raw_path.exists():
-        raw_path.unlink()
+    JSON is the official structured output protocol. Parser/writer stages own only
+    technical status (JSON parse / structural usability). Only the critic owns
+    success, score, issues, and repairs. Invalid JSON is never silently repaired;
+    it is passed to the critic and to the next attempt as a technical failed
+    attempt.
 
-    request_json_path.write_text(json.dumps({
-        "block_index": index,
-        "block_kind": block_kind,
-        "visual_style": video_style,
-        "song_context": song_context,
-        "local_context": local_context,
-        "current_block": current_block,
-        "continuity": continuity[-5:],
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    The selected task artifact is always the writer artifact. The critic never
+    replaces or rewrites the task result; it only evaluates the writer artifact,
+    drives retries, and selects which writer attempt is accepted or chosen as
+    best_failed.
+    """
+    attempts: List[Dict[str, Any]] = []
+    best: Optional[Dict[str, Any]] = None
+    previous_result: Optional[Dict[str, Any]] = None
+    max_attempts = max(1, int(max_attempts))
 
-    log("  [stage] ComfyUI LLM planner")
-    wf = patch_planner_workflow(
+    free_comfy_memory(comfy_url, f"before {display_name} llm loop")
+
+    for attempt in range(max_attempts):
+        attempt_dir = task_dir / f"attempt_{attempt:03d}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        common = {**base_context, "PREVIOUS_RESULT_JSON": previous_result or {}}
+
+        parser_status: Dict[str, Any] = {}
+        writer_status: Dict[str, Any] = {}
+        critic_status: Dict[str, Any] = {}
+        parser_json: Dict[str, Any] = {}
+        writer_json: Dict[str, Any] = {}
+        writer_payload: Any = None
+        final_payload: Any = None
+        critic_json: Dict[str, Any] = {}
+        failed_stage: Optional[str] = None
+        verdict = "critic_failed"
+
+        # Parser stage: always records technical status; no domain success here.
+        try:
+            parser_user = render_template(rules[parser_user_rule], common, parser_user_rule)
+            log(f"  [stage] {display_name} parser attempt {attempt + 1}/{max_attempts}")
+            parser_record = run_comfy_llm_json_stage_record(
+                planner_template,
+                comfy_url,
+                attempt_dir,
+                parser_stage_name,
+                rules[parser_system_rule],
+                parser_user,
+            )
+            parser_json, parser_status = validate_stage_json(
+                parser_stage_name,
+                parser_record.get("data"),
+                parser_record.get("status", {}),
+                validate_parser_result,
+            )
+        except Exception as exc:
+            failed_stage = failed_stage or "parser"
+            parser_status = {
+                "stage": parser_stage_name,
+                "ran": False,
+                "json_parse_ok": False,
+                "structural_ok": False,
+                "technical_error": str(exc),
+            }
+            parser_json = {"technical_error": str(exc), "stage": parser_stage_name, "stage_status": parser_status}
+
+        # Writer stage: still runs even if parser JSON/structure is bad.
+        writer_context = {
+            **common,
+            parser_context_key: parser_json,
+            "PARSER_JSON": parser_json,
+            "PARSER_STATUS_JSON": parser_status,
+            "PARSER_TECHNICAL_ERROR": parser_status.get("technical_error") or "",
+        }
+        try:
+            writer_user = render_template(rules[writer_user_rule], writer_context, writer_user_rule)
+            log(f"  [stage] {display_name} writer attempt {attempt + 1}/{max_attempts}")
+            writer_record = run_comfy_llm_json_stage_record(
+                planner_template,
+                comfy_url,
+                attempt_dir,
+                writer_stage_name,
+                rules[writer_system_rule],
+                writer_user,
+            )
+            writer_json, writer_status = validate_stage_json(
+                writer_stage_name,
+                writer_record.get("data"),
+                writer_record.get("status", {}),
+                None,
+            )
+        except Exception as exc:
+            failed_stage = failed_stage or "writer"
+            writer_status = {
+                "stage": writer_stage_name,
+                "ran": False,
+                "json_parse_ok": False,
+                "structural_ok": False,
+                "technical_error": str(exc),
+            }
+            writer_json = {"technical_error": str(exc), "stage": writer_stage_name, "stage_status": writer_status}
+
+        try:
+            writer_payload = writer_payload_from(writer_json)
+            if writer_status:
+                writer_status = {**writer_status, "structural_ok": True, "technical_error": writer_status.get("technical_error")}
+        except Exception as exc:
+            failed_stage = failed_stage or "writer"
+            err = str(exc)
+            writer_status = {**writer_status, "structural_ok": False, "technical_error": writer_status.get("technical_error") or err}
+            writer_payload = {
+                "technical_error": writer_status.get("technical_error") or err,
+                "writer_json": writer_json,
+                "writer_status": writer_status,
+            }
+
+        # Critic stage: always attempted after writer. It is the only owner of success/score.
+        critic_context = {
+            **writer_context,
+            writer_payload_context_key: writer_payload,
+            "WRITER_JSON": writer_json,
+            "WRITER_STATUS_JSON": writer_status,
+            "WRITER_TECHNICAL_ERROR": writer_status.get("technical_error") or "",
+            "PARSER_STATUS_JSON": parser_status,
+            "FAILED_STAGE": failed_stage or "",
+        }
+        try:
+            critic_user = render_template(rules[critic_user_rule], critic_context, critic_user_rule)
+            log(f"  [stage] {display_name} critic attempt {attempt + 1}/{max_attempts}")
+            critic_record = run_comfy_llm_json_stage_record(
+                planner_template,
+                comfy_url,
+                attempt_dir,
+                critic_stage_name,
+                rules[critic_system_rule],
+                critic_user,
+            )
+            critic_json, critic_status = validate_stage_json(
+                critic_stage_name,
+                critic_record.get("data"),
+                critic_record.get("status", {}),
+                None,
+            )
+            if critic_status.get("technical_error"):
+                raise RuntimeError(critic_status["technical_error"])
+            metrics = critic_metrics(critic_json)
+        except Exception as exc:
+            failed_stage = failed_stage or "critic"
+            critic_status = {
+                **critic_status,
+                "stage": critic_stage_name,
+                "ran": bool(critic_status.get("ran", False)),
+                "json_parse_ok": False,
+                "structural_ok": False,
+                "technical_error": str(exc),
+            }
+            critic_json = make_default_critic_json(
+                f"Critic technical failure: {exc}",
+                technical_repair,
+            )
+            metrics = critic_metrics(critic_json)
+
+        # The task result is the writer artifact. The critic never replaces it.
+        # It only evaluates this writer artifact and drives retry/selection.
+        try:
+            final_payload = writer_payload
+            if validate_final_payload is not None:
+                validate_final_payload(final_payload)
+        except Exception as exc:
+            failed_stage = failed_stage or "writer_payload"
+            final_payload = None
+            if not critic_json.get("issues"):
+                critic_json["issues"] = []
+            if not critic_json.get("repairs"):
+                critic_json["repairs"] = []
+            if isinstance(critic_json.get("issues"), list):
+                critic_json["issues"].append(f"Writer artifact is not structurally usable as the task result: {exc}")
+            if isinstance(critic_json.get("repairs"), list):
+                critic_json["repairs"].append(technical_repair)
+            critic_json["success"] = False
+            critic_json["score"] = min(float(critic_json.get("score", 0.0)), 0.0)
+            metrics = critic_metrics(critic_json)
+
+        technical_failed = any(
+            not st.get("structural_ok", False)
+            for st in [parser_status, writer_status, critic_status]
+            if st
+        ) or final_payload is None
+        if technical_failed:
+            verdict = "technical_failed"
+        elif metrics["success"]:
+            verdict = "success"
+        else:
+            verdict = "critic_failed"
+
+        result = {
+            "attempt": attempt,
+            **metrics,
+            "verdict": verdict,
+            "failed_stage": failed_stage,
+            "parser_status": parser_status,
+            "writer_status": writer_status,
+            "critic_status": critic_status,
+            "parser": parser_json,
+            "writer": writer_json,
+            "writer_artifact": final_payload,
+            "result": final_payload,
+            "critic": critic_json,
+            "critic_verdict": critic_json,
+        }
+        previous_result = _truncate_for_prompt(build_previous_result(parser_json, final_payload or writer_payload or {}, critic_json), 700)
+
+        attempts.append(result)
+        write_json(attempt_dir / "attempt_result.json", result)
+        log(
+            f"  [stage] {display_name} attempt "
+            f"{attempt + 1}/{max_attempts}: "
+            f"verdict={verdict} "
+            f"failed_stage={failed_stage or '-'} "
+            f"parser_json={str(parser_status.get('json_parse_ok', False)).lower()} "
+            f"writer_json={str(writer_status.get('json_parse_ok', False)).lower()} "
+            f"critic_json={str(critic_status.get('json_parse_ok', False)).lower()} "
+            f"success={str(result['success']).lower()} "
+            f"score={float(result['score']):.1f} "
+            f"issues={int(result.get('issue_count', 0))} repairs={int(result.get('repair_count', 0))}"
+        )
+
+        if result.get("result") is not None:
+            if best is None or float(result.get("score", 0.0)) > float(best.get("score", -1.0)):
+                best = result
+        if result.get("success") and result.get("result") is not None:
+            final_result = result
+            selection_status = "success"
+            break
+    else:
+        if best is None:
+            raise RuntimeError(f"{display_name} failed before producing any usable structured result")
+        final_result = best
+        selection_status = "best_failed"
+
+    write_quality_loop_artifacts(task_dir, task_name, attempts, final_result, selection_status, max_attempts)
+    write_json(task_dir / "selected_result.json", final_result)
+    log(
+        f"  [stage] {display_name} selected: "
+        f"attempt={int(final_result['attempt']) + 1}/{max_attempts} "
+        f"status={selection_status} "
+        f"verdict={final_result.get('verdict', '-')} "
+        f"score={float(final_result.get('score', 0.0)):.1f} "
+        f"issues={int(final_result.get('issue_count', 0))} "
+        f"repairs={int(final_result.get('repair_count', 0))}"
+    )
+    return final_result
+
+
+
+def _truncate_for_prompt(value: Any, max_len: int = 900) -> Any:
+    """Compact retry context so later attempts do not exceed local LLM context.
+
+    It does not repair or change selected artifacts. It only limits diagnostic
+    context passed back into the next LLM attempt.
+    """
+    if isinstance(value, str):
+        if len(value) <= max_len:
+            return value
+        return value[:max_len] + f"… [truncated {len(value) - max_len} chars]"
+    if isinstance(value, list):
+        return [_truncate_for_prompt(v, max_len) for v in value[:12]]
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            if k in {"raw_preview", "raw_response", "raw_text", "request", "prompt", "history", "workflow"}:
+                continue
+            if k == "stage_status" and isinstance(v, dict):
+                out[k] = {
+                    "stage": v.get("stage"),
+                    "json_parse_ok": v.get("json_parse_ok"),
+                    "structural_ok": v.get("structural_ok"),
+                    "technical_error": _truncate_for_prompt(v.get("technical_error", ""), 300),
+                }
+            else:
+                out[k] = _truncate_for_prompt(v, max_len)
+        return out
+    return value
+
+
+def _compact_retry_context(parsed_key: str, parsed_value: Any, payload_key: str, payload_value: Any, critic: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        parsed_key: _truncate_for_prompt(parsed_value, 700),
+        payload_key: _truncate_for_prompt(payload_value, 700),
+        "score": critic.get("score", 0),
+        "success": critic.get("success", False),
+        "issues": _truncate_for_prompt(critic.get("issues", []), 500),
+        "repairs": _truncate_for_prompt(critic.get("repairs", []), 500),
+    }
+
+def build_previous_contract_result_for_retry(
+    parsed_style: Dict[str, Any],
+    contract: Dict[str, Any],
+    critic: Dict[str, Any],
+) -> Dict[str, Any]:
+    return _compact_retry_context("failed_parsed_style", parsed_style, "failed_contract", contract, critic)
+
+
+def style_condenser_writer_payload(writer_json: Dict[str, Any]) -> Dict[str, Any]:
+    return contract_bundle_from(writer_json)
+
+
+
+def run_style_condenser_attempt_loop(
+    planner_template: Dict[str, Any],
+    rules: Dict[str, str],
+    comfy_url: str,
+    debug_stage_dir: Path,
+    raw_style: str,
+    style_source_id: str,
+    block_index: int,
+    max_attempts: int,
+) -> Dict[str, Any]:
+    final_result = run_llm_quality_loop(
+        planner_template=planner_template,
+        rules=rules,
+        comfy_url=comfy_url,
+        task_dir=debug_stage_dir,
+        task_name="style_condenser",
+        display_name="style condenser",
+        max_attempts=max_attempts,
+        base_context={
+            "STYLE_SOURCE_ID": style_source_id,
+            "BLOCK_INDEX": block_index,
+            "RAW_VIDEO_STYLE": raw_style,
+        },
+        parser_stage_name="style_condenser_parser",
+        parser_system_rule="style_condenser_parser_system.txt",
+        parser_user_rule="style_condenser_parser_user.txt",
+        writer_stage_name="style_condenser_writer",
+        writer_system_rule="style_condenser_system.txt",
+        writer_user_rule="style_condenser_user.txt",
+        critic_stage_name="style_condenser_critic",
+        critic_system_rule="style_condenser_critic_system.txt",
+        critic_user_rule="style_condenser_critic_user.txt",
+        parser_context_key="PARSED_STYLE_JSON",
+        writer_payload_context_key="CONTRACT_JSON",
+        writer_payload_from=style_condenser_writer_payload,
+        build_previous_result=build_previous_contract_result_for_retry,
+        validate_final_payload=lambda payload: normalize_style_identity_bundle(payload, raw_style),
+        technical_repair="Return valid JSON for parser/writer/critic with the required style and identity contract schema; preserve concrete identity anchors from the raw style.",
+    )
+    write_json(debug_stage_dir / "final_contract.json", final_result)
+    return contract_bundle_from({"contract": final_result["result"]})
+
+
+def get_style_and_identity_contracts(
+    planner_template: Dict[str, Any],
+    rules: Dict[str, str],
+    comfy_url: str,
+    style_dir: Path,
+    debug_dir: Path,
+    raw_style: str,
+    style_source_id: str,
+    block_index: int,
+    max_attempts: int,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    style_dir.mkdir(parents=True, exist_ok=True)
+    style_path = style_contract_path(style_dir, style_source_id)
+    identity_path = identity_contract_path(style_dir, style_source_id)
+    if style_path.exists() and identity_path.exists():
+        return load_json(style_path), load_json(identity_path)
+
+    debug_stage_dir = debug_dir / "style" / style_source_id
+    log(f"  [stage] condense video style + identity: {style_source_id}")
+    contract = run_style_condenser_attempt_loop(
         planner_template,
         rules,
-        video_style,
-        song_context,
-        local_context,
-        current_block,
-        raw_path,
-        continuity,
-        block_kind,
-        index,
-        request_path=request_path,
+        comfy_url,
+        debug_stage_dir,
+        raw_style,
+        style_source_id,
+        block_index,
+        max_attempts,
     )
-    pid, client_id = queue_prompt(wf, comfy_url)
-    log(f"  [planner] prompt_id={pid}")
-    h = wait_history(pid, comfy_url, wf, client_id)
-    check_history_status(h, plans_dir / f"{base_name}_history.json")
-
-    if not raw_path.exists():
-        raise RuntimeError(f"Planner did not write plan file: {raw_path}")
-
-    raw_text = raw_path.read_text(encoding="utf-8").strip()
-    plan = extract_json_object(raw_text)
-    required = ["scene_summary", "image_prompt", "video_prompt", "negative_prompt"]
-    missing = [k for k in required if not str(plan.get(k, "")).strip()]
-    if missing:
-        raise RuntimeError(f"Planner JSON missing keys: {missing}. Raw response saved to {raw_path}")
-
-    # Do not modify visual prompts in code. Prompt policy belongs in rules/*.txt templates.
-    response_json_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-    clean_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-    parsed = {k: str(plan[k]) for k in required}
-    parsed_json_path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
-    return parsed
-
-
-
-def build_song_context_prompt(rules: Dict[str, str], video_style: str, verses: List[Dict[str, Any]]) -> str:
-    lyrics_text = "\n***\n".join(str(v.get("text", "")) for v in verses)
-    return render_template(
-        rules["song_context_user.txt"],
-        {
-            "VIDEO_STYLE": video_style,
-            "ALL_LYRICS": lyrics_text,
-        },
-        "song_context_user.txt",
+    style_contract, identity_contract = normalize_style_identity_bundle(contract, raw_style)
+    style_path.write_text(json.dumps(style_contract, ensure_ascii=False, indent=2), encoding="utf-8")
+    identity_path.write_text(json.dumps(identity_contract, ensure_ascii=False, indent=2), encoding="utf-8")
+    (style_dir / f"{style_source_id}_style_identity_bundle.json").write_text(
+        json.dumps({"style_contract": style_contract, "identity_contract": identity_contract}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
+    return style_contract, identity_contract
 
 
-def patch_song_context_workflow(
-    template: Dict[str, Any],
-    rules: Dict[str, str],
-    video_style: str,
-    verses: List[Dict[str, Any]],
-    raw_path: Path,
-    request_path: Path,
+
+def prompt_writer_payload(writer_json: Dict[str, Any]) -> Dict[str, str]:
+    return prompt_package_from(writer_json)
+
+
+
+def build_previous_prompt_result_for_retry(plan: Dict[str, Any], prompt: Dict[str, str], critic: Dict[str, Any]) -> Dict[str, Any]:
+    return _compact_retry_context("failed_semantic_plan", plan, "failed_prompt", prompt, critic)
+
+
+def validate_semantic_plan(plan: Dict[str, Any]) -> None:
+    for key in ["main_subject", "main_action", "setting", "emotional_intent", "visual_consequence", "must_show", "avoid_as_main_subject"]:
+        if key not in plan:
+            raise RuntimeError(f"Semantic planner JSON missing key: {key}")
+
+
+def compact_for_llm(value: Any, limit: int = 900) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def build_range_visual_state_after_subrange(
+    previous_state: Optional[Dict[str, Any]],
+    subrange: Dict[str, Any],
+    prompt: Dict[str, str],
 ) -> Dict[str, Any]:
-    wf = json.loads(json.dumps(template))
-    if "2" not in wf or "3" not in wf:
-        raise RuntimeError("Planner workflow must contain nodes 2=LLM_local and 3=PathSaveStringFile")
+    state = dict(previous_state or {})
+    sub_i = int(subrange.get("sub_index", 1))
+    current = {
+        "subrange_index": sub_i,
+        "subrange_text": compact_for_llm(str(subrange.get("text", "")), 360),
+        "scene_summary": compact_for_llm(prompt.get("scene_summary", ""), 500),
+        "image_prompt": compact_for_llm(prompt.get("image_prompt", ""), 700),
+        "video_prompt": compact_for_llm(prompt.get("video_prompt", ""), 700),
+    }
+    if not state:
+        state = {
+            "mode": "established_from_first_subrange",
+            "established_by_subrange": sub_i,
+            "continuity_lock": (
+                "Inside the same semantic range, later subranges should continue the same visible scene, "
+                "main subject, location, scale, palette, and identity lens unless the current subrange explicitly requires a change."
+            ),
+            "established_scene": current,
+            "recent_subranges": [current],
+        }
+    else:
+        recent = list(state.get("recent_subranges") or [])
+        recent.append(current)
+        state["recent_subranges"] = recent[-4:]
+        state["last_scene"] = current
+    return state
 
-    prompt = build_song_context_prompt(rules, video_style, verses)
-    save_prompt_debug(request_path, prompt)
 
-    wf["2"]["inputs"]["system_prompt"] = rules["song_context_system.txt"]
-    wf["2"]["inputs"]["user_prompt"] = prompt
-    wf["2"]["inputs"]["historical_record"] = ""
-    wf["2"]["inputs"]["conversation_rounds"] = 1
-    wf["2"]["inputs"]["is_memory"] = "disable"
-    wf["2"]["inputs"]["is_locked"] = "disable"
-    wf["2"]["inputs"]["main_brain"] = "enable"
-    wf["3"]["inputs"]["path"] = str(raw_path)
-    return wf
+def continuity_instruction_for_subrange(subrange: Dict[str, Any], range_visual_state: Optional[Dict[str, Any]]) -> str:
+    sub_i = int(subrange.get("sub_index", 1))
+    sub_count = int(subrange.get("sub_count", 1))
+    if sub_count <= 1:
+        return "Single-subrange semantic range: establish and complete one coherent scene."
+    if sub_i == 1 or not range_visual_state:
+        return (
+            "This is the first subrange of a multi-part semantic range. Establish a stable visual scene, "
+            "main subject, location, scale, palette, and identity lens that later subranges can continue."
+        )
+    return (
+        "This is a later subrange inside the same semantic range. Treat it as a continuation of the established scene. "
+        "Preserve the same main subject, location, scale, palette, and identity/world lens unless the current subrange text explicitly demands a new one. "
+        "Change the action and visible consequence according to the current subrange; do not redesign the subject or restage the world."
+    )
+
+
+def run_prompt_attempt_loop(
+    planner_template: Dict[str, Any],
+    rules: Dict[str, str],
+    comfy_url: str,
+    plans_dir: Path,
+    part_debug_dir: Path,
+    plan_base_name: str,
+    block_index: int,
+    range_text: str,
+    subrange_text: str,
+    song_context: Dict[str, Any],
+    local_context: str,
+    previous_visual_context: List[Dict[str, str]],
+    style_contract: Dict[str, Any],
+    identity_contract: Dict[str, Any],
+    prompt_max_attempts: int,
+    range_visual_state: Optional[Dict[str, Any]] = None,
+    subrange: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    continuity_instruction = continuity_instruction_for_subrange(subrange or {}, range_visual_state)
+    base_context = {
+        "BLOCK_INDEX": block_index,
+        "RANGE_TEXT": range_text,
+        "SUBRANGE_TEXT": subrange_text,
+        "SONG_CONTEXT_JSON": song_context,
+        "LOCAL_CONTEXT": local_context,
+        "PREVIOUS_VISUAL_CONTEXT_JSON": previous_visual_context[-8:],
+        "RANGE_VISUAL_STATE_JSON": range_visual_state or {},
+        "SUBRANGE_CONTINUITY_INSTRUCTION": continuity_instruction,
+        "STYLE_CONTRACT_JSON": style_contract,
+        "IDENTITY_CONTRACT_JSON": identity_contract,
+        "LITERAL_SCENE_RULES": rules["literal_scene_rules.txt"],
+    }
+    final_result = run_llm_quality_loop(
+        planner_template=planner_template,
+        rules=rules,
+        comfy_url=comfy_url,
+        task_dir=part_debug_dir,
+        task_name="prompt_generation",
+        display_name="prompt generation",
+        max_attempts=prompt_max_attempts,
+        base_context=base_context,
+        parser_stage_name="semantic_planner",
+        parser_system_rule="semantic_planner_system.txt",
+        parser_user_rule="semantic_planner_user.txt",
+        writer_stage_name="prompt_writer",
+        writer_system_rule="prompt_writer_system.txt",
+        writer_user_rule="prompt_writer_user.txt",
+        critic_stage_name="prompt_critic",
+        critic_system_rule="prompt_critic_system.txt",
+        critic_user_rule="prompt_critic_user.txt",
+        parser_context_key="SEMANTIC_PLAN_JSON",
+        writer_payload_context_key="PROMPT_PACKAGE_JSON",
+        writer_payload_from=prompt_writer_payload,
+        build_previous_result=build_previous_prompt_result_for_retry,
+        validate_parser_result=validate_semantic_plan,
+        validate_final_payload=prompt_package_from,
+        technical_repair="Return valid JSON for semantic plan, prompt package, and critic. Keep the current subrange lyric event central and preserve relevant identity anchors without replacing the action.",
+    )
+    final_prompt = prompt_package_from(final_result["result"])
+    part_debug_dir.mkdir(parents=True, exist_ok=True)
+    write_json(part_debug_dir / "final_prompt.json", final_result)
+    (part_debug_dir / "image_prompt.txt").write_text(final_prompt["image_prompt"], encoding="utf-8")
+    (part_debug_dir / "video_prompt.txt").write_text(final_prompt["video_prompt"], encoding="utf-8")
+    (part_debug_dir / "negative_prompt.txt").write_text(final_prompt["negative_prompt"], encoding="utf-8")
+
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = plans_dir / f"{plan_base_name}.json"
+    plan_path.write_text(json.dumps(final_prompt, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(plans_dir / f"{plan_base_name}_final_result.json", final_result)
+    return final_prompt
+
+
+
+def lyrics_text_from_verses(verses: List[Dict[str, Any]]) -> str:
+    return "\n***\n".join(str(v.get("text", "")) for v in verses)
+
+
+def song_context_payload_from(value: Dict[str, Any]) -> Dict[str, Any]:
+    src: Any = value.get("song_context") if isinstance(value.get("song_context"), dict) else value
+    if not isinstance(src, dict):
+        raise RuntimeError("Song context is not a JSON object")
+    required = [
+        "song_summary",
+        "main_characters",
+        "recurring_locations",
+        "recurring_props",
+        "visual_motifs",
+        "tone",
+        "continuity_rules",
+        "avoid",
+    ]
+    missing = [k for k in required if k not in src]
+    if missing:
+        raise RuntimeError(f"Song context JSON missing keys: {missing}")
+    return dict(src)
+
+
+
+def build_previous_song_context_result_for_retry(parsed_song: Dict[str, Any], song_context: Dict[str, Any], critic: Dict[str, Any]) -> Dict[str, Any]:
+    return _compact_retry_context("failed_parsed_song", parsed_song, "failed_song_context", song_context, critic)
 
 
 def get_or_create_song_context(
@@ -3765,54 +4827,48 @@ def get_or_create_song_context(
     verses: List[Dict[str, Any]],
     comfy_url: str,
     plans_dir: Path,
+    max_attempts: int,
 ) -> Dict[str, Any]:
-    """Load cached song_context.json or build it when visual generation needs it."""
+    """Load cached song_context.json or build it through the standard LLM quality loop."""
     plans_dir.mkdir(parents=True, exist_ok=True)
     clean_path = plans_dir / "song_context.json"
-    raw_path = plans_dir / "song_context_response.txt"
-    response_json_path = plans_dir / "song_context_response.json"
-    request_path = plans_dir / "song_context_request.txt"
 
     if clean_path.exists():
         log(f"[stage] use cached song context: {clean_path}")
         return load_json(clean_path)
 
     log("[stage] build missing song context")
-    if raw_path.exists():
-        raw_path.unlink()
-
-    wf = patch_song_context_workflow(
-        planner_template,
-        rules,
-        video_style,
-        verses,
-        raw_path,
-        request_path,
+    task_dir = plans_dir / "song_context_quality_loop"
+    final_result = run_llm_quality_loop(
+        planner_template=planner_template,
+        rules=rules,
+        comfy_url=comfy_url,
+        task_dir=task_dir,
+        task_name="song_context",
+        display_name="song context",
+        max_attempts=max_attempts,
+        base_context={
+            "VIDEO_STYLE": video_style,
+            "ALL_LYRICS": lyrics_text_from_verses(verses),
+        },
+        parser_stage_name="song_context_parser",
+        parser_system_rule="song_context_parser_system.txt",
+        parser_user_rule="song_context_parser_user.txt",
+        writer_stage_name="song_context_writer",
+        writer_system_rule="song_context_system.txt",
+        writer_user_rule="song_context_user.txt",
+        critic_stage_name="song_context_critic",
+        critic_system_rule="song_context_critic_system.txt",
+        critic_user_rule="song_context_critic_user.txt",
+        parser_context_key="PARSED_SONG_JSON",
+        writer_payload_context_key="SONG_CONTEXT_JSON",
+        writer_payload_from=song_context_payload_from,
+        build_previous_result=build_previous_song_context_result_for_retry,
+        validate_final_payload=song_context_payload_from,
+        technical_repair="Return valid JSON for song parser, song context writer, and critic. Keep reusable visual continuity facts grounded in the lyrics and visual style without quoting lyrics or inventing visible text.",
     )
-    pid, client_id = queue_prompt(wf, comfy_url)
-    log(f"[song-context] prompt_id={pid}")
-    h = wait_history(pid, comfy_url, wf, client_id)
-    check_history_status(h, plans_dir / "song_context_history.json")
-
-    if not raw_path.exists():
-        raise RuntimeError(f"Song-context planner did not write file: {raw_path}")
-
-    raw_text = raw_path.read_text(encoding="utf-8").strip()
-    ctx = extract_json_object(raw_text)
-    defaults = {
-        "song_summary": "",
-        "main_characters": [],
-        "recurring_locations": [],
-        "recurring_props": [],
-        "visual_motifs": [],
-        "tone": "",
-        "continuity_rules": [],
-        "avoid": ["visible text", "letters", "captions", "subtitles", "signs", "logos", "watermarks"],
-    }
-    for k, v in defaults.items():
-        ctx.setdefault(k, v)
-
-    response_json_path.write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
+    ctx = song_context_payload_from(final_result["result"])
+    write_json(plans_dir / "song_context_final_result.json", final_result)
     clean_path.write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
     return ctx
 
@@ -3860,7 +4916,6 @@ def build_instrumental_local_context(verses: List[Dict[str, Any]], previous_vers
 
 
 def build_current_block_instruction(block: Dict[str, Any], verses: List[Dict[str, Any]]) -> str:
-    kind = str(block.get("kind", "verse"))
     directives = block.get("bracket_directives") or []
     directive_text = ""
     if directives:
@@ -3871,25 +4926,16 @@ def build_current_block_instruction(block: Dict[str, Any], verses: List[Dict[str
               "Do not treat them as sung lyrics. If they conflict with actual lyrics, lyrics win."
         )
 
-    if kind == "intro":
+    if not block_has_lyric_text(block):
         return (
-            "This is the opening instrumental intro before any lyrics. "
-            "Create an establishing opening visual for the whole song: introduce the world, main characters, mood and recurring motifs. "
-            "Do not depict one specific verse event too literally. No visible text."
+            "This is an explicit non-lyrical song block from lyrics.txt. "
+            "It may be instrumental, intro, outro, breakdown, solo, rest, or metadata-only. "
+            "No words are sung in this block. Continue or resolve the surrounding visual scene using the music and bracket directives. "
+            "Do not render lyrics, captions, signs, section labels, or any visible text."
         ) + directive_text
-    if kind == "outro":
-        return (
-            "This is the closing/outro after the final lyric. "
-            "Create a warm final tableau that resolves the whole song visually. "
-            "Do not introduce new plot events. No visible text."
-        ) + directive_text
-    if kind == "instrumental":
-        return (
-            "This is an instrumental break with no sung lyrics. "
-            "Create a visual musical interlude or transition between the surrounding lyric sections. "
-            "Do not render lyrics, captions, signs, or any visible text."
-        ) + directive_text
-    return "Current verse/block text:\n" + str(block.get("text", "")) + directive_text
+
+    return "Current song block text:\n" + str(block.get("text", "")) + directive_text
+
 
 
 
@@ -3941,7 +4987,7 @@ def upload_image_to_comfy(image_path: Path, comfy_url: str, subfolder: str) -> s
 
 
 def timed_line_segments_for_block(block: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if str(block.get("kind")) != "verse":
+    if not block_has_lyric_text(block):
         return []
 
     verse = block.get("verse") or {}
@@ -3968,7 +5014,7 @@ def timed_line_segments_for_block(block: Dict[str, Any]) -> List[Dict[str, Any]]
 
 
 def subrange_text_for_block(block: Dict[str, Any], sub_start: float, sub_end: float) -> str:
-    if str(block.get("kind")) != "verse":
+    if not block_has_lyric_text(block):
         return ""
 
     pieces: List[str] = []
@@ -4011,8 +5057,71 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
     target_seconds = max(0.5, min(recommended, safe_max_seconds))
     min_segment_seconds = 0.5
 
-    def even_boundaries(seg_start: float, seg_end: float) -> List[float]:
-        """Split one oversized segment into near-target pieces under safe max."""
+    if duration <= safe_max_seconds:
+        return [start, end]
+
+    def clean_boundaries(values: List[float]) -> List[float]:
+        ordered = sorted(float(x) for x in values if start - 1e-6 <= float(x) <= end + 1e-6)
+        out: List[float] = []
+        for value in ordered:
+            if not out or value > out[-1] + 0.01:
+                out.append(value)
+        if not out or abs(out[0] - start) > 0.01:
+            out.insert(0, start)
+        else:
+            out[0] = start
+        if abs(out[-1] - end) > 0.01:
+            out.append(end)
+        else:
+            out[-1] = end
+        return out
+
+    def split_using_candidates(seg_start: float, seg_end: float, candidates: List[float]) -> List[float]:
+        """Split using only supplied natural boundaries.
+
+        The function never invents boundaries. It prefers pieces around
+        recommended_workflow_seconds while staying below max_workflow_seconds.
+        If no usable candidate exists, it leaves the remaining segment intact;
+        the next refinement pass will try a finer boundary class.
+        """
+        if seg_end - seg_start <= safe_max_seconds + 1e-6:
+            return [seg_start, seg_end]
+
+        local_candidates = sorted(
+            float(c) for c in candidates
+            if seg_start + 0.01 < float(c) < seg_end - 0.01
+        )
+        if not local_candidates:
+            return [seg_start, seg_end]
+
+        boundaries = [seg_start]
+        previous = seg_start
+        while seg_end - previous > safe_max_seconds + 1e-6:
+            earliest = previous + min_segment_seconds
+            latest = min(previous + safe_max_seconds, seg_end - min_segment_seconds)
+            if latest < earliest:
+                break
+
+            valid = [c for c in local_candidates if earliest <= c <= latest]
+            if not valid:
+                break
+
+            remaining = seg_end - previous
+            remaining_parts = max(2, int(math.ceil(remaining / safe_max_seconds)))
+            desired = previous + remaining / remaining_parts
+            desired = min(desired, previous + target_seconds)
+            chosen = min(valid, key=lambda c: abs(c - desired))
+            if chosen <= previous + 0.01:
+                break
+            boundaries.append(chosen)
+            previous = chosen
+
+        if boundaries[-1] < seg_end - 0.01:
+            boundaries.append(seg_end)
+        return boundaries
+
+    def split_evenly(seg_start: float, seg_end: float) -> List[float]:
+        """Final mechanical split when natural lyric boundaries are insufficient."""
         seg_duration = max(0.01, seg_end - seg_start)
         if seg_duration <= safe_max_seconds + 1e-6:
             return [seg_start, seg_end]
@@ -4020,77 +5129,46 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
         pieces = max(2, int(math.ceil(seg_duration / target_seconds)))
         while seg_duration / pieces > safe_max_seconds:
             pieces += 1
-
         return [seg_start + seg_duration * i / pieces for i in range(pieces + 1)]
 
-    if duration <= safe_max_seconds:
-        return [start, end]
-
-    candidates = {start, end}
-    if str(block.get("kind")) == "verse":
+    line_candidates = {start, end}
+    word_candidates = {start, end}
+    if block_has_lyric_text(block):
         for seg in timed_line_segments_for_block(block):
             seg_end = float(seg["end"])
             if start < seg_end < end:
-                candidates.add(seg_end)
+                line_candidates.add(seg_end)
+                word_candidates.add(seg_end)
             for w in seg.get("words") or []:
-                we = float(w.get("end", start))
-                if start < we < end:
-                    candidates.add(we)
+                word_end = float(w.get("end", start))
+                if start < word_end < end:
+                    word_candidates.add(word_end)
 
-    sorted_candidates = sorted(candidates)
-    boundaries = [start]
-    previous = start
+    # Deterministic policy, intentionally not configurable:
+    # 1. Prefer complete lyric-line boundaries.
+    # 2. If any resulting segment is still too long, refine only those segments
+    #    using word boundaries.
+    # 3. If a segment is still too long, split it mechanically into near-target
+    #    equal chunks based on recommended_workflow_seconds.
+    boundaries = split_using_candidates(start, end, sorted(line_candidates))
 
-    # First pass: use natural lyric boundaries when they are available near the
-    # desired target duration and do not create an immediate oversized part.
-    # Do not synthesize "optimal" cut points here. If lyric-aware splitting
-    # cannot keep a segment under the limit, the second pass below splits that
-    # segment evenly into near-target pieces. That avoids a big part plus a tiny
-    # remainder and keeps the policy simple.
-    while end - previous > safe_max_seconds:
-        remaining = end - previous
-        remaining_parts = max(2, int(math.ceil(remaining / target_seconds)))
-        desired = previous + remaining / remaining_parts
-        desired = min(desired, previous + target_seconds)
-
-        earliest = previous + min_segment_seconds
-        latest = min(previous + safe_max_seconds, end - min_segment_seconds)
-        if latest < earliest:
-            break
-
-        valid = [c for c in sorted_candidates if earliest <= c <= latest]
-        if not valid:
-            break
-
-        chosen = min(valid, key=lambda c: abs(c - desired))
-        if chosen <= previous + 0.01:
-            break
-        boundaries.append(float(chosen))
-        previous = float(chosen)
-
-    if boundaries[-1] < end:
-        boundaries.append(end)
-
-    clean = [boundaries[0]]
-    for b in boundaries[1:]:
-        if b > clean[-1] + 0.01:
-            clean.append(float(b))
-    if clean[-1] < end:
-        clean.append(end)
-
-    # Second pass: any remaining oversized segment is split evenly into pieces
-    # sized around recommended_workflow_seconds while staying below the safe
-    # workflow cap. This is the fallback for lyric passages where no good
-    # word/line boundary exists.
-    validated = [clean[0]]
-    for segment_end in clean[1:]:
-        segment_start = validated[-1]
-        pieces = even_boundaries(segment_start, segment_end)
+    word_refined = [boundaries[0]]
+    for segment_end in boundaries[1:]:
+        segment_start = word_refined[-1]
+        pieces = split_using_candidates(segment_start, segment_end, sorted(word_candidates))
         for b in pieces[1:]:
-            if b > validated[-1] + 0.01:
-                validated.append(float(b))
+            if b > word_refined[-1] + 0.01:
+                word_refined.append(float(b))
 
-    return validated
+    evenly_refined = [word_refined[0]]
+    for segment_end in word_refined[1:]:
+        segment_start = evenly_refined[-1]
+        pieces = split_evenly(segment_start, segment_end)
+        for b in pieces[1:]:
+            if b > evenly_refined[-1] + 0.01:
+                evenly_refined.append(float(b))
+
+    return clean_boundaries(evenly_refined)
 
 def build_subranges_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
     boundaries = split_boundaries_for_block(block, config)
@@ -4104,7 +5182,6 @@ def build_subranges_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> 
 
         out.append({
             "block_index": int(block["block_index"]),
-            "kind": str(block.get("kind", "verse")),
             "sub_index": i + 1,
             "sub_count": count,
             "start": sub_start,
@@ -4118,7 +5195,6 @@ def build_subranges_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> 
 
 
 def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any]) -> str:
-    kind = str(block.get("kind", "verse"))
     directives = block.get("bracket_directives") or []
     directive_text = "\n".join(f"- {x}" for x in directives) if directives else "- none"
     full_text = str(block.get("text", "")).strip() or "(no sung lyrics in this semantic range)"
@@ -4145,7 +5221,6 @@ def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any]) 
     return (
         f"SEMANTIC RANGE:\n"
         f"Block index: {int(block['block_index']):03d}\n"
-        f"Kind: {kind}\n"
         f"Subrange: {int(subrange['sub_index'])} of {int(subrange['sub_count'])}\n"
         f"Time: {float(subrange['start']):.3f}s..{float(subrange['end']):.3f}s\n\n"
         f"BRACKET DIRECTIVES, metadata for the whole semantic range:\n{directive_text}\n\n"
@@ -4154,6 +5229,7 @@ def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any]) 
         "Priority rules:\n"
         "- Always follow VISUAL STYLE for medium, look, palette, character design, camera and rendering.\n"
         "- For factual action, follow CURRENT SUBRANGE when it provides text.\n"
+        "- If this is not the first subrange of the semantic range, treat it as a continuation shot unless the current subrange explicitly changes subject or location.\n"
         "- Bracket directives are metadata, not sung lyrics and never visible text.\n"
         "- Do not render captions, signs, section labels, lyric cards, or written words."
     )
@@ -4283,19 +5359,45 @@ def render_audio_for_timeline(full_mix: Path, out_dir: Path, ffmpeg: str, audio_
     return render
 
 
-def instrumental_gap_threshold(verses: List[Dict[str, Any]], config: Dict[str, Any]) -> float:
-    durations = [float(v.get("duration", 0.0)) for v in verses if float(v.get("duration", 0.0)) > 0.01]
-    median_duration = statistics.median(durations) if durations else 0.0
-    return max(
-        float(config["instrumental_gap_min_seconds"]),
-        median_duration * float(config["instrumental_gap_min_ratio_of_median_verse"]),
+def last_effective_lyric_end_before_explicit_gap(block: Dict[str, Any], default_end: float, config: Dict[str, Any]) -> float:
+    """Return a lyric end suitable for an explicit following non-lyrical block.
+
+    Forced lyric structure wins over stretched alignment tails. When a lyric line
+    ends with zero-duration words far after the last real word, keep the empty
+    block's gap rather than letting the previous lyric block consume it.
+    """
+    min_tail = max(0.5, float(config.get("explicit_gap_min_tail_seconds", 2.0)))
+    nonzero_ends: List[float] = []
+    zeroish_ends: List[float] = []
+    for line in block.get("lines", []) or []:
+        for w in line.get("words", []) or []:
+            try:
+                ws = float(w.get("start", 0.0))
+                we = float(w.get("end", ws))
+            except Exception:
+                continue
+            if we - ws >= 0.08:
+                nonzero_ends.append(we)
+            else:
+                zeroish_ends.append(we)
+    if not nonzero_ends or not zeroish_ends:
+        return default_end
+    natural_end = max(nonzero_ends)
+    stretched_end = max(zeroish_ends + [default_end])
+    if stretched_end - natural_end >= min_tail:
+        return natural_end
+    return default_end
+
+
+def make_nonlyrical_block_text(block: Dict[str, Any]) -> str:
+    directives = block.get("bracket_directives") or []
+    label = ", ".join(str(x) for x in directives) if directives else "empty"
+    return (
+        f"Non-lyrical song block ({label}). No sung words in this section; "
+        "use the music, surrounding lyrics and bracket metadata for visual continuity."
     )
 
 
-
-
-def should_create_silent_gap_block(gap_duration: float, verses: List[Dict[str, Any]], config: Dict[str, Any]) -> bool:
-    return float(gap_duration) >= instrumental_gap_threshold(verses, config)
 def make_timeline_blocks(
     all_verses: List[Dict[str, Any]],
     selected_verses: List[Dict[str, Any]],
@@ -4303,150 +5405,126 @@ def make_timeline_blocks(
     has_limit: bool,
     config: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], Optional[float]]:
-    """Create continuous visual timeline blocks.
+    """Create a continuous visual timeline from explicit lyrics.txt blocks.
 
-    Lyric timing remains unchanged. Short intro/outro gaps are merged into the
-    first/last lyric range using the same threshold as instrumental gaps.
+    The range list follows lyrics.txt exactly: every *** segment becomes one
+    timeline block. Blocks with lyrics use alignment timing; blocks without
+    lyrics fill the gap between surrounding explicit blocks or the audio edge.
     """
-    total = len(all_verses)
-    selected_count = len(selected_verses)
-    full_song = selected_count >= total and not has_limit
+    source_blocks = selected_verses
+    if not source_blocks:
+        return [], None
 
-    if selected_count >= total:
-        full_song = True
-
-    if full_song:
-        audio_end: Optional[float] = None
-        timeline_end = audio_duration
-    else:
-        next_verse = all_verses[selected_count]
-        timeline_end = float(next_verse["start"])
-        audio_end = timeline_end
+    full_song = (len(selected_verses) >= len(all_verses)) and not has_limit
+    timeline_end = float(audio_duration) if full_song else float(selected_verses[-1].get("end", audio_duration))
+    audio_end = None if full_song else timeline_end
 
     blocks: List[Dict[str, Any]] = []
-    next_block_index = 0
-    desired_preroll = max(0.0, float(config.get("range_visual_preroll_seconds", 0.0)))
+    n = len(source_blocks)
 
-    visual_starts: List[float] = []
-    previous_lyric_end = 0.0
-    for verse in selected_verses:
-        lyric_start = float(verse["start"])
-        available_gap = max(0.0, lyric_start - previous_lyric_end)
-        actual_preroll = min(desired_preroll, available_gap)
-        visual_starts.append(max(0.0, lyric_start - actual_preroll))
-        previous_lyric_end = float(verse["end"])
+    def next_lyrical_index(pos: int) -> Optional[int]:
+        for j in range(pos + 1, n):
+            if block_has_lyric_text(source_blocks[j]):
+                return j
+        return None
 
-    first_visual_start = visual_starts[0]
-    intro_is_separate = should_create_silent_gap_block(first_visual_start, all_verses, config)
+    def prev_lyrical_index(pos: int) -> Optional[int]:
+        for j in range(pos - 1, -1, -1):
+            if block_has_lyric_text(source_blocks[j]):
+                return j
+        return None
 
-    if intro_is_separate:
-        intro_text = (
-            "Opening instrumental/intro block for the whole song. "
-            "Establish the main setting, recurring characters and mood before the first lyric starts."
-        )
-        blocks.append({
-            "block_index": next_block_index,
-            "kind": "intro",
-            "verse_index": 0,
-            "start": 0.0,
-            "end": first_visual_start,
-            "duration": first_visual_start,
-            "text": intro_text,
-            "bracket_directives": [],
-        })
-        next_block_index += 1
-    else:
-        # Too short to be a meaningful generated clip. Fold it into the first
-        # lyric range so we do not render a 0.x second intro video.
-        visual_starts[0] = 0.0
+    lyric_start: Dict[int, float] = {}
+    lyric_end: Dict[int, float] = {}
+    for i, src in enumerate(source_blocks):
+        if not block_has_lyric_text(src):
+            continue
+        raw_start = max(0.0, float(src.get("start", 0.0)))
+        raw_end = max(raw_start + 0.01, float(src.get("end", raw_start + 0.01)))
+        if next_lyrical_index(i) is None and not any(not block_has_lyric_text(source_blocks[j]) for j in range(i + 1, n)):
+            raw_end = max(raw_end, timeline_end)
+        if i + 1 < n and not block_has_lyric_text(source_blocks[i + 1]):
+            raw_end = last_effective_lyric_end_before_explicit_gap(src, raw_end, config)
+        lyric_start[i] = raw_start
+        lyric_end[i] = min(max(raw_start + 0.01, raw_end), timeline_end)
 
-    for pos, verse in enumerate(selected_verses):
-        verse_index = int(verse["index"])
-        lyric_start = float(verse["start"])
-        start = float(visual_starts[pos])
-        lyric_end = float(verse["end"])
-        actual_preroll = max(0.0, lyric_start - start)
-
-        if pos + 1 < len(selected_verses):
-            next_lyric_start = float(selected_verses[pos + 1]["start"])
-            next_visual_start = float(visual_starts[pos + 1])
-            next_verse_index: Optional[int] = int(selected_verses[pos + 1]["index"])
-        elif full_song:
-            next_lyric_start = lyric_end
-            next_visual_start = lyric_end
-            next_verse_index = None
-        else:
-            next_lyric_start = timeline_end
-            next_visual_start = timeline_end
-            next_verse_index = int(all_verses[selected_count]["index"]) if selected_count < total else None
-
-        lyric_gap = max(0.0, next_lyric_start - lyric_end)
-        split_gap = should_create_silent_gap_block(lyric_gap, all_verses, config) and next_lyric_start > lyric_end
-
-        verse_end = lyric_end if split_gap else next_visual_start
-        if verse_end <= start:
-            verse_end = lyric_end
-
-        blocks.append({
-            "block_index": next_block_index,
-            "kind": "verse",
-            "verse_index": verse_index,
-            "start": start,
-            "end": verse_end,
-            "duration": max(0.01, verse_end - start),
-            "text": verse.get("text", ""),
-            "verse": verse,
-            "lyric_start": lyric_start,
-            "lyric_end": lyric_end,
-            "visual_preroll": actual_preroll,
-            "bracket_directives": list(verse.get("bracket_directives", [])),
-        })
-        next_block_index += 1
-
-        if split_gap:
-            instrumental_end = next_visual_start
+    # First pass: create blocks in lyrics.txt order. Non-lyrical runs are filled
+    # evenly between the previous lyrical end and next lyrical start/audio end.
+    i = 0
+    while i < n:
+        src = source_blocks[i]
+        if block_has_lyric_text(src):
+            start = 0.0 if i == 0 else float(blocks[-1]["end"])
+            raw_start = lyric_start.get(i, start)
+            if not blocks:
+                start = 0.0 if raw_start > 0.0 else raw_start
+            else:
+                start = float(blocks[-1]["end"])
+            j = next_lyrical_index(i)
+            if i + 1 < n and not block_has_lyric_text(source_blocks[i + 1]):
+                end = lyric_end[i]
+            elif j is not None:
+                end = lyric_start[j]
+            else:
+                end = timeline_end
+            end = max(start + 0.01, min(float(end), timeline_end))
+            src["start"] = start
+            src["end"] = end
+            src["duration"] = max(0.01, end - start)
             blocks.append({
-                "block_index": next_block_index,
-                "kind": "instrumental",
-                "verse_index": verse_index,
-                "previous_verse_index": verse_index,
-                "next_verse_index": next_verse_index,
-                "start": lyric_end,
-                "end": instrumental_end,
-                "duration": max(0.01, instrumental_end - lyric_end),
-                "text": (
-                    f"Instrumental break with no sung lyrics between verse {verse_index}"
-                    + (f" and verse {next_verse_index}." if next_verse_index else " and the end of the selected range.")
-                ),
-                "bracket_directives": [],
+                "block_index": len(blocks),
+                "verse_index": int(src.get("index", len(blocks) + 1)),
+                "song_block_index": int(src.get("index", len(blocks) + 1)),
+                "start": start,
+                "end": end,
+                "duration": max(0.01, end - start),
+                "text": src.get("text", ""),
+                "verse": src,
+                "lyric_start": lyric_start.get(i, start),
+                "lyric_end": lyric_end.get(i, end),
+                "visual_preroll": max(0.0, lyric_start.get(i, start) - start),
+                "bracket_directives": list(src.get("bracket_directives", [])),
             })
-            next_block_index += 1
+            i += 1
+            continue
 
-    if full_song:
-        last = selected_verses[-1]
-        outro_start = float(last["end"])
-        outro_end = audio_duration
-        outro_duration = max(0.0, outro_end - outro_start)
-        if should_create_silent_gap_block(outro_duration, all_verses, config):
-            outro_text = (
-                "Closing instrumental/outro block for the whole song. "
-                "Create a final warm visual tableau that resolves the story without any text."
-            )
+        run_start_i = i
+        while i < n and not block_has_lyric_text(source_blocks[i]):
+            i += 1
+        run_end_i = i
+        prev_i = prev_lyrical_index(run_start_i)
+        next_i = next_lyrical_index(run_end_i - 1)
+        gap_start = float(blocks[-1]["end"]) if blocks else 0.0
+        if prev_i is not None:
+            gap_start = max(gap_start, lyric_end.get(prev_i, gap_start))
+        gap_end = lyric_start[next_i] if next_i is not None else timeline_end
+        gap_end = max(gap_start + 0.01, min(float(gap_end), timeline_end))
+        count = run_end_i - run_start_i
+        for k in range(count):
+            src_empty = source_blocks[run_start_i + k]
+            start = gap_start + (gap_end - gap_start) * k / count
+            end = gap_start + (gap_end - gap_start) * (k + 1) / count
+            src_empty["start"] = start
+            src_empty["end"] = end
+            src_empty["duration"] = max(0.01, end - start)
             blocks.append({
-                "block_index": next_block_index,
-                "kind": "outro",
-                "verse_index": int(last["index"]) + 1,
-                "start": outro_start,
-                "end": outro_end,
-                "duration": max(0.01, outro_duration),
-                "text": outro_text,
-                "bracket_directives": [],
+                "block_index": len(blocks),
+                "verse_index": int(src_empty.get("index", len(blocks) + 1)),
+                "song_block_index": int(src_empty.get("index", len(blocks) + 1)),
+                "previous_verse_index": int(source_blocks[prev_i].get("index")) if prev_i is not None else 0,
+                "next_verse_index": int(source_blocks[next_i].get("index")) if next_i is not None else None,
+                "start": start,
+                "end": end,
+                "duration": max(0.01, end - start),
+                "text": "",
+                "verse": src_empty,
+                "bracket_directives": list(src_empty.get("bracket_directives", [])),
+                "section_text": make_nonlyrical_block_text(src_empty),
             })
-        elif outro_duration > 0.0 and blocks:
-            # Too short for a standalone outro clip; merge into the previous
-            # visual range so final video still covers full audio duration.
-            blocks[-1]["end"] = outro_end
-            blocks[-1]["duration"] = max(0.01, float(blocks[-1]["end"]) - float(blocks[-1]["start"]))
+
+    if blocks:
+        blocks[-1]["end"] = max(float(blocks[-1]["end"]), timeline_end)
+        blocks[-1]["duration"] = max(0.01, float(blocks[-1]["end"]) - float(blocks[-1]["start"]))
 
     return blocks, audio_end
 
@@ -4513,11 +5591,14 @@ def validate_unscaled_clip_for_timeline(
 def load_continuity_from_plans(plans_dir: Path, before_block_index: int) -> List[Dict[str, str]]:
     """Load previous saved scene summaries for visual continuity."""
     out: List[Dict[str, str]] = []
+    seen: set[str] = set()
     if not plans_dir.exists():
         return out
 
     for p in sorted(plans_dir.glob("plan_*.json")):
-        m = re.match(r"plan_(\d+)\.json$", p.name)
+        if p.name.endswith("_final_result.json"):
+            continue
+        m = re.match(r"plan_(\d+)(?:_part_(\d+))?\.json$", p.name)
         if not m:
             continue
 
@@ -4532,7 +5613,10 @@ def load_continuity_from_plans(plans_dir: Path, before_block_index: int) -> List
 
         summary = str(data.get("scene_summary", "")).strip()
         if summary:
-            out.append({"segment": str(idx), "scene_summary": summary})
+            segment = f"{idx}.{int(m.group(2))}" if m.group(2) else str(idx)
+            if segment not in seen:
+                out.append({"segment": segment, "scene_summary": summary})
+                seen.add(segment)
 
     return out
 
@@ -4676,7 +5760,6 @@ def write_timeline_manifest(
         block_index = int(block["block_index"])
         item = {
             "block_index": block_index,
-            "kind": block["kind"],
             "verse_index": int(block.get("verse_index", block["block_index"])),
             "start": float(block["start"]),
             "end": float(block["end"]),
@@ -4731,7 +5814,6 @@ def write_preview_manifest(
         block_index = int(block["block_index"])
         items.append({
             "block_index": block_index,
-            "kind": block["kind"],
             "verse_index": int(block.get("verse_index", block["block_index"])),
             "start": float(block["start"]),
             "end": float(block["end"]),
@@ -4766,26 +5848,6 @@ def write_preview_manifest(
 
 
 
-def copy_file_if_exists(src_path: Path, dst_path: Path) -> None:
-    if src_path.exists():
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_path, dst_path)
-
-
-def copy_planner_artifacts_to_part_debug(
-    plans_dir: Path,
-    base_name: str,
-    part_debug_dir: Path,
-) -> None:
-    copy_file_if_exists(plans_dir / f"{base_name}_request.txt", part_debug_dir / "planner_request.txt")
-    copy_file_if_exists(plans_dir / f"{base_name}_request.json", part_debug_dir / "planner_request.json")
-    copy_file_if_exists(plans_dir / f"{base_name}_response.txt", part_debug_dir / "planner_response.txt")
-    copy_file_if_exists(plans_dir / f"{base_name}_response.json", part_debug_dir / "planner_response.json")
-    copy_file_if_exists(plans_dir / f"{base_name}_parsed.json", part_debug_dir / "planner_parsed.json")
-    copy_file_if_exists(plans_dir / f"{base_name}.json", part_debug_dir / "planner_result.json")
-    copy_file_if_exists(plans_dir / f"{base_name}_history.json", part_debug_dir / "planner_history.json")
-
-
 def range_debug_dir(debug_dir: Path, block_index: int) -> Path:
     return debug_dir / "ranges" / f"range_{block_index:03d}"
 
@@ -4807,7 +5869,6 @@ def write_range_debug_files(block: Dict[str, Any], subranges: List[Dict[str, Any
 
     range_context = {
         "block_index": block_i,
-        "kind": str(block.get("kind", "")),
         "verse_index": block.get("verse_index"),
         "previous_verse_index": block.get("previous_verse_index"),
         "next_verse_index": block.get("next_verse_index"),
@@ -4890,12 +5951,18 @@ def main() -> None:
     height = int(config["video_height"])
     comfy_url = args.comfy_url or str(config["comfy_url"])
     output_dir = Path(args.comfy_output_dir).resolve() if args.comfy_output_dir else resolve_config_path(str(config["comfy_output_dir"]), script_dir)
-    planner_template = load_json(workflow_dir / "planner_visual_prompts_api.json")
+    planner_template = apply_llm_workflow_config(
+        load_json(workflow_dir / "planner_visual_prompts_api.json"),
+        int(config["llm_max_ctx"]),
+        int(config["llm_max_length"]),
+    )
     image_template = load_json(workflow_dir / "image_from_prompt_api.json")
     video_template = load_json(workflow_dir / "video_from_image_api.json")
     write_json(debug_dir / "config_used.json", config)
     log(f"[stage] comfy url : {comfy_url}")
     log(f"[stage] comfy out : {output_dir}")
+    log(f"[stage] llm max ctx: {int(config['llm_max_ctx'])}")
+    log(f"[stage] llm max length: {int(config['llm_max_length'])}")
     block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
 
     ensure_alignment_artifact(
@@ -4917,6 +5984,7 @@ def main() -> None:
     stats_end(stats, "parse_alignment")
 
     plans_dir = out_dir / "plans"
+    style_dir = out_dir / "style"
 
     total_verses = len(verses)
 
@@ -5131,6 +6199,7 @@ def main() -> None:
             verses,
             comfy_url,
             plans_dir,
+            int(config["prompt_max_attempts"]),
         )
         write_json(debug_dir / "song_context_used.json", {
             "context": song_context,
@@ -5141,7 +6210,6 @@ def main() -> None:
 
     for block in blocks:
         block_i = int(block["block_index"])
-        kind = str(block["kind"])
         duration = max(0.1, float(block["duration"]))
         first_line = str(block.get("text", "")).splitlines()[0] if str(block.get("text", "")).splitlines() else ""
         first = first_line[:100]
@@ -5181,7 +6249,7 @@ def main() -> None:
                 shutil.rmtree(path)
             path.mkdir(parents=True, exist_ok=True)
 
-        if kind == "instrumental":
+        if not block_has_lyric_text(block):
             local_context = build_instrumental_local_context(
                 verses,
                 int(block.get("previous_verse_index", 0)),
@@ -5190,16 +6258,28 @@ def main() -> None:
         else:
             local_context = build_local_context(
                 verses,
-                int(block.get("verse_index", block_i)),
+                int(block.get("verse_index", block_i + 1)),
                 int(config["local_context_radius"]),
             )
 
-        block_video_style = effective_video_style(block_i, video_style, block_video_styles)
+        raw_style, style_source_id = choose_effective_style_source(block_i, video_style, block_video_styles)
+        style_contract, identity_contract = get_style_and_identity_contracts(
+            planner_template,
+            rules,
+            comfy_url,
+            style_dir,
+            debug_dir,
+            raw_style,
+            style_source_id,
+            block_i,
+            int(config["prompt_max_attempts"]),
+        )
         base_continuity = load_continuity_from_plans(plans_dir, block_i)
         part_continuity = list(base_continuity)
         subclip_paths: List[Path] = []
         subrange_infos: List[Dict[str, Any]] = []
         previous_subclip: Optional[Path] = None
+        range_visual_state: Dict[str, Any] = {}
 
         for subrange in subranges:
             sub_i = int(subrange["sub_index"])
@@ -5216,31 +6296,38 @@ def main() -> None:
             part_debug_dir.mkdir(parents=True, exist_ok=True)
             write_json(part_debug_dir / "planner_context.json", {
                 "block_index": block_i,
-                "block_kind": kind,
                 "subrange": subrange,
                 "video_style_source": video_style_report.get("blocks", {}).get(str(block_i), video_style_report.get("default", {})),
-                "video_style": block_video_style,
+                "style_source_id": style_source_id,
+                "style_contract": style_contract,
+                "identity_contract": identity_contract,
                 "song_context": song_context,
                 "local_context": local_context,
                 "current_block": current_instruction,
                 "continuity": part_continuity[-5:],
+                "range_visual_state": range_visual_state,
+                "subrange_continuity_instruction": continuity_instruction_for_subrange(subrange, range_visual_state),
             })
 
-            plan = run_comfy_planner(
+            plan = run_prompt_attempt_loop(
                 planner_template,
                 rules,
-                block_video_style,
-                song_context,
-                local_context,
-                current_instruction,
-                block_i,
-                kind,
                 comfy_url,
                 plans_dir,
+                part_debug_dir,
+                plan_base_name,
+                block_i,
+                str(block.get("text", "")),
+                current_instruction,
+                song_context,
+                local_context,
                 part_continuity,
-                plan_suffix=plan_suffix,
+                style_contract,
+                identity_contract,
+                int(config["prompt_max_attempts"]),
+                range_visual_state=range_visual_state,
+                subrange=subrange,
             )
-            copy_planner_artifacts_to_part_debug(plans_dir, plan_base_name, part_debug_dir)
 
             seeds = {
                 "image_seed": random_seed(),
@@ -5253,6 +6340,7 @@ def main() -> None:
 
             if sub_i == 1:
                 log("  [stage] queue start image")
+                free_comfy_memory(comfy_url, "before image generation")
                 iwf = patch_image_workflow(
                     image_template,
                     plan["image_prompt"],
@@ -5299,6 +6387,7 @@ def main() -> None:
             write_json(part_debug_dir / "video_patched.json", vwf)
 
             log("  [stage] queue video")
+            free_comfy_memory(comfy_url, "before video generation")
             pid, client_id = queue_prompt(vwf, comfy_url)
             log(f"  [video] prompt_id={pid}")
             vh = wait_history(pid, comfy_url, vwf, client_id)
@@ -5318,9 +6407,13 @@ def main() -> None:
             previous_subclip = subclip_local
             subclip_paths.append(subclip_local)
             scene_summary = str(plan.get("scene_summary", ""))
+            range_visual_state = build_range_visual_state_after_subrange(range_visual_state, subrange, plan)
             part_continuity.append({
                 "segment": f"{block_i}.{sub_i}",
                 "scene_summary": scene_summary,
+                "image_prompt": compact_for_llm(plan.get("image_prompt", ""), 600),
+                "video_prompt": compact_for_llm(plan.get("video_prompt", ""), 600),
+                "range_visual_state": range_visual_state,
             })
 
             subrange_info = {
@@ -5404,7 +6497,6 @@ def main() -> None:
             int(config["video_fps"]),
         )
         scale_info["block_index"] = block_i
-        scale_info["kind"] = str(block.get("kind", ""))
         scaling_report.append(scale_info)
         clips.append(clip_local)
     write_json(debug_dir / "clip_validation_report.json", validation_report)

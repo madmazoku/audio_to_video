@@ -2,7 +2,7 @@
   "1": {
     "inputs": {
       "model_path": "G:\\Git\\ComfyUI\\models\\text_encoders\\qwen3-4b-abl-q4_0.gguf",
-      "max_ctx": 4096,
+      "max_ctx": 8192,
       "gpu_layers": 31,
       "n_threads": 8,
       "is_locked": true
@@ -22,7 +22,7 @@
       "user_prompt": "PLACEHOLDER_USER_PROMPT",
       "model_type": "LLM-GGUF",
       "temperature": 0.25,
-      "max_length": 1536,
+      "max_length": 6144,
       "is_memory": "disable",
       "is_locked": "disable",
       "main_brain": "enable",

@@ -31,13 +31,24 @@ audio_to_video/
   run_rework_2.cmd
 
   rules/
+    song_context_parser_system.txt
+    song_context_parser_user.txt
     song_context_system.txt
     song_context_user.txt
-    block_planner_system.txt
-    block_planner_intro.txt
-    block_planner_verse.txt
-    block_planner_instrumental.txt
-    block_planner_outro.txt
+    song_context_critic_system.txt
+    song_context_critic_user.txt
+    style_condenser_parser_system.txt
+    style_condenser_parser_user.txt
+    style_condenser_system.txt
+    style_condenser_user.txt
+    style_condenser_critic_system.txt
+    style_condenser_critic_user.txt
+    semantic_planner_system.txt
+    semantic_planner_user.txt
+    prompt_writer_system.txt
+    prompt_writer_user.txt
+    prompt_critic_system.txt
+    prompt_critic_user.txt
     literal_scene_rules.txt
 
   data/
@@ -667,32 +678,60 @@ For lyric ranges, `range_visual_preroll_seconds` lets the semantic clip start sl
 
 Word-level karaoke is gap-aware: gaps between word timestamps are preserved instead of compressing all words together. Silent gaps inside the karaoke overlay are consumed without making the next word highlight early.
 
-Subtitle artifacts are lazy. `work/subs/karaoke.ass` is the full-song release subtitle file used by final rendering, `work/subs/preview_karaoke.ass` is the full-song preview karaoke subtitle file, `work/subs/preview_debug.ass` is the debug overlay, and `subtitle_preview.mp4` is a black-screen full-song preview video with audio, preview subtitles, and debug overlay. Existing files are reused until deleted or invalidated by `--refresh-alignment`. The preview is independent of `--limit`; a limited final render naturally burns only release subtitle events that fall inside the limited video/audio duration. The debug overlay is vector-drawn ASS graphics with three progress bars: full song progress with range/subrange boundary ticks, current range progress, and current subrange progress. Range labels use compact zero-based `Rnumber/count` labels without the range kind. `count` is always the total full-song range count, independent of `--limit`; this total is the maximum useful value for `--limit`. For example, `R000/027` through `R026/027` means `--limit 27` selects the whole song. Subranges use `Snumber/count`. `preview_debug.ass` is never used for the final video. This happens before song-context LLM, planner LLM, image generation, or video generation. Use `--preview-subtitles-only` to stop after this file is created.
+Subtitle artifacts are lazy. `work/subs/karaoke.ass` is the full-song release subtitle file used by final rendering, `work/subs/preview_karaoke.ass` is the full-song preview karaoke subtitle file, `work/subs/preview_debug.ass` is the debug overlay, and `subtitle_preview.mp4` is a black-screen full-song preview video with audio, preview subtitles, and debug overlay. Existing files are reused until deleted or invalidated by `--refresh-alignment`. The preview is independent of `--limit`; a limited final render naturally burns only release subtitle events that fall inside the limited video/audio duration. The debug overlay is vector-drawn ASS graphics with three progress bars: full song progress with range/subrange boundary ticks, current range progress, and current subrange progress. Range labels use compact zero-based `Rnumber/count` labels without section-type labels. `count` is always the total full-song range count, independent of `--limit`; this total is the maximum useful value for `--limit`. For example, `R000/027` through `R026/027` means `--limit 27` selects the whole song. Subranges use `Snumber/count`. `preview_debug.ass` is never used for the final video. This happens before song-context LLM, planner LLM, image generation, or video generation. Use `--preview-subtitles-only` to stop after this file is created.
 
 Intro, outro, and instrumental gaps use the same threshold predicate. A silent gap becomes its own semantic block only when its duration is at least `instrumental_gap_threshold`; shorter intro/outro gaps are merged into the nearest lyric range.
 
 Debug for ranges/subranges is written under `output/work/debug/ranges/range_NNN/`, with one folder per semantic range and one `part_MMM/` folder per internal subrange.
 
-## 10. Prompt priority
+## 10. LLM quality loop and prompt priority
 
-The planner receives a structured context. Effective priority:
+All LLM generation/evaluation stages use the same quality-loop shape:
 
 ```text
-VISUAL STYLE
-GLOBAL SONG CONTEXT
-LOCAL CONTEXT
-BRACKET DIRECTIVES
-FULL SEMANTIC RANGE LYRICS / RANGE TEXT
-CURRENT SUBRANGE TEXT, when present
+parser -> writer -> critic
+repeat until critic success=true or max attempts is reached
+
+The value returned to the rest of the pipeline is always the selected writer artifact. The critic never replaces the writer output; it only evaluates it, provides `success`/`score`/`issues`/`repairs`, drives retries, and determines which writer attempt is accepted or selected as `best_failed`.
 ```
 
-Visual style is the mandatory style contract. Current subrange text is the highest factual priority when a semantic block is split. Bracket directives are metadata and must not be rendered as visible text.
+The shared runner is `run_llm_quality_loop(...)`. Task-specific behavior lives in rule templates, not in custom orchestration branches. The current standardized LLM tasks are:
 
+```text
+song_context      -> song_context_parser -> song_context_writer -> song_context_critic
+style_condenser   -> style_condenser_parser -> style_condenser_writer -> style_condenser_critic
+prompt_generation -> semantic_planner     -> prompt_writer          -> prompt_critic
+```
 
+`prompt_generation` produces the coordinated image/video prompt package for one subrange. The semantic planner is the parser stage for that task: it parses the current subrange into the concrete event before the writer creates image/video prompts.
 
-### Future prompt generation architecture
+For every task the runner writes per-attempt metrics and selected-result metadata:
 
-The planned prompt-generation replacement is documented in [`PROMPT_GENERATION_PLAN.md`](PROMPT_GENERATION_PLAN.md). It uses an effective style contract, semantic planner, prompt writer, critic, and retry loop. `video_style_N.txt` is planned as a full zero-based range style override rather than a diff. No legacy single-pass prompt path is kept in that design.
+```text
+attempt_NNN/attempt_result.json
+attempts_summary.json
+attempts_full.json
+selected_result.json
+```
+
+If every attempt gets `success=false`, the highest-scored usable attempt is selected, a warning is written, and execution continues. Bad quality is therefore a warning/retry/selection issue, not a runtime stop. Runtime errors are reserved for technical failures such as missing rule files, missing workflow nodes, or no usable structured result after every attempt.
+
+JSON remains the official structured output protocol for LLM stages. Parser and writer stages do not own domain `success`; they only report technical status such as `json_parse_ok`, `structural_ok`, and `technical_error`. The critic is the only stage that owns `success`, `score`, `issues`, and `repairs`. If parser or writer JSON is invalid, the raw response and parse/structure error are passed into the normal critic stage; the critic returns a low-scored failed verdict and repair instructions for the next attempt. The runner does not silently repair malformed JSON, but it does strip common wrappers such as `<think>...</think>` and markdown fences before parsing.
+
+For subrange prompt generation, effective priority is:
+
+```text
+CURRENT SUBRANGE TEXT / highest factual action priority
+FULL SEMANTIC RANGE LYRICS / context around the current subrange
+IDENTITY CONTRACT / recurring visual identity and concrete anchors
+STYLE CONTRACT / rendering, camera, lighting, motion language
+GLOBAL SONG CONTEXT / continuity and recurring motifs
+LOCAL CONTEXT / nearby lyric context
+PREVIOUS VISUAL CONTEXT / continuity only
+BRACKET DIRECTIVES / metadata only
+```
+
+Current subrange text decides what happens. Identity/style/song context enrich the event but must not replace the local action. Bracket directives are metadata and must not be rendered as visible text.
 
 ### Action-oriented video prompts
 
@@ -751,51 +790,48 @@ Rules are plain text templates in `rules/`. They are versioned with the runner a
 
 ```text
 song_context_system.txt
-```
-
-System prompt for global song context generation.
-
-```text
 song_context_user.txt
 ```
 
-User prompt template for global song context. It receives song-level lyrics and visual style.
+System and user prompts for global song context generation.
 
 ```text
-block_planner_system.txt
+style_condenser_parser_system.txt
+style_condenser_parser_user.txt
+style_condenser_system.txt
+style_condenser_user.txt
+style_condenser_critic_system.txt
+style_condenser_critic_user.txt
 ```
 
-System prompt for per-block visual prompt generation.
+Parse the effective raw video style into source-grounded facts, condense those facts into separate `identity_contract` and `style_contract` outputs, then evaluate/repair them with the condenser critic. `video_style_N.txt` is a full range-specific override; if it is absent, global `video_style.txt` is used.
 
 ```text
-block_planner_intro.txt
+semantic_planner_system.txt
+semantic_planner_user.txt
 ```
 
-Planner template for intro blocks before the first lyric.
+Choose one main subject, one main action, and relevant identity anchors for the current range/subrange. This stage does not write image or video prompts.
 
 ```text
-block_planner_verse.txt
+prompt_writer_system.txt
+prompt_writer_user.txt
 ```
 
-Planner template for lyric/verse semantic blocks. It knows about full semantic range text and highest-priority current subrange text.
+Convert the semantic plan plus identity/style contracts into `scene_summary`, `image_prompt`, `video_prompt`, and `negative_prompt`.
 
 ```text
-block_planner_instrumental.txt
+prompt_critic_system.txt
+prompt_critic_user.txt
 ```
 
-Planner template for instrumental gaps. It creates a visual musical interlude without lyrics.
-
-```text
-block_planner_outro.txt
-```
-
-Planner template for outro blocks after the final lyric.
+Evaluate grounding, action quality, identity preservation, and continuity; return `success`, `score`, `issues`, and `repairs`. The critic does not replace the writer prompt package.
 
 ```text
 literal_scene_rules.txt
 ```
 
-Shared rules that keep the visual plan grounded in current lyrics/subrange facts and prevent visible text.
+Shared rules that keep visual planning grounded in current lyrics/subrange facts and prevent visible text.
 
 Edit rules when you want to change prompt behavior. Do not put rules in `input/`; they are part of the algorithm, not song data.
 
@@ -819,8 +855,6 @@ Default technical/timeline configuration:
   "clip_duration_tolerance_ratio": 0.05,
   "recommended_workflow_seconds": 12,
   "max_workflow_seconds": 16,
-  "instrumental_gap_min_seconds": 8.0,
-  "instrumental_gap_min_ratio_of_median_verse": 0.5,
   "local_context_radius": 2,
   "range_visual_preroll_seconds": 0.25,
   "subtitle_line_preroll_seconds": 0.25,
@@ -844,8 +878,7 @@ The instrumental gap threshold is:
 
 ```text
 max(
-  instrumental_gap_min_seconds,
-  median_verse_duration * instrumental_gap_min_ratio_of_median_verse
+  explicit non-lyrical blocks from lyrics.txt
 )
 ```
 
@@ -1085,3 +1118,78 @@ Diagnostic files:
 - `work/debug/alignment_match_report.json`
 - `work/debug/alignment_match_report.txt`
 
+
+## Prompt generation architecture
+
+Visual prompt generation now uses a multi-stage pipeline instead of a single-pass planner:
+
+1. Effective style selection: `video_style_N.txt` fully overrides `video_style.txt` for zero-based range `N`; otherwise the global style is used.
+2. Style condenser parser: the effective raw style is parsed into source-grounded identity/style facts without condensation.
+3. Style condenser writer: the parsed facts are condensed into `identity_contract` and `style_contract` under `work/style/`.
+4. Style condenser critic: evaluates whether the parser/writer preserved distinctive concrete identity/style anchors from the raw style and returns repairs for the next attempt. It does not replace the writer contract.
+5. Semantic planner: selects one main subject, one main action, and relevant identity anchors for the current subrange.
+6. Prompt writer: turns the semantic plan into `scene_summary`, `image_prompt`, `video_prompt`, and `negative_prompt`.
+7. Prompt critic: evaluates grounding/action quality/identity preservation/continuity and returns `success`, `score`, `issues`, and `repairs`. It does not replace the writer prompt package.
+
+LLM tasks use the same quality-loop policy: parser/generator output flows into writer output, then a task-specific critic checks the writer artifact. The selected result returned to the pipeline is always the writer artifact from the accepted/highest-scored usable attempt. The full attempt is retried up to `prompt_max_attempts` and selected by `success` first or best overall `score` if all attempts fail. A quality failure such as weak identity, generic style condensation, or a mediocre prompt is a warning and does not interrupt generation. Runtime failures are reserved for technical problems such as no usable JSON/schema after every attempt.
+
+Each attempt prints a concise stdout metric line with `success`, `score`, issue count, and repair count. If no attempt succeeds, the highest-scored failed attempt is used so generation can continue; stdout reports which attempt was selected and writes a warning. Debug summaries are written to `attempts_summary.json` and full attempt data to `attempts_full.json` under each task directory, for example `work/debug/style/<source>/` and `work/debug/prompts/RNNN_SMMM/`.
+
+See `PROMPT_GENERATION_PLAN.md` for the full design.
+
+
+## LLM context window
+
+`data/config.json` contains `llm_max_ctx`. The runner treats this as the source of truth for the local LLM context window and patches the ComfyUI LLM workflow (`workflows/planner_visual_prompts_api.json`) at runtime by updating every node that exposes a `max_ctx` input.
+
+Default:
+
+```json
+"llm_max_ctx": 8192
+```
+
+You can override it per project with `input/config.json`:
+
+```json
+{
+  "llm_max_ctx": 16384
+}
+```
+
+The runner also logs an approximate token count for every LLM stage so context pressure is visible in the console and in debug workflows.
+
+### LLM context and response length
+
+`data/config.json` controls both LLM context window and generated response length:
+
+```json
+{
+  "llm_max_ctx": 8192,
+  "llm_max_length": 6144
+}
+```
+
+`llm_max_ctx` patches workflow nodes with `max_ctx` and controls the prompt/context window.
+`llm_max_length` patches workflow nodes with `max_length` and controls how many tokens the LLM may generate.
+Thinking output such as `<think>...</think>` is allowed. The runner strips visible thinking text during JSON extraction, but those tokens still consume `llm_max_length`, so keep `llm_max_length` high enough for thinking models.
+
+## Same-range subrange continuity
+
+Subranges inside one semantic range are treated as continuation shots by default, not as independent scene prompts.
+
+Splitting now prefers complete lyric-line boundaries and uses the smallest number of subranges that fits under `max_workflow_seconds`. This avoids broken fragments such as `There are no` / `treats...`, which can make adjacent subranges drift into different scenes.
+
+Config flags:
+
+```json
+{
+}
+```
+
+Subrange splitting is deterministic and not configurable: it first uses lyric line boundaries, then refines only oversized pieces with word boundaries, then uses near-equal mechanical chunks only when natural lyric boundaries are still insufficient.
+
+During prompt generation, the first subrange establishes a `range_visual_state`; later subranges receive this state and must preserve the same main subject, location, scale, palette, and identity/world lens unless their current lyric text explicitly changes them. The action and visible consequence should evolve with the current subrange, but the subject/world should not be redesigned inside one range.
+
+### Lyrics block structure
+
+`lyrics.txt` is the authoritative song structure. Every segment separated by `***` becomes exactly one ordered song block. Blocks may contain lyrics, only bracket metadata, or no text at all. Metadata-only and empty blocks are preserved as non-lyrical sections and receive timing from the gap between neighboring lyrical blocks or the audio edge. The runner does not create extra instrumental ranges from detected gaps; explicit `***` structure controls the ranges.

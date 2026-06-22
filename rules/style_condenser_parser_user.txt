@@ -1,0 +1,67 @@
+Parse RAW VIDEO STYLE into source-grounded visual facts.
+
+Style source id: {{STYLE_SOURCE_ID}}
+Range index if range-specific: {{BLOCK_INDEX}}
+
+RAW VIDEO STYLE:
+{{RAW_VIDEO_STYLE}}
+
+PREVIOUS FAILED RESULT / REPAIR CONTEXT:
+{{PREVIOUS_RESULT_JSON}}
+
+Return ONLY valid JSON with exactly these keys:
+{
+  "identity_source_facts": {
+    "distinctive_world_or_aesthetic_labels": [],
+    "character_or_faction_terms": [],
+    "creature_or_species_terms": [],
+    "costume_or_body_design_terms": [],
+    "location_or_architecture_terms": [],
+    "prop_symbol_technology_or_object_terms": [],
+    "recurring_motifs_or_rituals": [],
+    "tone_identity_terms": [],
+    "anti_generic_clues": []
+  },
+  "style_source_facts": {
+    "positive_rendering_medium_terms": [],
+    "positive_rendering_technique_terms": [],
+    "positive_camera_composition_terms": [],
+    "positive_lighting_color_texture_terms": [],
+    "positive_motion_animation_terms": [],
+    "positive_pacing_editing_terms": [],
+    "negative_rendering_medium_terms": [],
+    "negative_rendering_technique_terms": [],
+    "negative_style_terms": [],
+    "negative_content_terms": [],
+    "ambiguous_or_conflicting_style_terms": []
+  },
+  "source_constraints": {
+    "must_preserve_exact_or_near_exact_terms": [],
+    "must_not_invent_beyond_source": [],
+    "ambiguous_or_sparse_source_notes": []
+  }
+}
+
+HARD SOURCE-GROUNDING:
+- Extract only terms actually present in RAW VIDEO STYLE or direct near-synonyms that preserve the same meaning.
+- Do not invent genre, era, location, technology, medium, species, character, color palette, or plot.
+- Do not use examples from these instructions as facts.
+- If RAW VIDEO STYLE does not say a term positively, do not put it in positive facts.
+- If RAW VIDEO STYLE forbids a term, put it only in negative facts.
+
+POSITIVE MEDIUM EXTRACTION:
+- Rendering medium means the visual form: anime, 2D animation, 3D render, CGI, live action, documentary footage, claymation, oil painting, watercolor, pixel art, manga, comic book, pencil sketch, VHS footage, etc.
+- Put desired visual media in positive_rendering_medium_terms.
+- Put rendering methods in positive_rendering_technique_terms: cel shading, hand-drawn lineart, painterly backgrounds, flat colors, volumetric lighting, film grain, etc.
+- Do not collapse medium into mood words like cinematic, epic, grim, surreal, beautiful.
+
+NEGATIVE EXTRACTION:
+- Extract negative constraints only from explicit negative language in RAW VIDEO STYLE: "no", "not", "never", "avoid", "without", "must not", "do not", "negative constraints".
+- Preserve full forbidden phrases. Example: if RAW says "no manga speech bubbles", the negative is "manga speech bubbles", NOT "manga" and NOT "anime".
+- If a term appears as a positive required medium, do NOT also put it in negative terms unless RAW explicitly forbids that exact same term in a separate contradiction. Put contradictions in ambiguous_or_conflicting_style_terms.
+- Keep negative rendering medium separate from negative content. Example: "no 3D render" is negative_rendering_medium_terms; "no readable text" is negative_content_terms.
+
+IDENTITY VS STYLE:
+- Identity facts are recurring world, characters, species, props, locations, symbols, rituals, costumes, factions.
+- Style facts are rendering medium, camera, motion, lighting, palette, texture, pacing.
+- If RAW VIDEO STYLE says anchors should be used selectively or are not required in every shot, preserve that in anti_generic_clues or source_constraints.
