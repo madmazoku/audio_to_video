@@ -1,4 +1,4 @@
-Condense the parsed source facts into compact reusable identity and style contracts.
+Condense parsed source facts into compact reusable identity and style contracts.
 
 Style source id: {{STYLE_SOURCE_ID}}
 Range index if range-specific: {{BLOCK_INDEX}}
@@ -17,17 +17,10 @@ Return ONLY valid JSON with exactly these top-level keys:
   "style_contract": {
     "visual_style_summary": "",
     "required_style_prefix": "",
-    "required_medium_terms": [],
-    "required_rendering_techniques": [],
     "cinematography_rules": [],
     "motion_style_rules": [],
     "lighting_color_texture_rules": [],
-    "pacing_editing_rules": [],
     "allowed_style_elements": [],
-    "negative_medium_terms": [],
-    "negative_style_terms": [],
-    "negative_content_terms": [],
-    "ambiguous_or_conflicting_style_notes": [],
     "style_must_not": []
   },
   "identity_contract": {
@@ -35,7 +28,6 @@ Return ONLY valid JSON with exactly these top-level keys:
     "required_recurring_anchors": [],
     "optional_anchor_pool": [],
     "character_or_faction_anchors": [],
-    "creature_or_species_anchors": [],
     "location_anchors": [],
     "prop_or_symbol_anchors": [],
     "style_continuity_rules": [],
@@ -44,43 +36,33 @@ Return ONLY valid JSON with exactly these top-level keys:
   }
 }
 
-CATASTROPHIC DRIFT PREVENTION:
+Compatibility note:
+- Keep exactly these fields because the runner structurally requires the older core contract fields.
+- Do not add extra arrays such as separate negative_medium_terms, negative_style_terms, or parser copies.
+
+Compact output limits:
+- Summaries and anchor_usage_rule: max 16 words each.
+- required_style_prefix: max 10 words.
+- Each array max 5 items; optional_anchor_pool max 7.
+- Each array item max 6 words.
+- No explanations, no copied paragraphs, no examples, no duplicate meaning.
+
+Universal source rules:
 - Every non-empty field must be grounded in PARSED SOURCE FACTS or RAW VIDEO STYLE.
-- Never invent a different visual world, genre, era, medium, setting, technology, species, character, location, or color palette.
-- Any genre label, era label, setting type, rendering medium, visual technology, character type, location type, species/type of subject, or aesthetic label may appear only if PARSED SOURCE FACTS supports it as a positive source term or a direct neutral paraphrase. Do not introduce unrelated styles, genres, worlds, technologies, eras, places, species, protagonists, or media forms merely because they are visually common, cinematic, or plausible.
-- If PARSED SOURCE FACTS lists a term under negative_* facts, do not put it in positive style fields.
+- Do not invent unrelated medium, genre, era, world, species, technology, setting, palette, character, or plot.
+- style_must_not contains only explicit source negatives plus pipeline safety: current lyrics remain primary; no idle/camera-only clips.
+- Never put a required positive medium/technique/style into style_must_not. If the source itself conflicts, preserve the positive source term and mention the conflict compactly in style_must_not only if it is explicit.
+- No project-default bans: only source-grounded negatives belong in style_must_not.
 
-STYLE CONTRACT RULES:
-- required_style_prefix must be a short reusable prompt prefix built only from positive_rendering_medium_terms and positive_rendering_technique_terms.
-- required_style_prefix should be strong enough to copy into image_prompt/video_prompt verbatim.
-- required_medium_terms must copy the strongest positive_rendering_medium_terms.
-- required_rendering_techniques must copy the strongest positive_rendering_technique_terms.
-- visual_style_summary must summarize positive medium/look/palette from source facts, not the narrative world.
-- negative_medium_terms must copy explicit forbidden media from negative_rendering_medium_terms and negative_rendering_technique_terms.
-- negative_style_terms must copy explicit forbidden style/look terms.
-- negative_content_terms must copy explicit forbidden content terms.
-- style_must_not should include operational constraints: do not override lyrics, do not invent forbidden medium, do not turn anchors into main subjects, do not produce idle/camera-only motion.
+Style contract rules:
+- required_style_prefix is a short copyable prompt prefix from positive source medium/technique/look.
+- visual_style_summary summarizes medium/look/palette, not narrative plot.
+- allowed_style_elements are desired source motifs/styles, not required every-clip content.
 
-IDENTITY CONTRACT RULES:
-
-CONCRETE ANCHOR DEMOTION GATE:
-- Before adding anything to required_recurring_anchors, apply this test: can this phrase modify almost any lyric-chosen scene without selecting a visible subject, location, object, destination, faction, ritual, landmark, or plot beat? If no, it is a concrete anchor and MUST be demoted out of required_recurring_anchors.
-- required_recurring_anchors may contain broad identity invariants only: overall world identity, broad subject/body class, universal design lens, universal tone/setting class, or required medium-linked identity. Keep them short and abstract.
-- required_recurring_anchors MUST NOT contain named characters, rulers, protagonists, factions, armies, iconic landmarks, buildings, monuments, thrones/seats, vehicles, weapons, tools, relics, symbols, ritual acts, destinations, or one-off locations unless RAW VIDEO STYLE explicitly says that exact element must appear in every scene or every clip.
-- style_continuity_rules must also stay abstract. They may preserve rendering consistency, palette family, tone, body/design logic, broad world class, or atmosphere. They MUST NOT contain a concrete visual item as a repeated requirement.
-- If a concrete motif is important, place it into optional_anchor_pool, character_or_faction_anchors, location_anchors, or prop_or_symbol_anchors.
-- If unsure whether an anchor is broad or concrete, treat it as concrete and demote it. Under-forcing is safer than over-forcing.
-- Do not put desired world elements into avoid_generic_drift. avoid_generic_drift is only for forbidden generic drift destinations, not for wanted identity anchors.
-
-- identity_summary must name the distinctive source world/identity using source nouns.
-- required_recurring_anchors has a narrow meaning: only broad invariants that should shape nearly every clip without choosing the plot. Examples of acceptable types are the overall world identity, the primary species/body type, or a required universal design lens. Do not place named rulers, iconic landmarks, special props, monuments, vehicles, weapons, factions, rituals, or one-off locations here unless the raw source explicitly says they must appear in every scene/clip.
-- If the source says an anchor is recurring, iconic, selective, occasional, "when relevant", or "when lyrics imply it", put it in optional_anchor_pool, character_or_faction_anchors, location_anchors, or prop_or_symbol_anchors, not required_recurring_anchors.
-- It is acceptable for required_recurring_anchors to be empty or very short. Prefer under-including here over over-forcing the same subject/setting into every range.
-- Put additional props, locations, factions, rituals, symbols, landmarks, and named characters into optional_anchor_pool, character_or_faction_anchors, location_anchors, and prop_or_symbol_anchors.
-- anchor_usage_rule must explicitly say that current lyrics choose the main subject/action/setting; anchors are optional supporting continuity unless the current lyrics mention or clearly imply them.
-- Preserve selective-use warnings from parsed facts when present. If a source warns that anchors are not mandatory subjects, reflect that by demoting those anchors out of required_recurring_anchors.
-
-QUALITY TARGET:
-- Compact but not generic.
-- Source-grounded but operational.
-- The output should make later prompts preserve the required visual medium without letting recurring anchors dominate every scene.
+Identity anchor demotion:
+- required_recurring_anchors are broad invariants only: overall identity/world class, subject/body class, tone class, or universal design lens.
+- Do NOT place named characters, factions, iconic landmarks, seats, monuments, vehicles, weapons, tools, relics, symbols, rituals, destinations, or one-off locations in required_recurring_anchors unless the source explicitly says they appear in every clip.
+- Concrete motifs go into optional_anchor_pool, character_or_faction_anchors, location_anchors, or prop_or_symbol_anchors.
+- style_continuity_rules must stay abstract: rendering consistency, palette family, tone, body/design logic, broad world class, atmosphere.
+- If unsure, demote the anchor. Under-forcing is safer than over-forcing.
+- anchor_usage_rule must say current lyrics choose main subject/action/setting; anchors are optional support unless lyrics mention or imply them.

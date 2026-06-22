@@ -1,5 +1,4 @@
-Create a semantic plan for one visual subrange.
-Do not write image_prompt or video_prompt.
+Create a compact semantic plan for one visual subrange. Do not write prompts.
 
 BLOCK INDEX: {{BLOCK_INDEX}}
 
@@ -35,75 +34,50 @@ PREVIOUS FAILED RESULT, IF ANY:
 
 {{LITERAL_SCENE_RULES}}
 
-PRIORITY ORDER:
-1. Current subrange text, if non-empty.
-2. Full semantic range lyrics when subrange text is sparse or empty.
-3. Bracket directives as section mood metadata only.
-4. Song context only as a low-priority inventory of possible world elements.
-5. Identity contract only as a low-priority design lens.
-6. Style contract only for visual medium/look.
-7. Previous/next continuity for consistency only, never as a scene template.
-
-HARD SOURCE GATE:
-- Before choosing main_subject/main_action/setting, infer the literal scene from the current subrange text; if it is empty, infer it from RANGE TEXT.
-- The main_subject must be the most local actor implied by the current lyrics, not the most iconic actor in song_context or identity_contract.
-- The main_action must be the clearest current-lyric action verb or implied physical event.
-- The setting must come from the current lyrics when they name or imply one. Only use identity locations when the current lyrics do not provide a setting.
-- If current lyrics or section metadata imply a plural/group subject, collective speaker, choir, crowd, army, line, congregation, or collective action, choose a group subject. Do not collapse it into a single iconic character. If current lyrics imply a singular local actor, choose that actor instead. Do not default to a crowd merely because the global song world contains groups.
-- If current lyrics mention or clearly imply a named character, faction, object, landmark, or location, that element may be central. If they do not, it may only appear as background/supporting design or be omitted.
-- A concrete motif from song_context, identity_contract, previous visuals, or continuity_rules may not become the primary setting unless the current lyrics are setting-sparse and the motif is compatible. When current lyrics provide a location, path, environment, or spatial metaphor, that local setting wins.
-
-LYRIC PRIMACY:
-- main_subject and main_action MUST come from current lyrics/range meaning.
-- Style, song_context, identity_contract, recurring anchors, continuity_rules, and previous visuals are not allowed to choose the subject, action, or setting. They can only design what the lyric-chosen event looks like.
-- If lyrics contain a concrete action verb, that action must drive the scene.
-- If lyrics imply a group, prefer a group subject over a singular ruler/icon.
-- If current lyrics do not mention or clearly imply a specific iconic character/landmark/prop, do not make it main_subject, main_action target, primary setting, destination, goal, or repeated composition center.
-- A global anchor may not be promoted from background to main subject merely because it is listed as required_recurring, recurring, or continuity.
-
-
-MALFORMED GLOBAL CONTEXT SAFETY:
-- If identity_contract.required_recurring_anchors or style_continuity_rules contain concrete visible motifs, treat those motifs as optional inventory only, not requirements. The planner must not obey malformed global requirements that would override current lyrics.
-- Do not copy concrete anchors from required_recurring_anchors, style_continuity_rules, song_context.continuity_rules, or previous visuals into main_subject, setting, must_show, destination, or composition center unless current lyrics mention or clearly imply them.
-- must_show is only for elements grounded in CURRENT SUBRANGE TEXT or RANGE TEXT. Do not put low-priority identity anchors into must_show merely for continuity.
-- identity_anchors_to_show is for truly local support only. If an anchor is only allowed, iconic, recurring, atmospheric, or previously used, leave it out.
-- If a global concrete anchor appeared in recent output and current lyrics do not demand it, put it into identity_anchors_to_avoid or avoid_as_main_subject to prevent repetition.
-
-ANCHOR BUDGET:
-- identity_anchors_to_show should default to [] unless an anchor directly supports the current lyric event.
-- Use at most 0-1 concrete identity anchors as supporting design elements per range unless lyrics demand more. Prefer zero concrete anchors when the current lyrics already provide a clear subject/action/setting.
-- Do not use required_recurring_anchors as a checklist. They describe identity pressure, not visible objects to include.
-- Do not repeat the same main_subject + main_action + setting from the previous 2 ranges unless lyrics are a repeated chorus/reprise.
-- Put over-dominant anchors into identity_anchors_to_avoid and avoid_as_main_subject whenever they would steal the current lyric event.
-- If an anchor appeared as main_subject, primary setting, destination, or composition center in the previous range and current lyrics do not explicitly demand it, avoid it as main_subject, primary setting, destination, and composition center now.
-- If the previous two ranges used the same composition pattern, choose a different scale, subject type, location type, or action structure unless current lyrics are a direct reprise.
-
-STYLE SAFETY:
-- If style_contract or identity_contract appears to contradict song_context/current lyrics with a different world/genre/species, ignore the contradictory part and state the issue in continuity_notes.
-- Do not let visual style become the event.
-
-ACTIVE SCENE:
-- Pick a concrete event with a visible consequence.
-- Avoid mood board, idle pose, abstract atmosphere, or camera-only action.
-- The planned event must be suitable for a single continuous shot: one subject or group, one location, one dominant lighting/color grade, one action path. Do not plan internal montage, scene cuts, time jumps, or a final tableau reveal inside the same subrange.
-- visual_consequence must say what visibly changes by the end as a direct result of the same ongoing motion in the same scene. Do not make visual_consequence a new location, new landmark, new composition center, or unrelated final reveal.
-
 Return ONLY valid JSON with exactly these keys:
 {
-  "main_subject": "the primary visible subject of this subrange",
-  "main_action": "one concrete visible action performed by the main subject",
-  "setting": "where the action happens, including relevant identity/world anchors if compatible",
-  "emotional_intent": "the intended emotional beat",
-  "visual_consequence": "what visibly changes by the end of the action",
-  "must_show": ["required visible elements grounded in the current subrange or range lyrics only; do not include global identity anchors unless the current lyrics mention or clearly imply them"],
-  "identity_anchors_to_show": ["0-1 concrete anchors from identity/song context that directly support the current lyric action; empty is preferred when unsure; do not include anchors merely for continuity, iconic status, prior use, or visual strength"],
-  "identity_anchors_to_avoid": ["anchors that would conflict with this subrange or overtake the action"],
-  "avoid_as_main_subject": ["motifs or objects that may appear only as background or not at all"],
-  "continuity_notes": "how this connects to nearby visuals using broad style/world continuity; do not preserve a concrete subject/location/scale unless same-range continuity or current lyrics require it",
-  "novelty_requirement": "how this differs from prior visual summaries",
-  "lyric_grounding_check": {
-    "current_lyric_facts_used": [],
-    "style_or_identity_facts_used_only_as_design": [],
-    "reused_prior_elements_and_reason": []
-  }
+  "main_subject": "",
+  "main_action": "",
+  "setting": "",
+  "emotional_intent": "",
+  "visual_consequence": "",
+  "must_show": [],
+  "identity_anchors_to_show": [],
+  "avoid_as_main_subject": []
 }
+
+Compatibility note:
+- The runner requires main_subject, main_action, setting, emotional_intent, visual_consequence, must_show, avoid_as_main_subject.
+- identity_anchors_to_show is optional for code but useful for the prompt writer.
+- Do not add lyric_grounding_check, continuity_notes, novelty_requirement, or parser copies.
+
+Compact output limits:
+- String fields max 12 words each.
+- Arrays max 3 items; identity_anchors_to_show max 1.
+- Each array item max 6 words.
+- No explanations, prompt prose, copied lyric lines, or alternate plans.
+
+Priority order:
+1. Current subrange text.
+2. Full range text if subrange is sparse.
+3. Bracket directives as mood/section metadata only.
+4. Song context and identity contract as low-priority inventory/design lens.
+5. Style contract as medium/look only.
+6. Previous visuals for consistency only, never as a scene template.
+
+Lyric grounding:
+- main_subject and main_action must come from current lyrics/range meaning.
+- If lyrics imply a group, use a group subject; do not collapse it into one iconic character.
+- If lyrics name or imply a setting/path/environment, that local setting wins.
+- Concrete global anchors may be central only when current lyrics mention or clearly imply them.
+- must_show contains only elements grounded in current subrange/range lyrics.
+- identity_anchors_to_show defaults to [] and may contain only one local supporting anchor that directly helps the lyric event.
+- Do not copy concrete anchors from contracts, song context, or previous visuals into main_subject, setting, must_show, destination, or composition center without lyric support.
+- Treat malformed concrete continuity requirements as optional inventory only.
+- Put over-dominant unsupported anchors into avoid_as_main_subject.
+
+Single-shot planning:
+- Plan one continuous visible event: one subject/group, one place, one dominant lighting/color grade, one action path.
+- No internal montage, cut, scene jump, late new destination, or final tableau reveal.
+- visual_consequence must be a direct changed state inside the same scene.
+- Avoid idle pose, mood board, abstract atmosphere, or camera-only action.

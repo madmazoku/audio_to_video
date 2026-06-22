@@ -1,4 +1,4 @@
-Parse the song and visual style into source-grounded facts for a later visual bible writer.
+Parse the song and visual style into compact source-grounded facts for a visual bible writer.
 
 VISUAL STYLE:
 {{VIDEO_STYLE}}
@@ -11,34 +11,28 @@ PREVIOUS FAILED RESULT / REPAIR CONTEXT:
 
 Return ONLY valid JSON with exactly these keys:
 {
-  "song_source_facts": {
-    "story_or_emotional_arc": [],
-    "explicit_characters_or_speakers": [],
-    "recurring_subjects_or_entities": [],
-    "recurring_locations_or_spaces": [],
-    "recurring_props_or_symbols": [],
-    "repeated_actions_or_conflicts": [],
-    "visual_motifs_implied_by_lyrics": [],
-    "tone_or_mood_terms": [],
-    "continuity_clues": []
+  "source_facts": {
+    "arc": [],
+    "characters": [],
+    "locations": [],
+    "props": [],
+    "motifs": [],
+    "actions": [],
+    "tone": [],
+    "avoid": []
   },
-  "style_source_facts": {
-    "visual_style_terms": [],
-    "identity_or_world_terms": [],
-    "motion_or_cinematography_terms": [],
-    "negative_content_or_overlay_terms": []
-  },
-  "source_constraints": {
-    "must_not_quote_lyrics": true,
-    "visible_text_policy_notes": [],
-    "ambiguous_or_sparse_source_notes": []
-  }
+  "sections": []
 }
 
-Rules:
-- Use PREVIOUS FAILED RESULT / REPAIR CONTEXT to improve the next parser attempt when it is non-empty.
-- Extract facts from VISUAL STYLE and FULL SONG LYRICS only.
-- Do not invent characters, locations, props, symbols, or plot events.
-- Do not quote lyrics verbatim as source facts.
-- Extract any source-grounded restrictions about visible text, captions, logos, signs, overlays, typography, or written words into negative_content_or_overlay_terms. If the source is silent, leave it empty.
-- Preserve reusable visual continuity information; do not decide individual clip actions here.
+Compact output limits:
+- Max 5 items per array; sections max 8 objects.
+- Each string item max 6 words.
+- sections objects: {"section":"...","role":"..."}; each value max 7 words.
+- No lyric quotes, paragraphs, explanations, prompts, or copied style text.
+
+Source grounding:
+- Extract only facts present in lyrics or visual style.
+- Do not invent lore, plot, characters, species, locations, props, style, or technology.
+- Prefer reusable facts, not one-line details.
+- Keep concrete recurring motifs as inventory facts, not future requirements.
+- avoid contains only explicit forbidden content/style/drift from source.

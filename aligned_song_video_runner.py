@@ -404,12 +404,14 @@ def queue_prompt(workflow: Dict[str, Any], comfy_url: str, client_id: Optional[s
 
 
 
-def free_comfy_memory(comfy_url: str, reason: str = "") -> None:
+def free_comfy_memory(comfy_url: str, reason: str = "", sleep_time: Optional[float] = None) -> None:
     """Best-effort ComfyUI VRAM/cache cleanup.
 
     This only asks the ComfyUI server process to unload models/free memory.
     It is intentionally non-fatal: unsupported endpoints or transient errors
     should not stop generation.
+    When sleep_time is provided, wait that many seconds after a successful
+    free-memory request.
     """
     payload = {"unload_models": True, "free_memory": True}
     base = comfy_url.rstrip("/")
@@ -422,6 +424,11 @@ def free_comfy_memory(comfy_url: str, reason: str = "") -> None:
                 continue
             r.raise_for_status()
             log(f"  [comfy] free memory ok{label}: {path}")
+            if sleep_time is not None:
+                wait_seconds = max(0.0, float(sleep_time))
+                if wait_seconds:
+                    log(f"  [comfy] wait after free memory: {wait_seconds:.1f}s")
+                    time.sleep(wait_seconds)
             return
         except Exception as exc:
             log(f"  [comfy] free memory failed{label}: {path}: {exc}")
@@ -4272,7 +4279,7 @@ def run_llm_quality_loop(
     previous_result: Optional[Dict[str, Any]] = None
     max_attempts = max(1, int(max_attempts))
 
-    free_comfy_memory(comfy_url, f"before {display_name} llm loop")
+    free_comfy_memory(comfy_url, f"before {display_name} llm loop", sleep_time=1)
 
     for attempt in range(max_attempts):
         attempt_dir = task_dir / f"attempt_{attempt:03d}"
@@ -6340,7 +6347,7 @@ def main() -> None:
 
             if sub_i == 1:
                 log("  [stage] queue start image")
-                free_comfy_memory(comfy_url, "before image generation")
+                free_comfy_memory(comfy_url, "before image generation", sleep_time=1.0)
                 iwf = patch_image_workflow(
                     image_template,
                     plan["image_prompt"],
@@ -6387,7 +6394,7 @@ def main() -> None:
             write_json(part_debug_dir / "video_patched.json", vwf)
 
             log("  [stage] queue video")
-            free_comfy_memory(comfy_url, "before video generation")
+            free_comfy_memory(comfy_url, "before video generation", sleep_time=1.0)
             pid, client_id = queue_prompt(vwf, comfy_url)
             log(f"  [video] prompt_id={pid}")
             vh = wait_history(pid, comfy_url, vwf, client_id)

@@ -1,4 +1,4 @@
-Create a compact visual bible for a music video from the parsed source facts.
+Create a compact visual bible for a music video from parsed source facts.
 
 PARSED SONG FACTS:
 {{PARSED_SONG_JSON}}
@@ -9,51 +9,33 @@ PARSER TECHNICAL STATUS:
 PREVIOUS FAILED RESULT / REPAIR CONTEXT:
 {{PREVIOUS_RESULT_JSON}}
 
-Single-clip motion principle:
-- Song-level continuity should not ask future ranges to resolve into a central landmark, repeated destination, final reveal, or montage formula.
-- Preserve broad style/world continuity across ranges, but let each generated range be a continuous motion event grounded in its own lyrics.
-
 Return ONLY valid JSON with exactly these keys:
 {
-  "song_summary": "short summary of the whole song's story and emotional arc",
-  "main_characters": ["..."],
-  "recurring_locations": ["..."],
-  "recurring_props": ["..."],
-  "visual_motifs": ["..."],
-  "tone": "...",
-  "continuity_rules": ["..."],
+  "song_summary": "",
+  "main_characters": [],
+  "recurring_locations": [],
+  "recurring_props": [],
+  "visual_motifs": [],
+  "tone": "",
+  "continuity_rules": [],
   "avoid": []
 }
 
+Compatibility note:
+- Keep exactly these fields because the runner structurally requires them.
+- Do not add parser copies, section maps, explanations, or alternate context objects.
+
+Compact output limits:
+- song_summary and tone: max 16 words.
+- Each array max 5 items; visual_motifs max 6.
+- Each array item max 6 words.
+- No lyrics, no paragraph explanations, no image/video prompts.
+
 Rules:
-- Use PARSED SONG FACTS as the main source. Do not require the full lyrics here; the parser already extracted the reusable facts.
-- If PARSER TECHNICAL STATUS reports json_parse_ok=false or structural_ok=false, still return the required JSON shape using the available technical/error context and repair notes; keep fields compact.
-- Use PREVIOUS FAILED RESULT / REPAIR CONTEXT to improve the next attempt when it is non-empty.
-- Keep it compact: short strings and short lists only.
-- Do not quote the lyrics.
-- Do not invent lore, characters, locations, props, symbols, genres, worlds, or settings not grounded in parsed facts.
-- Focus on reusable visual context for intro, verse clips, subranges, and outro.
-- Do not decide the action, subject, composition, or setting for any future subrange; current subrange lyrics will decide that later.
-
-INVENTORY VS DIRECTIVE:
-- main_characters, recurring_locations, recurring_props, and visual_motifs are inventory lists only. They must not imply that those items appear in every clip.
-- A recurring item means "available for use when locally relevant", not "must be central everywhere".
-- Do not convert an inventory item into a continuity rule.
-
-CONTINUITY RULES MUST STAY ABSTRACT:
-
-CONCRETE MOTIF TEST FOR CONTINUITY_RULES:
-- If a continuity rule would cause a future prompt to show a specific visible thing, place, character, prop, faction, ritual, or destination, it is too concrete. Move that item to inventory and keep the rule abstract.
-- continuity_rules should read like constraints on how scenes are designed, not like a checklist of what appears on screen.
-
-- continuity_rules must preserve only broad continuity: overall world identity, tone, rendering consistency, palette/atmosphere, body/species rules, and broad design logic.
-- continuity_rules must be low-priority and must explicitly avoid overriding future current-range/subrange lyrics.
-- Do not put named characters, iconic landmarks, special props, monuments, vehicles, weapons, factions, rituals, one-off locations, or section-specific motifs into continuity_rules unless parsed facts explicitly say they must appear in every clip.
-- Do not write rules of the form "use/show/center/return to [specific concrete motif]" unless the source explicitly requires that motif in every clip.
-- If a motif is important but not mandatory in every clip, keep it only in main_characters, recurring_locations, recurring_props, or visual_motifs.
-- If the source implies a motif is triggered by certain lyrics/sections, keep it as inventory; do not turn it into a global rule.
-
-AVOID FIELD:
-- avoid should contain only forbidden content, overlay/text/logo restrictions, or known drift risks grounded in parsed facts or style source facts. Do not add default text/logo/subtitle avoidance when the source is silent.
-- Do not put desired world elements into avoid.
-- Do not put broad desired style/identity elements into avoid.
+- Use parsed source facts only. Do not invent unsupported lore, genres, worlds, species, props, settings, or visual technologies.
+- main_characters, recurring_locations, recurring_props, and visual_motifs are inventory lists only.
+- continuity_rules must be abstract and low-priority: broad world identity, tone, body/design logic, palette family, rendering style, or atmosphere.
+- continuity_rules must NOT contain concrete characters, factions, landmarks, buildings, props, symbols, weapons, rituals, destinations, or central composition requirements unless the source explicitly says they occur in every clip.
+- Do not make future clips resolve into a repeated landmark, destination, final reveal, or montage formula.
+- Current subrange lyrics always choose main subject, action, and setting later.
+- avoid contains only source-grounded forbidden content/style/drift, not desired motifs.
