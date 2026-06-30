@@ -91,7 +91,7 @@
   },
   "270": {
     "inputs": {
-      "unet_name": "sulphur_dev_bf16_model.safetensors",
+      "unet_name": "ltx-2.3-22b-dev-fp8.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",
