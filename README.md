@@ -4,6 +4,29 @@ Generate a stylized music video from prepared song audio, lyrics, lyric timing, 
 
 This repository contains the orchestration code and versioned prompt/workflow templates. Song-specific files live in `input/`, and generated artifacts live in `output/`. The default `.gitignore` excludes `input*/` and `output*/` so the repository can be used as code/config while keeping large media files outside git.
 
+
+
+### AI-11 r6 logging note
+
+Runner stdout now prefixes every non-empty log line with a local timestamp including milliseconds:
+
+```text
+2026-06-29 23:11:14.123  [comfy] free memory ok (before video generation): /free
+2026-06-29 23:11:17.456  [comfy] node: 304 FPS [PrimitiveFloat]
+2026-06-29 23:12:17.789  [comfy] t+60.3s node+60.0s | running... | 395 VAE Decode [VAEDecode]
+```
+
+This is runner-side reporting only; ComfyUI itself is unchanged.
+
+
+### AI-11 r7 VAE decode note
+
+Final video decode is back to normal `VAEDecode`. The workflow still keeps `UnloadAllModels` immediately before node `395` so the cleanup dependency remains:
+
+```text
+378 Video Latent -> 9103 UnloadAllModels -> 395 VAE Decode
+```
+
 ## 1. What this project does
 
 `aligned_song_video_runner.py` builds a music video in these stages:
@@ -1085,3 +1108,12 @@ Diagnostic files:
 - `work/debug/alignment_match_report.json`
 - `work/debug/alignment_match_report.txt`
 
+
+
+### AI-11 r4 VRAM note
+
+The video workflow uses `UnloadAllModels` before the LTXV refine sampler and before final decode, and uses built-in `VAEDecodeTiled` for node `395` to reduce peak VRAM during the final video VAE decode. Required custom node remains `SeanScripts/ComfyUI-Unload-Model` for the unload nodes.
+
+### AI-11 r5 timed reporting
+
+ComfyUI progress lines printed by `aligned_song_video_runner.py` now include wall-clock time, workflow elapsed time, and per-node elapsed time where applicable. This is runner-side logging only; ComfyUI and workflow execution behavior are unchanged.
