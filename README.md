@@ -4,6 +4,29 @@ Generate a stylized music video from prepared song audio, lyrics, lyric timing, 
 
 This repository contains the orchestration code and versioned prompt/workflow templates. Song-specific files live in `input/`, and generated artifacts live in `output/`. The default `.gitignore` excludes `input*/` and `output*/` so the repository can be used as code/config while keeping large media files outside git.
 
+
+
+### AI-11 r6 logging note
+
+Runner stdout now prefixes every non-empty log line with a local timestamp including milliseconds:
+
+```text
+2026-06-29 23:11:14.123  [comfy] free memory ok (before video generation): /free
+2026-06-29 23:11:17.456  [comfy] node: 304 FPS [PrimitiveFloat]
+2026-06-29 23:12:17.789  [comfy] t+60.3s node+60.0s | running... | 395 VAE Decode [VAEDecode]
+```
+
+This is runner-side reporting only; ComfyUI itself is unchanged.
+
+
+### AI-11 r7 VAE decode note
+
+Final video decode is back to normal `VAEDecode`. The workflow still keeps `UnloadAllModels` immediately before node `395` so the cleanup dependency remains:
+
+```text
+378 Video Latent -> 9103 UnloadAllModels -> 395 VAE Decode
+```
+
 ## 1. What this project does
 
 `aligned_song_video_runner.py` builds a music video in these stages:
@@ -680,7 +703,7 @@ Word-level karaoke is gap-aware: gaps between word timestamps are preserved inst
 
 Subtitle artifacts are lazy. `work/subs/karaoke.ass` is the full-song release subtitle file used by final rendering, `work/subs/preview_karaoke.ass` is the full-song preview karaoke subtitle file, `work/subs/preview_debug.ass` is the debug overlay, and `subtitle_preview.mp4` is a black-screen full-song preview video with audio, preview subtitles, and debug overlay. Existing files are reused until deleted or invalidated by `--refresh-alignment`. The preview is independent of `--limit`; a limited final render naturally burns only release subtitle events that fall inside the limited video/audio duration. The debug overlay is vector-drawn ASS graphics with three progress bars: full song progress with range/subrange boundary ticks, current range progress, and current subrange progress. Range labels use compact zero-based `Rnumber/count` labels without section-type labels. `count` is always the total full-song range count, independent of `--limit`; this total is the maximum useful value for `--limit`. For example, `R000/027` through `R026/027` means `--limit 27` selects the whole song. Subranges use `Snumber/count`. `preview_debug.ass` is never used for the final video. This happens before song-context LLM, planner LLM, image generation, or video generation. Use `--preview-subtitles-only` to stop after this file is created.
 
-Intro, outro, and instrumental gaps use the same threshold predicate. A silent gap becomes its own semantic block only when its duration is at least `instrumental_gap_threshold`; shorter intro/outro gaps are merged into the nearest lyric range.
+`***` defines semantic ranges, including explicit non-lyrical ranges. Inside a range, `---` marks a preferred subrange divider; master’s short-subrange merge may combine it only when needed to satisfy workflow duration constraints.
 
 Debug for ranges/subranges is written under `output/work/debug/ranges/range_NNN/`, with one folder per semantic range and one `part_MMM/` folder per internal subrange.
 
@@ -735,7 +758,7 @@ Current subrange text decides what happens. Identity/style/song context enrich t
 
 ### Action-oriented video prompts
 
-The default block planner rules are tuned for LTXV image-to-video. The LLM is asked to write every `video_prompt` as a short non-looping event arc instead of an idle animated illustration. The image prompt defines the starting keyframe; the video prompt must describe what happens after that frame.
+The prompt-writer and critic rules are tuned for LTXV image-to-video. Every `video_prompt` is a short non-looping event arc instead of an idle animated illustration. The image prompt defines the starting keyframe; the video prompt describes what happens after that frame.
 
 Every generated video prompt should contain a clear temporal structure:
 
@@ -852,7 +875,8 @@ Default technical/timeline configuration:
   "video_width": 1280,
   "video_height": 720,
   "video_fps": 24,
-  "clip_duration_tolerance_ratio": 0.05,
+  "clip_duration_tolerance_ratio": 0.15,
+  "min_workflow_seconds": 1.0,
   "recommended_workflow_seconds": 12,
   "max_workflow_seconds": 16,
   "local_context_radius": 2,
@@ -862,7 +886,10 @@ Default technical/timeline configuration:
   "alignment_match_lookahead_words": 5,
   "alignment_match_similarity_threshold": 0.72,
   "alignment_match_warn_ratio": 0.2,
-  "alignment_match_max_extra_ratio": 0.5
+  "alignment_match_max_extra_ratio": 0.5,
+  "prompt_max_attempts": 3,
+  "llm_max_ctx": 12288,
+  "llm_max_length": 12288
 }
 ```
 
@@ -874,15 +901,7 @@ Input override:
 input/config.json
 ```
 
-The instrumental gap threshold is:
-
-```text
-max(
-  explicit non-lyrical blocks from lyrics.txt
-)
-```
-
-`local_context_radius` controls how many neighboring verses are passed to the block planner as local context. For normal verse blocks, `2` means up to two previous and two next verses. For intro, the runner passes the first `radius` verses as early-song context. For outro, it passes the last `radius` verses as final-song context.
+`local_context_radius` controls how many neighboring semantic ranges are included in prompt-generation context.
 
 ```text
 data/subtitle_styles.ass
@@ -898,15 +917,16 @@ Workflow files are ComfyUI API workflows. They are versioned with the runner. Do
 workflows/planner_visual_prompts_api.json
 ```
 
-LLM planner workflow. Expected node classes include:
+Shared parser/writer/critic LLM workflow. Expected node classes include:
 
 ```text
 GGUFLoader
 LLM_local
+clear_model
 Basic data handling: PathSaveStringFile
 ```
 
-This workflow writes JSON prompt plans to `output/work/plans/`.
+The runner patches this workflow for each LLM stage and writes stage JSON under the task's debug directory.
 
 ```text
 workflows/image_from_prompt_api.json
@@ -1135,9 +1155,6 @@ LLM tasks use the same quality-loop policy: parser/generator output flows into w
 
 Each attempt prints a concise stdout metric line with `success`, `score`, issue count, and repair count. If no attempt succeeds, the highest-scored failed attempt is used so generation can continue; stdout reports which attempt was selected and writes a warning. Debug summaries are written to `attempts_summary.json` and full attempt data to `attempts_full.json` under each task directory, for example `work/debug/style/<source>/` and `work/debug/prompts/RNNN_SMMM/`.
 
-See `PROMPT_GENERATION_PLAN.md` for the full design.
-
-
 ## LLM context window
 
 `data/config.json` contains `llm_max_ctx`. The runner treats this as the source of truth for the local LLM context window and patches the ComfyUI LLM workflow (`workflows/planner_visual_prompts_api.json`) at runtime by updating every node that exposes a `max_ctx` input.
@@ -1145,7 +1162,7 @@ See `PROMPT_GENERATION_PLAN.md` for the full design.
 Default:
 
 ```json
-"llm_max_ctx": 8192
+"llm_max_ctx": 12288
 ```
 
 You can override it per project with `input/config.json`:
@@ -1164,8 +1181,8 @@ The runner also logs an approximate token count for every LLM stage so context p
 
 ```json
 {
-  "llm_max_ctx": 8192,
-  "llm_max_length": 6144
+  "llm_max_ctx": 12288,
+  "llm_max_length": 12288
 }
 ```
 
@@ -1178,13 +1195,6 @@ Thinking output such as `<think>...</think>` is allowed. The runner strips visib
 Subranges inside one semantic range are treated as continuation shots by default, not as independent scene prompts.
 
 Splitting now prefers complete lyric-line boundaries and uses the smallest number of subranges that fits under `max_workflow_seconds`. This avoids broken fragments such as `There are no` / `treats...`, which can make adjacent subranges drift into different scenes.
-
-Config flags:
-
-```json
-{
-}
-```
 
 Subrange splitting is deterministic and not configurable: it first uses lyric line boundaries, then refines only oversized pieces with word boundaries, then uses near-equal mechanical chunks only when natural lyric boundaries are still insufficient.
 

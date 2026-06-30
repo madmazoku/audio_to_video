@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import time
+from datetime import datetime
 import tempfile
 import uuid
 from pathlib import Path
@@ -41,9 +42,46 @@ VIDEO_N = {
 }
 
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
+def log_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
+
+def log(msg: str) -> None:
+    text = str(msg)
+    lines = text.splitlines()
+    if not lines:
+        print("", flush=True)
+        return
+    for line in lines:
+        if line.strip():
+            print(f"{log_timestamp()}  {line.lstrip()}", flush=True)
+        else:
+            print("", flush=True)
+
+
+def wall_clock_ms() -> str:
+    now = time.time()
+    return time.strftime("%H:%M:%S", time.localtime(now)) + f".{int((now % 1.0) * 1000):03d}"
+
+
+def fmt_elapsed(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 100.0:
+        return f"{seconds:.1f}s"
+    return f"{seconds:.0f}s"
+
+
+def log_comfy(msg: str, workflow_start: Optional[float] = None, node_start: Optional[float] = None) -> None:
+    parts = []
+    now = time.perf_counter()
+    if workflow_start is not None:
+        parts.append(f"t+{fmt_elapsed(now - workflow_start)}")
+    if node_start is not None:
+        parts.append(f"node+{fmt_elapsed(now - node_start)}")
+    if parts:
+        log(f"[comfy] {' '.join(parts)} | {msg}")
+    else:
+        log(f"[comfy] {msg}")
 
 
 def clean_fresh_output_dir(output_root: Path) -> None:
@@ -403,7 +441,56 @@ def queue_prompt(workflow: Dict[str, Any], comfy_url: str, client_id: Optional[s
 
 
 
+def query_vram_mb() -> Optional[Tuple[int, int]]:
+    """Return (used_mb, total_mb) for the first NVIDIA GPU, or None."""
+    try:
+        cp = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except Exception:
+        return None
 
+    for line in cp.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) >= 2:
+            try:
+                return int(float(parts[0])), int(float(parts[1]))
+            except ValueError:
+                continue
+    return None
+
+
+def format_vram(vram: Optional[Tuple[int, int]]) -> str:
+    if vram is None:
+        return "vram unavailable"
+    used_mb, total_mb = vram
+    return f"{used_mb} / {total_mb}"
+
+
+def wait_after_free_memory(wait_seconds: float, poll_interval: float = 0.5, report_vram: bool = True) -> None:
+    wait_seconds = max(0.0, float(wait_seconds))
+    poll_interval = max(0.1, float(poll_interval))
+    if wait_seconds <= 0.0:
+        return
+
+    elapsed = 0.0
+    while elapsed + 1e-9 < wait_seconds:
+        step = min(poll_interval, wait_seconds - elapsed)
+        time.sleep(step)
+        elapsed += step
+        if report_vram:
+            vram = query_vram_mb()
+            if vram is not None:
+                log_comfy(f"waiting {elapsed:.1f}s: {format_vram(vram)}")
 def free_comfy_memory(comfy_url: str, reason: str = "", sleep_time: Optional[float] = None) -> None:
     """Best-effort ComfyUI VRAM/cache cleanup.
 
@@ -411,11 +498,14 @@ def free_comfy_memory(comfy_url: str, reason: str = "", sleep_time: Optional[flo
     It is intentionally non-fatal: unsupported endpoints or transient errors
     should not stop generation.
     When sleep_time is provided, wait that many seconds after a successful
-    free-memory request.
+    free-memory request and log VRAM during that wait.
     """
     payload = {"unload_models": True, "free_memory": True}
     base = comfy_url.rstrip("/")
     label = f" ({reason})" if reason else ""
+    before_vram = query_vram_mb()
+    report_wait_vram = before_vram is not None
+
     for path in ("/free", "/api/free"):
         url = base + path
         try:
@@ -423,17 +513,13 @@ def free_comfy_memory(comfy_url: str, reason: str = "", sleep_time: Optional[flo
             if r.status_code == 404:
                 continue
             r.raise_for_status()
-            log(f"  [comfy] free memory ok{label}: {path}")
+            log_comfy(f"free memory {format_vram(before_vram)} ok{label}: {path}")
             if sleep_time is not None:
-                wait_seconds = max(0.0, float(sleep_time))
-                if wait_seconds:
-                    log(f"  [comfy] wait after free memory: {wait_seconds:.1f}s")
-                    time.sleep(wait_seconds)
+                wait_after_free_memory(float(sleep_time), poll_interval=0.5, report_vram=report_wait_vram)
             return
         except Exception as exc:
-            log(f"  [comfy] free memory failed{label}: {path}: {exc}")
-    log(f"  [comfy] warning: free memory endpoint unavailable{label}")
-
+            log_comfy(f"free memory {format_vram(before_vram)} failed{label}: {path}: {exc}")
+    log_comfy(f"free memory {format_vram(before_vram)} failed/non-fatal{label}")
 
 def comfy_ws_url(comfy_url: str, client_id: str) -> str:
     base = comfy_url.rstrip("/")
@@ -463,8 +549,7 @@ def workflow_node_label(workflow: Dict[str, Any], node_id: Optional[str]) -> str
 
     class_type = str(node.get("class_type", "")).strip()
 
-    if title and class_type:
-        return f"{node_id} {title} [{class_type}]"
+    # Keep progress logs compact: node id + visible title/name only.
     if title:
         return f"{node_id} {title}"
     if class_type:
@@ -504,6 +589,8 @@ def wait_history_ws(
     start = time.perf_counter()
     last_report = 0.0
     current_node: Optional[str] = None
+    current_node_start: Optional[float] = None
+    node_start_by_id: Dict[str, float] = {}
     current_progress = ""
     last_node_label = ""
     finished_by_ws = False
@@ -540,7 +627,7 @@ def wait_history_ws(
                         continue
 
                     if msg_type == "execution_start":
-                        log(f"  [comfy] execution started prompt_id={prompt_id}")
+                        log_comfy(f"execution started prompt_id={prompt_id}", workflow_start=start)
 
                     elif msg_type == "executing":
                         node = data.get("node")
@@ -550,11 +637,13 @@ def wait_history_ws(
                             break
 
                         current_node = str(node)
+                        current_node_start = time.perf_counter()
+                        node_start_by_id[current_node] = current_node_start
                         current_progress = ""
                         node_label = workflow_node_label(workflow, current_node)
                         if node_label != last_node_label:
                             last_node_label = node_label
-                            log(f"  [comfy] node: {node_label}")
+                            log_comfy(f"node: {node_label}", workflow_start=start)
 
                     elif msg_type == "progress":
                         current_progress = format_progress(data.get("value"), data.get("max"))
@@ -562,12 +651,21 @@ def wait_history_ws(
                     elif msg_type == "executed":
                         node = data.get("node")
                         if node is not None:
-                            log(f"  [comfy] executed: {workflow_node_label(workflow, str(node))}")
+                            node_id = str(node)
+                            log_comfy(
+                                f"executed: {workflow_node_label(workflow, node_id)}",
+                                workflow_start=start,
+                                node_start=node_start_by_id.get(node_id),
+                            )
 
                     elif msg_type == "execution_error":
                         node = data.get("node_id") or data.get("node")
                         message = data.get("exception_message") or data.get("message") or ""
-                        log(f"  [comfy] execution error at {workflow_node_label(workflow, str(node) if node is not None else None)}: {message}")
+                        log_comfy(
+                            f"execution error at {workflow_node_label(workflow, str(node) if node is not None else None)}: {message}",
+                            workflow_start=start,
+                            node_start=current_node_start,
+                        )
                         finished_by_ws = True
                         break
 
@@ -580,9 +678,9 @@ def wait_history_ws(
                 last_report = elapsed
                 node_label = workflow_node_label(workflow, current_node)
                 if current_progress:
-                    log(f"  [comfy] running... {elapsed:.0f}s | {node_label} | progress {current_progress}")
+                    log_comfy(f"running... | {node_label} | progress {current_progress}", workflow_start=start, node_start=current_node_start)
                 else:
-                    log(f"  [comfy] running... {elapsed:.0f}s | {node_label}")
+                    log_comfy(f"running... | {node_label}", workflow_start=start, node_start=current_node_start)
 
             if finished_by_ws:
                 break
@@ -595,7 +693,7 @@ def wait_history_ws(
             h = r.json()
             if prompt_id in h:
                 elapsed = time.perf_counter() - start
-                log(f"  [comfy] finished after {elapsed:.0f}s")
+                log_comfy(f"finished after {fmt_elapsed(elapsed)}", workflow_start=start)
                 return h[prompt_id]
 
             if time.perf_counter() > deadline:
@@ -736,10 +834,15 @@ def lyric_words(text: str) -> List[str]:
 
 
 
+def is_subrange_divider_line(line: str) -> bool:
+    return str(line).strip() == "---"
+
+
 def is_alignment_meta_token(text: str) -> bool:
     stripped = str(text).strip()
     return (
         stripped == "***"
+        or is_subrange_divider_line(stripped)
         or (len(stripped) >= 2 and stripped.startswith("[") and stripped.endswith("]"))
         or stripped.startswith("[")
         or stripped.endswith("]")
@@ -759,6 +862,8 @@ def clean_lyrics_for_alignment_text(lyrics_text: str) -> str:
             continue
         if line == "***":
             out.append("")
+            continue
+        if is_subrange_divider_line(line):
             continue
         if is_bracket_directive_line(line):
             continue
@@ -814,20 +919,6 @@ def words_are_match(a: str, b: str, base_threshold: float) -> Tuple[bool, float,
     return False, sim, "mismatch"
 
 
-def block_has_lyric_text(block: Dict[str, Any]) -> bool:
-    lines = block.get("lines_text")
-    if isinstance(lines, list):
-        return any(str(line).strip() for line in lines)
-    lines = block.get("lines")
-    if isinstance(lines, list):
-        return any(str(line.get("text", "")).strip() if isinstance(line, dict) else str(line).strip() for line in lines)
-    return bool(str(block.get("text", "")).strip())
-
-
-def expected_words_for_lyrics_verses(lyrics_verses: List[Dict[str, Any]]) -> List[List[str]]:
-    return [lyric_words(str(v.get("text", ""))) if block_has_lyric_text(v) else [] for v in lyrics_verses]
-
-
 def next_lyric_line_words(verse_line_words: List[List[List[str]]], verse_index: int, line_index: int) -> List[str]:
     """Return the next actual lyric line after a block/line, skipping non-lyrical blocks."""
     current_lines = verse_line_words[verse_index] if 0 <= verse_index < len(verse_line_words) else []
@@ -837,6 +928,18 @@ def next_lyric_line_words(verse_line_words: List[List[List[str]]], verse_index: 
         if verse_line_words[vi]:
             return verse_line_words[vi][0]
     return []
+
+def block_has_lyric_text(block: Dict[str, Any]) -> bool:
+    lines = block.get("lines_text")
+    if isinstance(lines, list):
+        return any(str(line).strip() for line in lines)
+    lines = block.get("lines")
+    if isinstance(lines, list):
+        return any(str(line.get("text", "")).strip() if isinstance(line, dict) else str(line).strip() for line in lines)
+    return bool(str(block.get("text", "")).strip())
+
+def expected_words_for_lyrics_verses(lyrics_verses: List[Dict[str, Any]]) -> List[List[str]]:
+    return [lyric_words(str(v.get("text", ""))) if block_has_lyric_text(v) else [] for v in lyrics_verses]
 
 
 def find_next_range_prefix(
@@ -1327,12 +1430,14 @@ def actual_word_duration(word: Dict[str, Any]) -> float:
     return max(0.0, float(word.get("end", 0.0)) - float(word.get("start", 0.0)))
 
 
-def estimate_sanitized_word_duration(word_text: str, gap_to_original: float) -> float:
-    letters = max(1, len(norm_word(word_text)))
-    base = max(0.25, min(1.60, letters * 0.11))
-    if gap_to_original >= 3.0:
-        base = max(base, min(4.50, gap_to_original * 0.22))
-    return max(0.05, min(4.50, base))
+def line_timing_bounds_from_words(words: List[Dict[str, Any]], default_start: float = 0.0) -> Tuple[float, float]:
+    starts = [float(w["start"]) for w in words if w.get("start") is not None]
+    ends = [float(w["end"]) for w in words if w.get("end") is not None]
+    if starts and ends:
+        start = min(starts)
+        end = max(ends)
+        return start, max(start + 0.01, end)
+    return default_start, default_start + 0.01
 
 
 def sanitize_matched_line_word_timings(line_text: str, words: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1420,15 +1525,12 @@ def sanitize_matched_line_word_timings(line_text: str, words: List[Dict[str, Any
     return report
 
 
-def line_timing_bounds_from_words(words: List[Dict[str, Any]], default_start: float = 0.0) -> Tuple[float, float]:
-    starts = [float(w["start"]) for w in words if w.get("start") is not None]
-    ends = [float(w["end"]) for w in words if w.get("end") is not None]
-    if starts and ends:
-        start = min(starts)
-        end = max(ends)
-        return start, max(start + 0.01, end)
-    return default_start, default_start + 0.01
-
+def estimate_sanitized_word_duration(word_text: str, gap_to_original: float) -> float:
+    letters = max(1, len(norm_word(word_text)))
+    base = max(0.25, min(1.60, letters * 0.11))
+    if gap_to_original >= 3.0:
+        base = max(base, min(4.50, gap_to_original * 0.22))
+    return max(0.05, min(4.50, base))
 
 def build_line_candidate_from_start(
     expected_line_words: List[str],
@@ -1732,6 +1834,7 @@ def build_line_aware_verses_from_json_words(
             "text": " ".join(w["text"] for w in clean_words),
             "lines_text": [" ".join(w["text"] for w in clean_words)],
             "bracket_directives": [],
+            "subrange_divider_after_lines": [],
         }
         lyrics_verses = [ly]
 
@@ -1819,6 +1922,7 @@ def build_line_aware_verses_from_json_words(
                 "lines": [],
                 "alignment_mode": "explicit_gap_fill",
                 "bracket_directives": list(ly.get("bracket_directives", [])),
+                "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
                 "alignment_match": verse_report,
             })
             continue
@@ -1946,6 +2050,7 @@ def build_line_aware_verses_from_json_words(
             "lines": out_lines,
             "alignment_mode": "word_json_line_aware",
             "bracket_directives": list(ly.get("bracket_directives", [])),
+            "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
             "alignment_match": verse_report,
         })
 
@@ -2098,6 +2203,7 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         "prompt_max_attempts": int,
         "llm_max_ctx": int,
         "llm_max_length": int,
+        "min_workflow_seconds": (int, float),
         "recommended_workflow_seconds": (int, float),
         "max_workflow_seconds": (int, float),
         "local_context_radius": int,
@@ -2108,6 +2214,8 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         "alignment_match_similarity_threshold": (int, float),
         "alignment_match_warn_ratio": (int, float),
         "alignment_match_max_extra_ratio": (int, float),
+        "llm_max_ctx": int,
+        "llm_max_length": int,
     }
 
     for key, expected_type in required.items():
@@ -2125,6 +2233,7 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
     config["prompt_max_attempts"] = max(1, int(config["prompt_max_attempts"]))
     config["llm_max_ctx"] = max(1024, int(config["llm_max_ctx"]))
     config["llm_max_length"] = max(128, int(config["llm_max_length"]))
+    config["min_workflow_seconds"] = float(config["min_workflow_seconds"])
     config["recommended_workflow_seconds"] = float(config["recommended_workflow_seconds"])
     config["max_workflow_seconds"] = float(config["max_workflow_seconds"])
     config["local_context_radius"] = int(config["local_context_radius"])
@@ -2195,16 +2304,17 @@ def strip_bracket_directive(line: str) -> str:
 def parse_lyrics_txt(text: str) -> List[Dict[str, Any]]:
     """Parse lyrics.txt into ordered song blocks.
 
-    The only structural boundary is the explicit *** separator written in
-    lyrics.txt. Every segment is preserved as a block, including metadata-only
-    and completely empty segments. A block with no lyric_lines is a non-lyrical
-    structural section whose timing is assigned later from the surrounding
-    blocks/audio gap.
+    *** separates semantic ranges and every segment is preserved, including
+    metadata-only and empty non-lyrical sections. [metadata] lines are range directives.
+    --- marks a preferred subrange divider inside the current semantic range.
+    Dividers are stored as positions after lyric lines and never become lyric
+    text, alignment input, subtitles, or prompt text.
     """
     blocks: List[Dict[str, Any]] = []
     for raw in text.split("***"):
         lyric_lines: List[str] = []
         directives: List[str] = []
+        divider_after_lines: List[int] = []
         raw_lines = raw.splitlines()
 
         for line in raw_lines:
@@ -2216,14 +2326,22 @@ def parse_lyrics_txt(text: str) -> List[Dict[str, Any]]:
                 if directive:
                     directives.append(directive)
                 continue
+            if is_subrange_divider_line(stripped):
+                divider_after_lines.append(len(lyric_lines))
+                continue
             lyric_lines.append(stripped)
 
+        valid_dividers: List[int] = []
+        for pos in divider_after_lines:
+            if 0 < pos < len(lyric_lines) and pos not in valid_dividers:
+                valid_dividers.append(pos)
         blocks.append({
             "index": len(blocks) + 1,
             "block_index": len(blocks),
             "text": "\n".join(lyric_lines),
             "lines_text": lyric_lines,
             "bracket_directives": directives,
+            "subrange_divider_after_lines": valid_dividers,
             "raw_block_text": raw,
         })
     return blocks
@@ -2271,6 +2389,7 @@ def parse_alignment_top_text_as_lyrics(data: Any) -> List[Dict[str, Any]]:
             "index": len(verses) + 1,
             "text": "\n".join(lines),
             "lines_text": lines,
+            "subrange_divider_after_lines": [],
         })
 
     return verses
@@ -2343,6 +2462,7 @@ def build_verses_from_lrc(lrc_lines: List[Dict[str, Any]]) -> List[Dict[str, Any
             "lines": lines,
             "alignment_mode": "line_lrc",
             "bracket_directives": [],
+            "subrange_divider_after_lines": [],
         })
         cur = []
 
@@ -2413,6 +2533,7 @@ def build_verses_from_json_words(
             "text": " ".join(w["text"] for w in clean_words),
             "lines_text": [" ".join(w["text"] for w in clean_words)],
             "bracket_directives": [],
+            "subrange_divider_after_lines": [],
         }
         lyrics_verses = [ly]
 
@@ -2464,6 +2585,7 @@ def build_verses_from_json_words(
             "lines": out_lines,
             "alignment_mode": "word_json",
             "bracket_directives": list(ly.get("bracket_directives", [])),
+            "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
             "alignment_match": verse_report,
         })
 
@@ -2617,6 +2739,9 @@ def build_verses_from_lrc_and_lyrics(
         if text == "***":
             ignored_lines.append({**line, "reason": "separator"})
             continue
+        if is_subrange_divider_line(text):
+            ignored_lines.append({**line, "reason": "subrange_divider"})
+            continue
         if is_bracket_directive_line(text):
             ignored_lines.append({**line, "reason": "bracket_directive"})
             continue
@@ -2665,6 +2790,7 @@ def build_verses_from_lrc_and_lyrics(
                 "lines": [],
                 "alignment_mode": "explicit_gap_fill",
                 "bracket_directives": list(ly.get("bracket_directives", [])),
+                "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
                 "alignment_match": range_report,
             })
             continue
@@ -2741,6 +2867,7 @@ def build_verses_from_lrc_and_lyrics(
             "lines": out_lines,
             "alignment_mode": "line_lrc",
             "bracket_directives": list(ly.get("bracket_directives", [])),
+            "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
             "alignment_match": range_report,
         })
 
@@ -2859,35 +2986,6 @@ def resolve_command(candidates: List[Path], command_name: str) -> str:
     return found or command_name
 
 
-def resolve_stable_ts_command(script_dir: Path) -> str:
-    parent = script_dir.parent
-    candidates = [
-        parent / "stable-ts" / ".venv" / "Scripts" / "stable-ts.exe",
-        parent / "stable-ts" / ".venv" / "bin" / "stable-ts",
-    ]
-    return resolve_command(candidates, "stable-ts")
-
-
-def resolve_ffmpeg_command(script_dir: Path) -> str:
-    parent = script_dir.parent
-    candidates = [
-        parent / "ffmpeg" / "bin" / "ffmpeg.exe",
-        parent / "ffmpeg" / "bin" / "ffmpeg",
-    ]
-    return resolve_command(candidates, "ffmpeg")
-
-
-def resolve_ffprobe_command(script_dir: Path) -> str:
-    parent = script_dir.parent
-    candidates = [
-        parent / "ffmpeg" / "bin" / "ffprobe.exe",
-        parent / "ffmpeg" / "bin" / "ffprobe",
-    ]
-    return resolve_command(candidates, "ffprobe")
-
-
-
-
 def resolve_config_path(path_value: str, script_dir: Path) -> Path:
     raw = str(path_value).strip()
     if not raw:
@@ -2927,30 +3025,6 @@ def resolve_ffprobe_command(script_dir: Path) -> str:
 
 
 
-
-
-def find_first_existing(input_dir: Path, stem: str, extensions: Tuple[str, ...] = (".mp3", ".wav", ".m4a", ".flac")) -> Optional[Path]:
-    for ext in extensions:
-        p = input_dir / f"{stem}{ext}"
-        if p.exists():
-            return p
-    return None
-
-
-def detect_alignment_source(input_dir: Path) -> Tuple[str, Optional[Path], Optional[Path]]:
-    vocals = find_first_existing(input_dir, "vocals")
-    if vocals:
-        return "vocals", vocals, None
-
-    lrc = input_dir / "lyrics.lrc"
-    if lrc.exists():
-        return "lrc", lrc, None
-
-
-    raise FileNotFoundError(
-        "No alignment source found. Use input/vocals.* for stable-ts word alignment, "
-        "or input/lyrics.lrc for line-level timing when only full audio is available."
-    )
 
 
 def find_first_existing(input_dir: Path, stem: str, extensions: Tuple[str, ...] = (".mp3", ".wav", ".m4a", ".flac")) -> Optional[Path]:
@@ -3801,7 +3875,6 @@ def strip_llm_wrappers(text: str) -> str:
     if fence:
         return fence.group(1).strip()
     return cleaned
-
 
 def extract_json_object(text: str) -> Dict[str, Any]:
     """Extract exactly one JSON object from an LLM text response.
@@ -4944,9 +5017,6 @@ def build_current_block_instruction(block: Dict[str, Any], verses: List[Dict[str
     return "Current song block text:\n" + str(block.get("text", "")) + directive_text
 
 
-
-
-
 def comfy_block_part_subdir(run_id: str, block_index: int, sub_index: int) -> str:
     return f"aligned_song/{run_id}/block_{block_index:03d}/part_{sub_index:03d}"
 
@@ -5011,6 +5081,7 @@ def timed_line_segments_for_block(block: Dict[str, Any]) -> List[Dict[str, Any]]
             continue
 
         segments.append({
+            "line_index": int(line.get("index", len(segments) + 1)),
             "start": ls,
             "end": le,
             "text": str(line.get("text", "")),
@@ -5051,9 +5122,9 @@ def subrange_text_for_block(block: Dict[str, Any], sub_start: float, sub_end: fl
 def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> List[float]:
     start = float(block["start"])
     end = float(block["end"])
-    duration = max(0.01, end - start)
     max_seconds = float(config["max_workflow_seconds"])
     recommended = float(config["recommended_workflow_seconds"])
+    min_seconds = float(config["min_workflow_seconds"])
 
     # Keep a small safety margin below the workflow hard limit. Some aligned
     # word/line timestamps have millisecond rounding, and a visually harmless
@@ -5062,50 +5133,120 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
     # is retimed later to the exact lyric timeline.
     safe_max_seconds = max(0.5, max_seconds - 0.05)
     target_seconds = max(0.5, min(recommended, safe_max_seconds))
-    min_segment_seconds = 0.5
+    min_seconds = max(0.01, min(min_seconds, safe_max_seconds))
+    min_natural_piece_seconds = min(0.5, min_seconds)
 
-    if duration <= safe_max_seconds:
-        return [start, end]
+    timed_lines = timed_line_segments_for_block(block)
 
-    def clean_boundaries(values: List[float]) -> List[float]:
-        ordered = sorted(float(x) for x in values if start - 1e-6 <= float(x) <= end + 1e-6)
-        out: List[float] = []
-        for value in ordered:
-            if not out or value > out[-1] + 0.01:
-                out.append(value)
-        if not out or abs(out[0] - start) > 0.01:
-            out.insert(0, start)
-        else:
-            out[0] = start
-        if abs(out[-1] - end) > 0.01:
-            out.append(end)
-        else:
-            out[-1] = end
+    line_candidates = {start, end}
+    word_candidates = {start, end}
+    line_by_index: Dict[int, Dict[str, Any]] = {}
+    if block_has_lyric_text(block):
+        for seg in timed_lines:
+            line_index = int(seg.get("line_index", len(line_by_index) + 1))
+            line_by_index[line_index] = seg
+            seg_end = float(seg["end"])
+            if start < seg_end < end:
+                line_candidates.add(seg_end)
+                word_candidates.add(seg_end)
+            for w in seg.get("words") or []:
+                word_end = float(w.get("end", start))
+                if start < word_end < end:
+                    word_candidates.add(word_end)
+
+    manual_candidates = {start, end}
+    divider_positions = list(block.get("subrange_divider_after_lines", []))
+    for pos_raw in divider_positions:
+        pos = int(pos_raw)
+        seg = line_by_index.get(pos)
+        if not seg:
+            continue
+        boundary = float(seg.get("end", start))
+        if start < boundary < end:
+            manual_candidates.add(boundary)
+
+    def segment_duration(segment: Dict[str, Any]) -> float:
+        return max(0.0, float(segment["end"]) - float(segment["start"]))
+
+    def copy_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "start": float(segment["start"]),
+            "end": float(segment["end"]),
+            "start_boundary_kind": str(segment.get("start_boundary_kind", "range")),
+        }
+
+    def make_segments_from_boundaries(
+        segment: Dict[str, Any],
+        boundaries: List[float],
+        internal_boundary_kind: str,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        cleaned: List[float] = []
+        for value in boundaries:
+            value = float(value)
+            if not cleaned or value > cleaned[-1] + 0.01:
+                cleaned.append(value)
+        if len(cleaned) < 2:
+            return [copy_segment(segment)]
+
+        for i in range(len(cleaned) - 1):
+            seg_start = cleaned[i]
+            seg_end = cleaned[i + 1]
+            if seg_end <= seg_start + 0.001:
+                continue
+            out.append({
+                "start": seg_start,
+                "end": seg_end,
+                "start_boundary_kind": (
+                    str(segment.get("start_boundary_kind", "range"))
+                    if i == 0 else internal_boundary_kind
+                ),
+            })
+        return out or [copy_segment(segment)]
+
+    def split_at_all_candidates(
+        segments: List[Dict[str, Any]],
+        candidates: List[float],
+        internal_boundary_kind: str,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for segment in segments:
+            seg_start = float(segment["start"])
+            seg_end = float(segment["end"])
+            local = [
+                float(c) for c in candidates
+                if seg_start + 0.01 < float(c) < seg_end - 0.01
+            ]
+            if not local:
+                out.append(copy_segment(segment))
+                continue
+            boundaries = [seg_start] + sorted(local) + [seg_end]
+            out.extend(make_segments_from_boundaries(segment, boundaries, internal_boundary_kind))
         return out
 
-    def split_using_candidates(seg_start: float, seg_end: float, candidates: List[float]) -> List[float]:
-        """Split using only supplied natural boundaries.
-
-        The function never invents boundaries. It prefers pieces around
-        recommended_workflow_seconds while staying below max_workflow_seconds.
-        If no usable candidate exists, it leaves the remaining segment intact;
-        the next refinement pass will try a finer boundary class.
-        """
+    def split_using_candidates(
+        segment: Dict[str, Any],
+        candidates: List[float],
+        internal_boundary_kind: str,
+    ) -> List[Dict[str, Any]]:
+        """Split a too-long segment using only supplied natural boundaries."""
+        seg_start = float(segment["start"])
+        seg_end = float(segment["end"])
         if seg_end - seg_start <= safe_max_seconds + 1e-6:
-            return [seg_start, seg_end]
+            return [copy_segment(segment)]
 
         local_candidates = sorted(
             float(c) for c in candidates
             if seg_start + 0.01 < float(c) < seg_end - 0.01
         )
         if not local_candidates:
-            return [seg_start, seg_end]
+            return [copy_segment(segment)]
 
         boundaries = [seg_start]
         previous = seg_start
         while seg_end - previous > safe_max_seconds + 1e-6:
-            earliest = previous + min_segment_seconds
-            latest = min(previous + safe_max_seconds, seg_end - min_segment_seconds)
+            earliest = previous + min_natural_piece_seconds
+            latest = min(previous + safe_max_seconds, seg_end - min_natural_piece_seconds)
             if latest < earliest:
                 break
 
@@ -5125,57 +5266,153 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
 
         if boundaries[-1] < seg_end - 0.01:
             boundaries.append(seg_end)
-        return boundaries
+        return make_segments_from_boundaries(segment, boundaries, internal_boundary_kind)
 
-    def split_evenly(seg_start: float, seg_end: float) -> List[float]:
+    def split_long_using_candidates_strategy(
+        segments: List[Dict[str, Any]],
+        candidates: List[float],
+        internal_boundary_kind: str,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for segment in segments:
+            out.extend(split_using_candidates(segment, candidates, internal_boundary_kind))
+        return out
+
+    def split_evenly(segment: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Final mechanical split when natural lyric boundaries are insufficient."""
+        seg_start = float(segment["start"])
+        seg_end = float(segment["end"])
         seg_duration = max(0.01, seg_end - seg_start)
         if seg_duration <= safe_max_seconds + 1e-6:
-            return [seg_start, seg_end]
+            return [copy_segment(segment)]
 
-        pieces = max(2, int(math.ceil(seg_duration / target_seconds)))
+        pieces = max(2, int(round(seg_duration / target_seconds)))
         while seg_duration / pieces > safe_max_seconds:
             pieces += 1
-        return [seg_start + seg_duration * i / pieces for i in range(pieces + 1)]
+        boundaries = [seg_start + seg_duration * i / pieces for i in range(pieces + 1)]
+        return make_segments_from_boundaries(segment, boundaries, "even")
 
-    line_candidates = {start, end}
-    word_candidates = {start, end}
-    if block_has_lyric_text(block):
-        for seg in timed_line_segments_for_block(block):
-            seg_end = float(seg["end"])
-            if start < seg_end < end:
-                line_candidates.add(seg_end)
-                word_candidates.add(seg_end)
-            for w in seg.get("words") or []:
-                word_end = float(w.get("end", start))
-                if start < word_end < end:
-                    word_candidates.add(word_end)
+    def split_evenly_strategy(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for segment in segments:
+            out.extend(split_evenly(segment))
+        return out
 
-    # Deterministic policy, intentionally not configurable:
-    # 1. Prefer complete lyric-line boundaries.
-    # 2. If any resulting segment is still too long, refine only those segments
-    #    using word boundaries.
-    # 3. If a segment is still too long, split it mechanically into near-target
-    #    equal chunks based on recommended_workflow_seconds.
-    boundaries = split_using_candidates(start, end, sorted(line_candidates))
+    def merge_short_dp_strategy(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        n = len(segments)
+        if n <= 1:
+            return [copy_segment(x) for x in segments]
 
-    word_refined = [boundaries[0]]
-    for segment_end in boundaries[1:]:
-        segment_start = word_refined[-1]
-        pieces = split_using_candidates(segment_start, segment_end, sorted(word_candidates))
-        for b in pieces[1:]:
-            if b > word_refined[-1] + 0.01:
-                word_refined.append(float(b))
+        durations = [segment_duration(x) for x in segments]
+        prefix = [0.0]
+        for d in durations:
+            prefix.append(prefix[-1] + d)
 
-    evenly_refined = [word_refined[0]]
-    for segment_end in word_refined[1:]:
-        segment_start = evenly_refined[-1]
-        pieces = split_evenly(segment_start, segment_end)
-        for b in pieces[1:]:
-            if b > evenly_refined[-1] + 0.01:
-                evenly_refined.append(float(b))
+        boundary_penalty = {
+            "manual": 30.0,
+            "line": 10.0,
+            "word": 4.0,
+            "even": 1.0,
+            "range": 1_000_000.0,
+        }
 
-    return clean_boundaries(evenly_refined)
+        def group_duration(i: int, j: int) -> float:
+            return prefix[j] - prefix[i]
+
+        def contains_short_atom(i: int, j: int) -> bool:
+            return any(durations[k] < min_seconds - 1e-6 for k in range(i, j))
+
+        def removed_boundary_cost(i: int, j: int) -> float:
+            cost = 0.0
+            for k in range(i + 1, j):
+                cost += boundary_penalty.get(str(segments[k].get("start_boundary_kind", "line")), 10.0)
+            return cost
+
+        def segment_cost(i: int, j: int, duration: float) -> float:
+            cost = ((duration - target_seconds) / target_seconds) ** 2
+            if duration < min_seconds - 1e-6:
+                cost += 1_000_000.0
+                cost += 1_000_000.0 * ((min_seconds - duration) / min_seconds) ** 2
+            cost += removed_boundary_cost(i, j)
+            return cost
+
+        inf = float("inf")
+        dp = [inf] * (n + 1)
+        prev = [-1] * (n + 1)
+        dp[0] = 0.0
+
+        for j in range(1, n + 1):
+            for i in range(j - 1, -1, -1):
+                duration = group_duration(i, j)
+                if duration > safe_max_seconds + 1e-6:
+                    break
+                if j - i > 1 and not contains_short_atom(i, j):
+                    continue
+                cost = dp[i] + segment_cost(i, j, duration)
+                if cost < dp[j] - 1e-9:
+                    dp[j] = cost
+                    prev[j] = i
+
+        if prev[n] < 0:
+            raise RuntimeError("Unable to build valid subranges after short-range merge DP")
+
+        groups: List[Tuple[int, int]] = []
+        cursor = n
+        while cursor > 0:
+            i = prev[cursor]
+            if i < 0:
+                raise RuntimeError("Broken subrange DP backtracking state")
+            groups.append((i, cursor))
+            cursor = i
+        groups.reverse()
+
+        out: List[Dict[str, Any]] = []
+        for i, j in groups:
+            out.append({
+                "start": float(segments[i]["start"]),
+                "end": float(segments[j - 1]["end"]),
+                "start_boundary_kind": str(segments[i].get("start_boundary_kind", "range")),
+            })
+        return out
+
+    segments: List[Dict[str, Any]] = [{
+        "start": start,
+        "end": end,
+        "start_boundary_kind": "range",
+    }]
+
+    # Fixed strategy pipeline. Every strategy takes the current ordered subrange
+    # list and returns a new ordered subrange list. Manual dividers are just the
+    # first strategy; if a range has no --- markers it naturally returns the same
+    # single subrange.
+    segments = split_at_all_candidates(segments, sorted(manual_candidates), "manual")
+    segments = split_long_using_candidates_strategy(segments, sorted(line_candidates), "line")
+    segments = split_long_using_candidates_strategy(segments, sorted(word_candidates), "word")
+    segments = split_evenly_strategy(segments)
+    segments = merge_short_dp_strategy(segments)
+
+    for segment in segments:
+        duration = segment_duration(segment)
+        if duration > safe_max_seconds + 1e-6:
+            raise RuntimeError(
+                f"Unable to split {format_range_id(int(block['block_index']))}: "
+                f"subrange duration {duration:.3f}s exceeds safe max {safe_max_seconds:.3f}s"
+            )
+
+    boundaries = [float(segments[0]["start"])]
+    for segment in segments:
+        end_value = float(segment["end"])
+        if end_value > boundaries[-1] + 0.01:
+            boundaries.append(end_value)
+    if abs(boundaries[0] - start) > 0.01:
+        boundaries.insert(0, start)
+    else:
+        boundaries[0] = start
+    if abs(boundaries[-1] - end) > 0.01:
+        boundaries.append(end)
+    else:
+        boundaries[-1] = end
+    return boundaries
 
 def build_subranges_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
     boundaries = split_boundaries_for_block(block, config)
@@ -5491,6 +5728,7 @@ def make_timeline_blocks(
                 "lyric_end": lyric_end.get(i, end),
                 "visual_preroll": max(0.0, lyric_start.get(i, start) - start),
                 "bracket_directives": list(src.get("bracket_directives", [])),
+                "subrange_divider_after_lines": list(src.get("subrange_divider_after_lines", [])),
             })
             i += 1
             continue
@@ -5526,6 +5764,7 @@ def make_timeline_blocks(
                 "text": "",
                 "verse": src_empty,
                 "bracket_directives": list(src_empty.get("bracket_directives", [])),
+                "subrange_divider_after_lines": list(src_empty.get("subrange_divider_after_lines", [])),
                 "section_text": make_nonlyrical_block_text(src_empty),
             })
 
@@ -5568,7 +5807,7 @@ def validate_unscaled_clip_for_timeline(
 
     target_duration = max(0.1, float(block.get("duration", 0.0)))
     source_duration = ffprobe_duration(unscaled_clip, ffprobe_cmd)
-    tolerance = max(0.0, float(config.get("clip_duration_tolerance_ratio", 0.05)))
+    tolerance = max(0.0, float(config["clip_duration_tolerance_ratio"]))
     ratio_delta = abs(source_duration - target_duration) / max(target_duration, 0.001)
     ok = ratio_delta <= tolerance
     info = {
