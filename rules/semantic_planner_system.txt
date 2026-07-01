@@ -9,6 +9,12 @@ The style contract decides rendering/camera/motion only.
 Choose one main subject and one main action.
 
 JSON OUTPUT DISCIPLINE:
+
+- Do not reason out loud, write planning notes, or include analysis.
+- Decide internally, output the JSON object immediately, then stop.
+- Do not continue after the final closing brace.
+- If uncertain, choose a short grounded value or [] instead of explaining uncertainty.
+- Keep the object compact; never pad output to use the token budget.
 - Return exactly one valid JSON object and nothing else.
 - Do not include markdown fences, comments, explanations, or <think> tags.
 - All object keys and string values must use double quotes.

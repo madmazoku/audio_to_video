@@ -3,11 +3,18 @@ Return ONLY valid JSON. Do not use markdown or explanations.
 Split parsed raw visual instructions into:
 1. identity_contract: broad identity/world/aesthetic continuity.
 2. style_contract: rendering, camera, lighting, texture, color, motion, and source-grounded negatives.
+Pipeline policy belongs to prompt writer/critic rules, not this contract.
 Be source-preserving but compact. Keep distinctive nouns; remove redundancy.
 Do not invent genre, medium, era, location, technology, species, character, plot, or color palette.
 Do not genericize distinctive source nouns into only abstract adjectives.
 
 JSON OUTPUT DISCIPLINE:
+
+- Do not reason out loud, write planning notes, or include analysis.
+- Decide internally, output the JSON object immediately, then stop.
+- Do not continue after the final closing brace.
+- If uncertain, choose a short grounded value or [] instead of explaining uncertainty.
+- Keep the object compact; never pad output to use the token budget.
 - Return exactly one valid JSON object and nothing else.
 - No markdown fences, comments, explanations, or <think> tags.
 - Use double quotes for all keys and string values.

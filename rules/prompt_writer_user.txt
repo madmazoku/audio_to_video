@@ -9,6 +9,12 @@ IDENTITY CONTRACT:
 STYLE CONTRACT:
 {{STYLE_CONTRACT_JSON}}
 
+RAW VIDEO STYLE:
+{{RAW_VIDEO_STYLE}}
+
+DETERMINISTIC HARD STYLE DIRECTIVES:
+{{ENFORCED_STYLE_CONSTRAINTS_JSON}}
+
 RANGE TEXT:
 {{RANGE_TEXT}}
 
@@ -21,8 +27,20 @@ RANGE VISUAL STATE / SAME-RANGE CONTINUITY LOCK:
 SUBRANGE CONTINUITY INSTRUCTION:
 {{SUBRANGE_CONTINUITY_INSTRUCTION}}
 
-PREVIOUS FAILED RESULT, IF ANY:
-{{PREVIOUS_RESULT_JSON}}
+PREVIOUS CRITIC FEEDBACK FROM PREVIOUS ATTEMPT, IF ANY:
+{{PREVIOUS_CRITIC_FEEDBACK_JSON}}
+
+Feedback usage:
+- PREVIOUS_CRITIC_FEEDBACK_JSON is repair guidance only, not source material.
+- Apply only concrete issues/repairs relevant to this role.
+- Do not quote, summarize, debate, or copy previous feedback.
+- Do not mention previous attempts, scores, or repairs in the output.
+- Generate a fresh compact JSON object; do not patch or repeat old drafts.
+
+Writer retry rule:
+- Use feedback only to improve this prompt package. Do not change semantic_plan.main_subject, main_action, or setting.
+- Ignore feedback that asks to remove, replace, weaken, or avoid RAW VIDEO STYLE, required_style_phrases, source style payloads, or style_contract.required_style_prefix.
+- If feedback conflicts with source style, preserve the source style and fix only the non-style issue.
 
 Return ONLY valid JSON with exactly these keys:
 {
@@ -32,9 +50,10 @@ Return ONLY valid JSON with exactly these keys:
   "negative_prompt": ""
 }
 
-Compatibility note:
-- Keep exactly these fields because the runner requires them.
-- Do not add plan copies, contract copies, explanations, alternatives, or scores.
+JSON-only discipline:
+- No analysis, no reasoning text, no markdown, no comments, no prose outside JSON.
+- Return the required object only; close the final brace and stop.
+- Prefer short phrases and empty arrays over explanatory filler.
 
 Compact output limits:
 - scene_summary: max 16 words.
@@ -47,23 +66,34 @@ Grounding:
 - image_prompt and video_prompt must depict semantic_plan.main_subject performing semantic_plan.main_action in semantic_plan.setting.
 - The current lyric action remains central; style and identity only design it.
 - Do not replace the semantic plan with recurring anchors, previous visuals, or generic atmosphere.
-- Include style_contract.required_style_prefix early if present; otherwise include the source-required medium/look.
+- Start BOTH image_prompt and video_prompt with every required_style_phrases item intact. If none exist, use style_contract.required_style_prefix. Source style is authoritative even when it combines unusual aesthetics.
+- Treat hard style phrases as opaque rendering instructions: never abbreviate, split, translate, generalize, remove, or move words into identity fields.
+- After the required source style, add concrete visible cues derived from style_contract and RAW VIDEO STYLE.
+- Do not rely on abstract labels alone. Translate source style into visible rendering, lighting, materials, costume, environment texture, camera, and motion cues.
+- Avoid neutral/default realism, cozy safety, or generic stock-scene phrasing unless the source explicitly asks for it.
+- Use 2-4 concrete style/design cues, but do not invent new plot, landmarks, characters, factions, or readable text.
 - Include semantic_plan.must_show.
+- Preserve semantic_plan.main_subject and semantic_plan.setting literally; props/body parts/details may not replace them.
 
 Anchor discipline:
 - Use only semantic_plan.identity_anchors_to_show as concrete supporting anchor nouns, and keep their planned role.
 - Do not independently add concrete anchors from song_context or identity_contract as main subject, primary setting, destination, final reveal, main prop, or composition center.
 - Avoid semantic_plan.avoid_as_main_subject.
-- Required_recurring_anchors and style_continuity_rules are design pressure, not a checklist of visible objects.
+- Required_recurring_anchors and style_continuity_rules design the locked subject/world; they are not replacement scene subjects.
 
 Single-shot video:
 - video_prompt must describe one continuous motion shot in the same scene.
-- No edits, cuts, montage, time jump, crossfade, new establishing shot, late new landmark, or separate final tableau.
+- No scene-changing edits, time jumps, late landmarks, or unrelated tableau.
+- If RAW VIDEO STYLE explicitly requires cuts or a specific edit rhythm, honor it while keeping the same subject, setting, time, and continuous event.
+- Camera/editing style is not the action; include subject movement or visible environment consequence.
 - Show setup, visible action, and direct consequence inside the same place with stable subject, palette, scale, and dominant lighting unless the semantic plan requires change.
+- Prefer a clear continuous progression with setup, visible change, and final state; exact phrasing is not required.
+- Do not force literal phase labels like "At the start", "Then", or "By the end" unless natural.
 - Movement must not be camera-only; include moving subject or environment consequence.
 
 Negative prompt:
 - Include only source-grounded forbidden content/style/medium from style_contract.style_must_not, song_context avoid, and explicit negative source fields.
+- Include every forbidden_style_phrases item intact.
 - Include video-failure negatives: poster layout, idle animation, looping motion, camera-only movement.
 - Do not add default bans on text/signs/logos/subtitles/watermarks unless source-grounded negative constraints include them.
 - Do not put required medium, required subjects, required actions, or desired source motifs into the negative prompt.

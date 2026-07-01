@@ -715,7 +715,7 @@ All LLM generation/evaluation stages use the same quality-loop shape:
 parser -> writer -> critic
 repeat until critic success=true or max attempts is reached
 
-The value returned to the rest of the pipeline is always the selected writer artifact. The critic never replaces the writer output; it only evaluates it, provides `success`/`score`/`issues`/`repairs`, drives retries, and determines which writer attempt is accepted or selected as `best_failed`.
+The value returned to the rest of the pipeline is always a writer artifact accepted by the critic. The critic never replaces the writer output; it evaluates it and drives retries. If no attempt passes, generation stops instead of silently using a failed artifact.
 ```
 
 The shared runner is `run_llm_quality_loop(...)`. Task-specific behavior lives in rule templates, not in custom orchestration branches. The current standardized LLM tasks are:
@@ -737,15 +737,16 @@ attempts_full.json
 selected_result.json
 ```
 
-If every attempt gets `success=false`, the highest-scored usable attempt is selected, a warning is written, and execution continues. Bad quality is therefore a warning/retry/selection issue, not a runtime stop. Runtime errors are reserved for technical failures such as missing rule files, missing workflow nodes, or no usable structured result after every attempt.
+`success=true` is valid only with empty `issues` and `repairs`; contradictory critic output is normalized to failure and retried. If every attempt fails, `best_failed_result.json` and diagnostics are written and generation stops. There is no failed-result fallback.
 
 JSON remains the official structured output protocol for LLM stages. Parser and writer stages do not own domain `success`; they only report technical status such as `json_parse_ok`, `structural_ok`, and `technical_error`. The critic is the only stage that owns `success`, `score`, `issues`, and `repairs`. If parser or writer JSON is invalid, the raw response and parse/structure error are passed into the normal critic stage; the critic returns a low-scored failed verdict and repair instructions for the next attempt. The runner does not silently repair malformed JSON, but it does strip common wrappers such as `<think>...</think>` and markdown fences before parsing.
 
 For subrange prompt generation, effective priority is:
 
 ```text
-CURRENT SUBRANGE TEXT / highest factual action priority
-FULL SEMANTIC RANGE LYRICS / context around the current subrange
+RANGE SCENE CONTRACT / locked subject and setting after first subrange
+FULL SEMANTIC RANGE LYRICS / narrative agent, setting, relationships
+CURRENT SUBRANGE TEXT / current action and consequence
 IDENTITY CONTRACT / recurring visual identity and concrete anchors
 STYLE CONTRACT / rendering, camera, lighting, motion language
 GLOBAL SONG CONTEXT / continuity and recurring motifs
@@ -754,7 +755,9 @@ PREVIOUS VISUAL CONTEXT / continuity only
 BRACKET DIRECTIVES / metadata only
 ```
 
-Current subrange text decides what happens. Identity/style/song context enrich the event but must not replace the local action. Bracket directives are metadata and must not be rendered as visible text.
+The first technical subrange establishes one scene from the full semantic range. Later subranges copy its `main_subject` and `setting` exactly and change only action/consequence. Sparse fragments and mentioned props therefore cannot replace the range's narrative agent. Bracket directives are metadata and must not be rendered as visible text.
+
+Explicit style directives are enforced independently of their content. For example, the complete payload of `force visual style as:` must survive intact in `required_style_prefix`, `image_prompt`, and `video_prompt`; `never use:` items must survive in style negatives and `negative_prompt`. This mechanism is medium-agnostic and works for animation, painting, photography, naive drawings, pixel art, or any other requested style.
 
 ### Action-oriented video prompts
 
@@ -1147,13 +1150,13 @@ Visual prompt generation now uses a multi-stage pipeline instead of a single-pas
 2. Style condenser parser: the effective raw style is parsed into source-grounded identity/style facts without condensation.
 3. Style condenser writer: the parsed facts are condensed into `identity_contract` and `style_contract` under `work/style/`.
 4. Style condenser critic: evaluates whether the parser/writer preserved distinctive concrete identity/style anchors from the raw style and returns repairs for the next attempt. It does not replace the writer contract.
-5. Semantic planner: selects one main subject, one main action, and relevant identity anchors for the current subrange.
+5. Semantic planner: the first subrange selects one range-level narrative agent and setting from the full range; later subranges must reuse them and plan only the next action beat.
 6. Prompt writer: turns the semantic plan into `scene_summary`, `image_prompt`, `video_prompt`, and `negative_prompt`.
 7. Prompt critic: evaluates grounding/action quality/identity preservation/continuity and returns `success`, `score`, `issues`, and `repairs`. It does not replace the writer prompt package.
 
-LLM tasks use the same quality-loop policy: parser/generator output flows into writer output, then a task-specific critic checks the writer artifact. The selected result returned to the pipeline is always the writer artifact from the accepted/highest-scored usable attempt. The full attempt is retried up to `prompt_max_attempts` and selected by `success` first or best overall `score` if all attempts fail. A quality failure such as weak identity, generic style condensation, or a mediocre prompt is a warning and does not interrupt generation. Runtime failures are reserved for technical problems such as no usable JSON/schema after every attempt.
+LLM tasks use the same quality-loop policy: parser output flows into writer output, then a task-specific critic checks the writer artifact. The full attempt is retried up to `prompt_max_attempts`. Only `success=true` with empty `issues` and `repairs` is accepted; exhaustion is a runtime failure with saved diagnostics.
 
-Each attempt prints a concise stdout metric line with `success`, `score`, issue count, and repair count. If no attempt succeeds, the highest-scored failed attempt is used so generation can continue; stdout reports which attempt was selected and writes a warning. Debug summaries are written to `attempts_summary.json` and full attempt data to `attempts_full.json` under each task directory, for example `work/debug/style/<source>/` and `work/debug/prompts/RNNN_SMMM/`.
+Each attempt prints a concise stdout metric line with `success`, `score`, issue count, and repair count. Debug summaries are written to `attempts_summary.json` and full attempt data to `attempts_full.json`; on exhaustion the best failed artifact is saved for diagnosis but is never used for generation.
 
 ## LLM context window
 
@@ -1198,7 +1201,7 @@ Splitting now prefers complete lyric-line boundaries and uses the smallest numbe
 
 Subrange splitting is deterministic and not configurable: it first uses lyric line boundaries, then refines only oversized pieces with word boundaries, then uses near-equal mechanical chunks only when natural lyric boundaries are still insufficient.
 
-During prompt generation, the first subrange establishes a `range_visual_state`; later subranges receive this state and must preserve the same main subject, location, scale, palette, and identity/world lens unless their current lyric text explicitly changes them. The action and visible consequence should evolve with the current subrange, but the subject/world should not be redesigned inside one range.
+During prompt generation, the first subrange establishes a structured `range_visual_state.scene_contract`. Later subranges must copy its `main_subject` and `setting` exactly. Scene changes belong to a new semantic range (`***`), while technical subranges evolve only action and visible consequence. The state stores compact structured beats rather than accumulating full prior prompts.
 
 ### Lyrics block structure
 

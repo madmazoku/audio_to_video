@@ -9,6 +9,12 @@ Do not create the final style_contract or identity_contract here.
 Preserve concrete source vocabulary so the writer can build compact contracts without losing identity.
 
 JSON OUTPUT DISCIPLINE:
+
+- Do not reason out loud, write planning notes, or include analysis.
+- Decide internally, output the JSON object immediately, then stop.
+- Do not continue after the final closing brace.
+- If uncertain, choose a short grounded value or [] instead of explaining uncertainty.
+- Keep the object compact; never pad output to use the token budget.
 - Return exactly one valid JSON object and nothing else.
 - Do not include markdown fences, comments, explanations, or <think> tags.
 - All object keys and string values must use double quotes.

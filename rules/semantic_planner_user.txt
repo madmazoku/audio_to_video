@@ -5,8 +5,11 @@ BLOCK INDEX: {{BLOCK_INDEX}}
 RANGE TEXT / FULL SEMANTIC RANGE:
 {{RANGE_TEXT}}
 
-CURRENT SUBRANGE TEXT / HIGHEST FACTUAL PRIORITY:
+CURRENT SUBRANGE TEXT / CURRENT ACTION-BEAT PRIORITY:
 {{SUBRANGE_TEXT}}
+
+BLOCK METADATA / NON-LYRICAL CONTEXT:
+{{BLOCK_CONTEXT}}
 
 GLOBAL SONG CONTEXT:
 {{SONG_CONTEXT_JSON}}
@@ -29,13 +32,26 @@ IDENTITY CONTRACT / WORLD IDENTITY ONLY:
 STYLE CONTRACT / RENDERING ONLY:
 {{STYLE_CONTRACT_JSON}}
 
-PREVIOUS FAILED RESULT, IF ANY:
-{{PREVIOUS_RESULT_JSON}}
+PREVIOUS CRITIC FEEDBACK FROM PREVIOUS ATTEMPT, IF ANY:
+{{PREVIOUS_CRITIC_FEEDBACK_JSON}}
+
+Feedback usage:
+- PREVIOUS_CRITIC_FEEDBACK_JSON is repair guidance only, not source material.
+- Apply only concrete issues/repairs relevant to this role.
+- Do not quote, summarize, debate, or copy previous feedback.
+- Do not mention previous attempts, scores, or repairs in the output.
+- Generate a fresh compact JSON object; do not patch or repeat old drafts.
+- Ignore feedback that asks to remove, replace, weaken, or avoid source-required style/directive phrases.
+
+Planner retry rule:
+- Use feedback only to improve semantic planning. Do not write image_prompt or video_prompt.
 
 {{LITERAL_SCENE_RULES}}
 
 Return ONLY valid JSON with exactly these keys:
 {
+  "range_narrative_agent": "",
+  "range_setting": "",
   "main_subject": "",
   "main_action": "",
   "setting": "",
@@ -46,10 +62,10 @@ Return ONLY valid JSON with exactly these keys:
   "avoid_as_main_subject": []
 }
 
-Compatibility note:
-- The runner requires main_subject, main_action, setting, emotional_intent, visual_consequence, must_show, avoid_as_main_subject.
-- identity_anchors_to_show is optional for code but useful for the prompt writer.
-- Do not add lyric_grounding_check, continuity_notes, novelty_requirement, or parser copies.
+JSON-only discipline:
+- No analysis, no reasoning text, no markdown, no comments, no prose outside JSON.
+- Return the required object only; close the final brace and stop.
+- Prefer short phrases and empty arrays over explanatory filler.
 
 Compact output limits:
 - String fields max 12 words each.
@@ -58,26 +74,29 @@ Compact output limits:
 - No explanations, prompt prose, copied lyric lines, or alternate plans.
 
 Priority order:
-1. Current subrange text.
-2. Full range text if subrange is sparse.
-3. Bracket directives as mood/section metadata only.
-4. Song context and identity contract as low-priority inventory/design lens.
-5. Style contract as medium/look only.
-6. Previous visuals for consistency only, never as a scene template.
+1. RANGE VISUAL STATE scene_contract for main_subject and setting after the first subrange.
+2. Full semantic range for the stable narrative agent, viewpoint, scene, and relationships.
+3. Current subrange for this beat's action, emotion, prop emphasis, and consequence.
+4. Song context for recurring narrative-agent identity and full-song continuity.
+5. Style/identity contracts for rendering and design.
+6. Block metadata for mood only.
 
 Lyric grounding:
-- main_subject and main_action must come from current lyrics/range meaning.
-- If lyrics imply a group, use a group subject; do not collapse it into one iconic character.
-- If lyrics name or imply a setting/path/environment, that local setting wins.
-- Concrete global anchors may be central only when current lyrics mention or clearly imply them.
-- must_show contains only elements grounded in current subrange/range lyrics.
+- Technical subranges are consecutive beats of ONE scene, not independent scene prompts.
+- range_narrative_agent and range_setting describe the one stable scene for the FULL RANGE, independent of technical slicing.
+- On the first subrange, choose range_narrative_agent and range_setting from the FULL RANGE. Prefer its narrator, viewpoint character, recurring actor, or affected group over an isolated prop.
+- main_subject must copy range_narrative_agent exactly; setting must copy range_setting exactly.
+- A first-person or implied narrative agent may be grounded by the full range and song context even when the current slice names only their prop or action.
+- An object becomes main_subject only when the full range genuinely has no acting/affected agent and the object itself is the narrative focus.
+- On later subranges, range_narrative_agent and main_subject both copy scene_contract.main_subject EXACTLY; range_setting and setting both copy scene_contract.setting EXACTLY.
+- Sparse fragments inherit agent, setting, and relational meaning from the full range and scene_contract.
+- Current subrange controls what the locked subject does and what visibly changes; it does not reset casting or location.
+- must_show contains locally grounded details that can coexist with the locked subject and setting.
 - identity_anchors_to_show defaults to [] and may contain only one local supporting anchor that directly helps the lyric event.
-- Do not copy concrete anchors from contracts, song context, or previous visuals into main_subject, setting, must_show, destination, or composition center without lyric support.
-- Treat malformed concrete continuity requirements as optional inventory only.
-- Put over-dominant unsupported anchors into avoid_as_main_subject.
+- Put locally mentioned props/details that must not replace the narrative agent into avoid_as_main_subject.
 
 Single-shot planning:
-- Plan one continuous visible event: one subject/group, one place, one dominant lighting/color grade, one action path.
-- No internal montage, cut, scene jump, late new destination, or final tableau reveal.
+- Plan one continuous visible beat inside the range's locked subject, place, lighting family, and action path.
+- No scene jump, late new destination, or unrelated tableau. Editing rhythm may follow explicit raw-style requirements without changing subject, setting, or event.
 - visual_consequence must be a direct changed state inside the same scene.
 - Avoid idle pose, mood board, abstract atmosphere, or camera-only action.

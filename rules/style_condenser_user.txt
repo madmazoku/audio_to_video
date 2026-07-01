@@ -6,11 +6,25 @@ Range index if range-specific: {{BLOCK_INDEX}}
 RAW VIDEO STYLE:
 {{RAW_VIDEO_STYLE}}
 
+DETERMINISTIC HARD DIRECTIVES EXTRACTED BY RUNNER:
+{{ENFORCED_STYLE_CONSTRAINTS_JSON}}
+
 PARSED SOURCE FACTS:
 {{PARSED_STYLE_JSON}}
 
-PREVIOUS FAILED RESULT / REPAIR CONTEXT:
-{{PREVIOUS_RESULT_JSON}}
+PREVIOUS CRITIC FEEDBACK FROM PREVIOUS ATTEMPT, IF ANY:
+{{PREVIOUS_CRITIC_FEEDBACK_JSON}}
+
+Feedback usage:
+- PREVIOUS_CRITIC_FEEDBACK_JSON is repair guidance only, not source material.
+- Apply only concrete issues/repairs relevant to this role.
+- Do not quote, summarize, debate, or copy previous feedback.
+- Do not mention previous attempts, scores, or repairs in the output.
+- Generate a fresh compact JSON object; do not patch or repeat old drafts.
+- Ignore feedback that asks to remove, replace, weaken, or avoid source-required style/directive phrases.
+
+Writer retry rule:
+- Use feedback only to improve the contracts. Do not add non-source policy or old draft text.
 
 Return ONLY valid JSON with exactly these top-level keys:
 {
@@ -31,18 +45,18 @@ Return ONLY valid JSON with exactly these top-level keys:
     "location_anchors": [],
     "prop_or_symbol_anchors": [],
     "style_continuity_rules": [],
-    "avoid_generic_drift": [],
-    "anchor_usage_rule": ""
+    "avoid_generic_drift": []
   }
 }
 
-Compatibility note:
-- Keep exactly these fields because the runner structurally requires the older core contract fields.
-- Do not add extra arrays such as separate negative_medium_terms, negative_style_terms, or parser copies.
+JSON-only discipline:
+- No analysis, no reasoning text, no markdown, no comments, no prose outside JSON.
+- Return the required object only; close the final brace and stop.
+- Prefer short phrases and empty arrays over explanatory filler.
 
 Compact output limits:
-- Summaries and anchor_usage_rule: max 16 words each.
-- required_style_prefix: max 10 words.
+- Summaries: max 16 words each.
+- required_style_prefix has no word cap when preserving explicit hard directives; never truncate them.
 - Each array max 5 items; optional_anchor_pool max 7.
 - Each array item max 6 words.
 - No explanations, no copied paragraphs, no examples, no duplicate meaning.
@@ -50,14 +64,22 @@ Compact output limits:
 Universal source rules:
 - Every non-empty field must be grounded in PARSED SOURCE FACTS or RAW VIDEO STYLE.
 - Do not invent unrelated medium, genre, era, world, species, technology, setting, palette, character, or plot.
-- style_must_not contains only explicit source negatives plus pipeline safety: current lyrics remain primary; no idle/camera-only clips.
+- style_must_not contains only explicit source negatives. Do not put pipeline policy here.
 - Never put a required positive medium/technique/style into style_must_not. If the source itself conflicts, preserve the positive source term and mention the conflict compactly in style_must_not only if it is explicit.
 - No project-default bans: only source-grounded negatives belong in style_must_not.
+- Pipeline policy such as current-lyrics primacy, idle/camera-only prevention, anchor optionality, or generation safety belongs in prompt writer/critic rules, not this contract.
 
 Style contract rules:
-- required_style_prefix is a short copyable prompt prefix from positive source medium/technique/look.
+- required_style_prefix must contain every required_style_phrases item intact and in source order. It is an opaque rendering instruction, regardless of the named medium, style, or hybrid combination.
+- Every positive source_style_payload item from hard directives must be preserved in at least one style_contract field.
+- Put source camera, lens, editing, and motion directions into cinematography_rules or motion_style_rules.
+- Put source design/look/palette/texture/environment-style terms into allowed_style_elements or lighting_color_texture_rules.
+- Every forbidden_style_phrases item must appear intact in style_must_not.
+- Do not move any part of a required style phrase into identity_contract or optional anchors.
+- If there is no explicit required phrase, derive required_style_prefix from positive source medium/technique/look.
 - visual_style_summary summarizes medium/look/palette, not narrative plot.
 - allowed_style_elements are desired source motifs/styles, not required every-clip content.
+- Prefer source terms and compact visible style cues over generic labels; do not invent non-source plot.
 
 Identity anchor demotion:
 - required_recurring_anchors are broad invariants only: overall identity/world class, subject/body class, tone class, or universal design lens.
@@ -65,4 +87,3 @@ Identity anchor demotion:
 - Concrete motifs go into optional_anchor_pool, character_or_faction_anchors, location_anchors, or prop_or_symbol_anchors.
 - style_continuity_rules must stay abstract: rendering consistency, palette family, tone, body/design logic, broad world class, atmosphere.
 - If unsure, demote the anchor. Under-forcing is safer than over-forcing.
-- anchor_usage_rule must say current lyrics choose main subject/action/setting; anchors are optional support unless lyrics mention or imply them.

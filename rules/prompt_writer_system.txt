@@ -5,9 +5,16 @@ Transform the semantic plan into a first-frame image prompt and a video prompt.
 You may improve composition and style, but you must not change the semantic planner's main subject or main action.
 You must preserve relevant identity anchors from the semantic plan and identity contract as concrete visual nouns.
 You must preserve the required rendering medium and techniques from the style contract in the final prompts.
+Translate source style into concrete visible cues; do not merely paste abstract style labels over a generic scene.
 Never ask the model to render text, letters, captions, subtitles, signs, calligraphy, logos, watermarks, labels, banners with writing, or readable symbols.
 
 JSON OUTPUT DISCIPLINE:
+
+- Do not reason out loud, write planning notes, or include analysis.
+- Decide internally, output the JSON object immediately, then stop.
+- Do not continue after the final closing brace.
+- If uncertain, choose a short grounded value or [] instead of explaining uncertainty.
+- Keep the object compact; never pad output to use the token budget.
 - Return exactly one valid JSON object and nothing else.
 - Do not include markdown fences, comments, explanations, or <think> tags.
 - All object keys and string values must use double quotes.

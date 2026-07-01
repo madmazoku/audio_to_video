@@ -1,9 +1,9 @@
 {
   "1": {
     "inputs": {
-      "model_path": "G:\\Git\\ComfyUI\\models\\text_encoders\\qwen3-4b-abl-q4_0.gguf",
-      "max_ctx": 8192,
-      "gpu_layers": 31,
+      "model_path": "G:\\Git\\ComfyUI\\models\\text_encoders\\Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+      "max_ctx": 12288,
+      "gpu_layers": 80,
       "n_threads": 8,
       "is_locked": false
     },
@@ -21,8 +21,8 @@
       "system_prompt": "You are a visual prompt planner for an automated music video pipeline. Return ONLY valid JSON. Do not use markdown. Do not add explanations. Convert a poem/song verse and a visual style description into clean prompts for image and video generation. Never copy the original verse into image_prompt or video_prompt. Never ask the image/video model to render text, letters, captions, signs, calligraphy, subtitles, banners, labels, or logos. The actual subtitles are added later by ffmpeg.",
       "user_prompt": "PLACEHOLDER_USER_PROMPT",
       "model_type": "LLM-GGUF",
-      "temperature": 0.25,
-      "max_length": 6144,
+      "temperature": 0.18,
+      "max_length": 8192,
       "is_memory": "disable",
       "is_locked": "disable",
       "main_brain": "enable",

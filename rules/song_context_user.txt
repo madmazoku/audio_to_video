@@ -6,8 +6,19 @@ PARSED SONG FACTS:
 PARSER TECHNICAL STATUS:
 {{PARSER_STATUS_JSON}}
 
-PREVIOUS FAILED RESULT / REPAIR CONTEXT:
-{{PREVIOUS_RESULT_JSON}}
+PREVIOUS CRITIC FEEDBACK FROM PREVIOUS ATTEMPT, IF ANY:
+{{PREVIOUS_CRITIC_FEEDBACK_JSON}}
+
+Feedback usage:
+- PREVIOUS_CRITIC_FEEDBACK_JSON is repair guidance only, not source material.
+- Apply only concrete issues/repairs relevant to this role.
+- Do not quote, summarize, debate, or copy previous feedback.
+- Do not mention previous attempts, scores, or repairs in the output.
+- Generate a fresh compact JSON object; do not patch or repeat old drafts.
+- Ignore feedback that asks to remove, replace, weaken, or avoid source-required style/directive phrases.
+
+Writer retry rule:
+- Use feedback only to improve this visual bible JSON. Do not add unsupported facts to satisfy repairs.
 
 Return ONLY valid JSON with exactly these keys:
 {
@@ -21,21 +32,24 @@ Return ONLY valid JSON with exactly these keys:
   "avoid": []
 }
 
-Compatibility note:
-- Keep exactly these fields because the runner structurally requires them.
-- Do not add parser copies, section maps, explanations, or alternate context objects.
+JSON-only discipline:
+- No analysis, no reasoning text, no markdown, no comments, no prose outside JSON.
+- Return the required object only; close the final brace and stop.
+- Prefer short phrases and empty arrays over explanatory filler.
 
 Compact output limits:
 - song_summary and tone: max 16 words.
-- Each array max 5 items; visual_motifs max 6.
+- main_characters and visual_motifs max 6 items; other arrays max 5.
 - Each array item max 6 words.
 - No lyrics, no paragraph explanations, no image/video prompts.
 
 Rules:
 - Use parsed source facts only. Do not invent unsupported lore, genres, worlds, species, props, settings, or visual technologies.
+- main_characters must begin with every source_facts.narrative_agents item, preserving the central viewpoint/recurring actor before secondary characters.
+- song_summary must identify the central narrative agent and their through-line when the source provides one.
 - main_characters, recurring_locations, recurring_props, and visual_motifs are inventory lists only.
 - continuity_rules must be abstract and low-priority: broad world identity, tone, body/design logic, palette family, rendering style, or atmosphere.
 - continuity_rules must NOT contain concrete characters, factions, landmarks, buildings, props, symbols, weapons, rituals, destinations, or central composition requirements unless the source explicitly says they occur in every clip.
 - Do not make future clips resolve into a repeated landmark, destination, final reveal, or montage formula.
-- Current subrange lyrics always choose main subject, action, and setting later.
+- Full semantic ranges establish narrative agents and scenes; technical subranges later change only the current action beat.
 - avoid contains only source-grounded forbidden content/style/drift, not desired motifs.

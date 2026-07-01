@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import math
 import os
@@ -40,6 +41,8 @@ VIDEO_N = {
     "video_refine_noise": "283",
     "video_save": "327",
 }
+
+PROMPT_PIPELINE_SCHEMA_VERSION = 2
 
 
 def log_timestamp() -> str:
@@ -2292,6 +2295,28 @@ def load_block_video_styles(input_dir: Path, default_video_style: str, debug_dir
 
 
 
+def choose_effective_style_source(
+    block_index: int,
+    default_video_style: str,
+    block_video_styles: Dict[int, str],
+) -> Tuple[str, str]:
+    if block_index in block_video_styles:
+        return block_video_styles[block_index], f"range_{block_index:03d}"
+    return default_video_style, "global"
+
+
+def style_contract_path(style_dir: Path, style_source_id: str) -> Path:
+    if style_source_id == "global":
+        return style_dir / "global_style_contract.json"
+    return style_dir / f"{style_source_id}_style_contract.json"
+
+
+def identity_contract_path(style_dir: Path, style_source_id: str) -> Path:
+    if style_source_id == "global":
+        return style_dir / "global_identity_contract.json"
+    return style_dir / f"{style_source_id}_identity_contract.json"
+
+
 def is_bracket_directive_line(line: str) -> bool:
     stripped = line.strip()
     return len(stripped) >= 2 and stripped.startswith("[") and stripped.endswith("]")
@@ -4067,26 +4092,67 @@ def prompt_package_from(value: Dict[str, Any]) -> Dict[str, str]:
     return {k: str(src[k]).strip() for k in required}
 
 
-def choose_effective_style_source(
-    block_index: int,
-    default_video_style: str,
-    block_video_styles: Dict[int, str],
-) -> Tuple[str, str]:
-    if block_index in block_video_styles:
-        return block_video_styles[block_index], f"range_{block_index:03d}"
-    return default_video_style, "global"
+def normalized_constraint_text(value: Any) -> str:
+    """Normalize prose for deterministic phrase containment checks."""
+    return " ".join(re.findall(r"\w+", str(value).casefold(), flags=re.UNICODE))
 
 
-def style_contract_path(style_dir: Path, style_source_id: str) -> Path:
-    if style_source_id == "global":
-        return style_dir / "global_style_contract.json"
-    return style_dir / f"{style_source_id}_style_contract.json"
+def text_sha256(value: str) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
 
-def identity_contract_path(style_dir: Path, style_source_id: str) -> Path:
-    if style_source_id == "global":
-        return style_dir / "global_identity_contract.json"
-    return style_dir / f"{style_source_id}_identity_contract.json"
+def phrase_is_present(text: str, phrase: str) -> bool:
+    expected = normalized_constraint_text(phrase)
+    return bool(expected) and expected in normalized_constraint_text(text)
+
+
+def extract_enforced_style_constraints(raw_style: str) -> Dict[str, List[str]]:
+    """Extract explicit, style-agnostic hard directives from video_style text.
+
+    The directive payload stays opaque: it may describe animation, painting,
+    photography, children's drawings, pixel art, or any other visual medium.
+    """
+    required_prefixes = (
+        "force visual style as",
+        "required visual style",
+        "must use visual style",
+    )
+    source_payload_prefixes = required_prefixes + (
+        "use design as",
+        "make movie as",
+        "camera style",
+        "motion style",
+        "visual design",
+    )
+    forbidden_prefixes = (
+        "never use",
+        "must not use",
+        "forbid",
+        "avoid visual style",
+    )
+    required: List[str] = []
+    source_payloads: List[str] = []
+    forbidden: List[str] = []
+    for raw_line in str(raw_style).splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        label, value = line.split(":", 1)
+        label_norm = " ".join(label.casefold().split())
+        value = " ".join(value.split()).strip(" ,;")
+        if not value:
+            continue
+        if label_norm in source_payload_prefixes:
+            source_payloads.append(value)
+        if label_norm in required_prefixes:
+            required.append(value)
+        elif label_norm in forbidden_prefixes:
+            forbidden.extend(x.strip() for x in re.split(r"[,;]", value) if x.strip())
+    return {
+        "required_style_phrases": list(dict.fromkeys(required)),
+        "source_style_payloads": list(dict.fromkeys(source_payloads)),
+        "forbidden_style_phrases": list(dict.fromkeys(forbidden)),
+    }
 
 
 def contract_bundle_from(value: Dict[str, Any]) -> Dict[str, Any]:
@@ -4115,8 +4181,10 @@ def normalize_style_identity_bundle(contract: Dict[str, Any], raw_style: str) ->
     bundle = contract_bundle_from(contract)
     style_required = [
         "visual_style_summary",
+        "required_style_prefix",
         "cinematography_rules",
         "motion_style_rules",
+        "lighting_color_texture_rules",
         "allowed_style_elements",
         "style_must_not",
     ]
@@ -4129,7 +4197,6 @@ def normalize_style_identity_bundle(contract: Dict[str, Any], raw_style: str) ->
         "prop_or_symbol_anchors",
         "style_continuity_rules",
         "avoid_generic_drift",
-        "anchor_usage_rule",
     ]
 
     style_contract = dict(bundle["style_contract"])
@@ -4145,6 +4212,7 @@ def normalize_style_identity_bundle(contract: Dict[str, Any], raw_style: str) ->
     list_fields = [
         "cinematography_rules",
         "motion_style_rules",
+        "lighting_color_texture_rules",
         "allowed_style_elements",
         "style_must_not",
         "required_recurring_anchors",
@@ -4171,11 +4239,16 @@ def critic_metrics(critic_json: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("Critic JSON missing key: score")
     issues = critic_json.get("issues", [])
     repairs = critic_json.get("repairs", [])
+    if not isinstance(issues, list):
+        raise RuntimeError("Critic JSON field must be a list: issues")
+    if not isinstance(repairs, list):
+        raise RuntimeError("Critic JSON field must be a list: repairs")
+    success = bool(critic_json.get("success"))
     return {
-        "success": bool(critic_json.get("success")),
+        "success": success,
         "score": float(critic_json.get("score", 0.0)),
-        "issue_count": len(issues) if isinstance(issues, list) else 0,
-        "repair_count": len(repairs) if isinstance(repairs, list) else 0,
+        "issue_count": len(issues),
+        "repair_count": len(repairs),
     }
 
 
@@ -4187,10 +4260,10 @@ def build_quality_loop_summary(
     max_attempts: int,
 ) -> Dict[str, Any]:
     warning = None
-    if selection_status == "best_failed":
+    if selection_status == "failed":
         warning = (
             f"{task_name} did not receive critic success=true in {max_attempts} attempts; "
-            f"using best scored attempt {int(final_result.get('attempt', 0)) + 1}."
+            f"best scored failed attempt was {int(final_result.get('attempt', 0)) + 1}."
         )
     return {
         "task_name": task_name,
@@ -4308,6 +4381,131 @@ def make_default_critic_json(reason: str, repair: str) -> Dict[str, Any]:
     }
 
 
+
+
+def feedback_text_conflicts_with_source_style(text: Any, base_context: Dict[str, Any]) -> bool:
+    """Return true when critic feedback asks to remove a source-required style directive.
+
+    Feedback is allowed to improve wording or add missing source style. It must not
+    poison the retry loop by telling parser/writer to remove a style phrase that
+    came from RAW_VIDEO_STYLE, STYLE_CONTRACT, or hard extracted constraints.
+    """
+    raw = str(text or "")
+    norm = set(re.findall(r"[\w']+", raw.casefold(), flags=re.UNICODE))
+    if not norm:
+        return False
+    destructive = {
+        "remove", "omit", "drop", "delete", "exclude", "avoid", "forbid", "ban",
+        "replace", "weaken", "strip", "mismatch", "contradict", "contradicts",
+        "contradiction", "conflict", "conflicts", "unsupported", "invented",
+        "unwanted", "wrong", "scene", "change",
+    }
+    if not (norm & destructive):
+        return False
+
+    protected_values: List[str] = []
+    constraints = base_context.get("ENFORCED_STYLE_CONSTRAINTS_JSON")
+    if isinstance(constraints, dict):
+        for key in ("required_style_phrases", "source_style_payloads"):
+            vals = constraints.get(key)
+            if isinstance(vals, list):
+                protected_values.extend(str(v) for v in vals if str(v).strip())
+    for key in ("RAW_VIDEO_STYLE",):
+        if str(base_context.get(key, "")).strip():
+            protected_values.append(str(base_context.get(key)))
+    style_contract = base_context.get("STYLE_CONTRACT_JSON")
+    if isinstance(style_contract, dict):
+        for key in ("required_style_prefix", "cinematography_rules", "motion_style_rules", "lighting_color_texture_rules", "allowed_style_elements"):
+            val = style_contract.get(key)
+            if isinstance(val, list):
+                protected_values.extend(str(v) for v in val if str(v).strip())
+            elif str(val or "").strip():
+                protected_values.append(str(val))
+
+    stop = {
+        "style", "visual", "prompt", "required", "source", "use", "as", "the", "and",
+        "with", "not", "no", "image", "video", "movie", "make", "design", "frame",
+        "setting", "tone", "camera", "shot", "shots", "scene", "action",
+    }
+    protected_tokens = set()
+    for value in protected_values:
+        for tok in re.findall(r"[\w']+", str(value).casefold(), flags=re.UNICODE):
+            if len(tok) >= 3 and tok not in stop:
+                protected_tokens.add(tok)
+    return bool(norm & protected_tokens)
+
+
+def sanitize_compact_critic_feedback(feedback: Dict[str, Any], base_context: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(feedback, dict):
+        return feedback
+    out = dict(feedback)
+    filtered: List[Dict[str, str]] = []
+    for key in ("issues", "repairs"):
+        vals = out.get(key, [])
+        if not isinstance(vals, list):
+            vals = [str(vals)]
+        keep = []
+        for item in vals:
+            if feedback_text_conflicts_with_source_style(item, base_context):
+                filtered.append({"field": key, "text": str(item)})
+                continue
+            keep.append(item)
+        out[key] = keep
+    if filtered:
+        out["discarded_feedback"] = filtered[:8]
+        out["instruction"] = (
+            "Apply remaining critic repairs only. Discarded feedback conflicted with source-required style directives; "
+            "preserve RAW VIDEO STYLE and hard style phrases."
+        )
+    return out
+
+
+def build_compact_critic_feedback(
+    attempt: int,
+    failed_stage: Optional[str],
+    parser_status: Dict[str, Any],
+    writer_status: Dict[str, Any],
+    critic_status: Dict[str, Any],
+    critic_json: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Feedback passed from a failed attempt to the next parser/writer attempt.
+
+    It intentionally contains only critic issues/repairs and compact technical
+    status, never previous parser/writer payloads. This keeps retries focused on
+    improvements without causing the next critic/writer to reprocess stale drafts.
+    """
+    issues = critic_json.get("issues", []) if isinstance(critic_json, dict) else []
+    repairs = critic_json.get("repairs", []) if isinstance(critic_json, dict) else []
+    if not isinstance(issues, list):
+        issues = [str(issues)]
+    if not isinstance(repairs, list):
+        repairs = [str(repairs)]
+
+    technical_errors = []
+    for label, status in [
+        ("parser", parser_status),
+        ("writer", writer_status),
+        ("critic", critic_status),
+    ]:
+        err = (status or {}).get("technical_error")
+        if err:
+            technical_errors.append({
+                "stage": label,
+                "error": _truncate_for_prompt(str(err), 300),
+            })
+
+    return {
+        "previous_attempt": int(attempt) + 1,
+        "previous_failed_stage": failed_stage or "",
+        "previous_success": bool(critic_json.get("success", False)) if isinstance(critic_json, dict) else False,
+        "previous_score": float(critic_json.get("score", 0.0)) if isinstance(critic_json, dict) else 0.0,
+        "issues": _truncate_for_prompt(issues, 400),
+        "repairs": _truncate_for_prompt(repairs, 400),
+        "technical_errors": technical_errors,
+        "instruction": "Apply these critic repairs in the next fresh answer. Do not copy previous drafts.",
+    }
+
+
 def run_llm_quality_loop(
     planner_template: Dict[str, Any],
     rules: Dict[str, str],
@@ -4329,27 +4527,25 @@ def run_llm_quality_loop(
     parser_context_key: str,
     writer_payload_context_key: str,
     writer_payload_from: Any,
-    build_previous_result: Any,
     validate_parser_result: Optional[Any] = None,
-    validate_final_payload: Optional[Any] = None,
     technical_repair: str = "Return valid JSON that matches the required schema exactly, then preserve the task constraints in the next attempt.",
 ) -> Dict[str, Any]:
     """Run a standardized parser -> writer -> critic LLM quality loop.
 
-    JSON is the official structured output protocol. Parser/writer stages own only
-    technical status (JSON parse / structural usability). Only the critic owns
-    success, score, issues, and repairs. Invalid JSON is never silently repaired;
-    it is passed to the critic and to the next attempt as a technical failed
-    attempt.
+    JSON is the official structured output protocol. Python only checks JSON
+    parsing and structural schema for parser/writer/critic. Only the critic owns
+    quality success, score, issues, and repairs. Invalid JSON is never silently
+    repaired; compact critic feedback from failed attempts is passed to the next
+    parser/writer attempt.
 
     The selected task artifact is always the writer artifact. The critic never
-    replaces or rewrites the task result; it only evaluates the writer artifact,
-    drives retries, and selects which writer attempt is accepted or chosen as
-    best_failed.
+    replaces, rewrites, or gets overwritten by Python post-validation. If no
+    attempt receives critic success=true, the best scored structurally usable
+    writer attempt is selected with a warning.
     """
     attempts: List[Dict[str, Any]] = []
     best: Optional[Dict[str, Any]] = None
-    previous_result: Optional[Dict[str, Any]] = None
+    previous_feedback: Optional[Dict[str, Any]] = None
     max_attempts = max(1, int(max_attempts))
 
     free_comfy_memory(comfy_url, f"before {display_name} llm loop", sleep_time=1)
@@ -4357,7 +4553,10 @@ def run_llm_quality_loop(
     for attempt in range(max_attempts):
         attempt_dir = task_dir / f"attempt_{attempt:03d}"
         attempt_dir.mkdir(parents=True, exist_ok=True)
-        common = {**base_context, "PREVIOUS_RESULT_JSON": previous_result or {}}
+        common = {
+            **base_context,
+            "PREVIOUS_CRITIC_FEEDBACK_JSON": previous_feedback or {},
+        }
 
         parser_status: Dict[str, Any] = {}
         writer_status: Dict[str, Any] = {}
@@ -4436,7 +4635,7 @@ def run_llm_quality_loop(
             writer_json = {"technical_error": str(exc), "stage": writer_stage_name, "stage_status": writer_status}
 
         try:
-            writer_payload = writer_payload_from(writer_json)
+            writer_payload = writer_payload_from(writer_json, parser_json)
             if writer_status:
                 writer_status = {**writer_status, "structural_ok": True, "technical_error": writer_status.get("technical_error")}
         except Exception as exc:
@@ -4450,8 +4649,13 @@ def run_llm_quality_loop(
             }
 
         # Critic stage: always attempted after writer. It is the only owner of success/score.
+        # Do not show the previous failed writer artifact to the critic: the
+        # critic must judge only the current writer payload. Previous repair
+        # context is useful for parser/writer retries, but it confused local
+        # LLM critics into re-criticizing stale failed payloads.
         critic_context = {
             **writer_context,
+            "PREVIOUS_CRITIC_FEEDBACK_JSON": {},
             writer_payload_context_key: writer_payload,
             "WRITER_JSON": writer_json,
             "WRITER_STATUS_JSON": writer_status,
@@ -4495,33 +4699,16 @@ def run_llm_quality_loop(
             )
             metrics = critic_metrics(critic_json)
 
-        # The task result is the writer artifact. The critic never replaces it.
-        # It only evaluates this writer artifact and drives retry/selection.
-        try:
-            final_payload = writer_payload
-            if validate_final_payload is not None:
-                validate_final_payload(final_payload)
-        except Exception as exc:
-            failed_stage = failed_stage or "writer_payload"
-            final_payload = None
-            if not critic_json.get("issues"):
-                critic_json["issues"] = []
-            if not critic_json.get("repairs"):
-                critic_json["repairs"] = []
-            if isinstance(critic_json.get("issues"), list):
-                critic_json["issues"].append(f"Writer artifact is not structurally usable as the task result: {exc}")
-            if isinstance(critic_json.get("repairs"), list):
-                critic_json["repairs"].append(technical_repair)
-            critic_json["success"] = False
-            critic_json["score"] = min(float(critic_json.get("score", 0.0)), 0.0)
-            metrics = critic_metrics(critic_json)
+        # The task result is the writer artifact. Python performs no semantic
+        # post-validation here; quality is critic-owned.
+        final_payload = writer_payload
 
-        technical_failed = any(
+        writer_unusable = any(
             not st.get("structural_ok", False)
-            for st in [parser_status, writer_status, critic_status]
+            for st in [parser_status, writer_status]
             if st
         ) or final_payload is None
-        if technical_failed:
+        if writer_unusable:
             verdict = "technical_failed"
         elif metrics["success"]:
             verdict = "success"
@@ -4543,7 +4730,17 @@ def run_llm_quality_loop(
             "critic": critic_json,
             "critic_verdict": critic_json,
         }
-        previous_result = _truncate_for_prompt(build_previous_result(parser_json, final_payload or writer_payload or {}, critic_json), 700)
+        previous_feedback = sanitize_compact_critic_feedback(
+            build_compact_critic_feedback(
+                attempt=attempt,
+                failed_stage=failed_stage,
+                parser_status=parser_status,
+                writer_status=writer_status,
+                critic_status=critic_status,
+                critic_json=critic_json,
+            ),
+            base_context,
+        )
 
         attempts.append(result)
         write_json(attempt_dir / "attempt_result.json", result)
@@ -4560,8 +4757,25 @@ def run_llm_quality_loop(
             f"issues={int(result.get('issue_count', 0))} repairs={int(result.get('repair_count', 0))}"
         )
 
-        if result.get("result") is not None:
-            if best is None or float(result.get("score", 0.0)) > float(best.get("score", -1.0)):
+        if result.get("result") is not None and verdict != "technical_failed":
+            # Best failed fallback: prefer higher critic score; if the local
+            # critic collapses all scores to 0, prefer fewer issues/repairs and
+            # then the later attempt because it has seen repair context.
+            rank = (
+                float(result.get("score", 0.0)),
+                -int(result.get("issue_count", 0)),
+                -int(result.get("repair_count", 0)),
+                int(result.get("attempt", 0)),
+            )
+            best_rank = None
+            if best is not None:
+                best_rank = (
+                    float(best.get("score", 0.0)),
+                    -int(best.get("issue_count", 0)),
+                    -int(best.get("repair_count", 0)),
+                    int(best.get("attempt", 0)),
+                )
+            if best is None or rank > best_rank:
                 best = result
         if result.get("success") and result.get("result") is not None:
             final_result = result
@@ -4571,7 +4785,7 @@ def run_llm_quality_loop(
         if best is None:
             raise RuntimeError(f"{display_name} failed before producing any usable structured result")
         final_result = best
-        selection_status = "best_failed"
+        selection_status = "failed"
 
     write_quality_loop_artifacts(task_dir, task_name, attempts, final_result, selection_status, max_attempts)
     write_json(task_dir / "selected_result.json", final_result)
@@ -4618,25 +4832,7 @@ def _truncate_for_prompt(value: Any, max_len: int = 900) -> Any:
     return value
 
 
-def _compact_retry_context(parsed_key: str, parsed_value: Any, payload_key: str, payload_value: Any, critic: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        parsed_key: _truncate_for_prompt(parsed_value, 700),
-        payload_key: _truncate_for_prompt(payload_value, 700),
-        "score": critic.get("score", 0),
-        "success": critic.get("success", False),
-        "issues": _truncate_for_prompt(critic.get("issues", []), 500),
-        "repairs": _truncate_for_prompt(critic.get("repairs", []), 500),
-    }
-
-def build_previous_contract_result_for_retry(
-    parsed_style: Dict[str, Any],
-    contract: Dict[str, Any],
-    critic: Dict[str, Any],
-) -> Dict[str, Any]:
-    return _compact_retry_context("failed_parsed_style", parsed_style, "failed_contract", contract, critic)
-
-
-def style_condenser_writer_payload(writer_json: Dict[str, Any]) -> Dict[str, Any]:
+def style_condenser_writer_payload(writer_json: Dict[str, Any], parser_json: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return contract_bundle_from(writer_json)
 
 
@@ -4663,6 +4859,7 @@ def run_style_condenser_attempt_loop(
             "STYLE_SOURCE_ID": style_source_id,
             "BLOCK_INDEX": block_index,
             "RAW_VIDEO_STYLE": raw_style,
+            "ENFORCED_STYLE_CONSTRAINTS_JSON": extract_enforced_style_constraints(raw_style),
         },
         parser_stage_name="style_condenser_parser",
         parser_system_rule="style_condenser_parser_system.txt",
@@ -4676,8 +4873,6 @@ def run_style_condenser_attempt_loop(
         parser_context_key="PARSED_STYLE_JSON",
         writer_payload_context_key="CONTRACT_JSON",
         writer_payload_from=style_condenser_writer_payload,
-        build_previous_result=build_previous_contract_result_for_retry,
-        validate_final_payload=lambda payload: normalize_style_identity_bundle(payload, raw_style),
         technical_repair="Return valid JSON for parser/writer/critic with the required style and identity contract schema; preserve concrete identity anchors from the raw style.",
     )
     write_json(debug_stage_dir / "final_contract.json", final_result)
@@ -4698,8 +4893,21 @@ def get_style_and_identity_contracts(
     style_dir.mkdir(parents=True, exist_ok=True)
     style_path = style_contract_path(style_dir, style_source_id)
     identity_path = identity_contract_path(style_dir, style_source_id)
-    if style_path.exists() and identity_path.exists():
-        return load_json(style_path), load_json(identity_path)
+    meta_path = style_dir / f"{style_source_id}_contract_meta.json"
+    raw_style_sha256 = text_sha256(raw_style)
+    if style_path.exists() and identity_path.exists() and meta_path.exists():
+        meta = load_json(meta_path)
+        if (
+            int(meta.get("prompt_pipeline_schema_version", 0)) == PROMPT_PIPELINE_SCHEMA_VERSION
+            and str(meta.get("raw_style_sha256", "")) == raw_style_sha256
+        ):
+            cached_bundle = {
+                "style_contract": load_json(style_path),
+                "identity_contract": load_json(identity_path),
+            }
+            return normalize_style_identity_bundle(cached_bundle, raw_style)
+    if style_path.exists() or identity_path.exists():
+        log(f"  [stage] rebuild stale style contract: {style_source_id}")
 
     debug_stage_dir = debug_dir / "style" / style_source_id
     log(f"  [stage] condense video style + identity: {style_source_id}")
@@ -4720,23 +4928,39 @@ def get_style_and_identity_contracts(
         json.dumps({"style_contract": style_contract, "identity_contract": identity_contract}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    write_json(meta_path, {
+        "prompt_pipeline_schema_version": PROMPT_PIPELINE_SCHEMA_VERSION,
+        "style_source_id": style_source_id,
+        "raw_style_sha256": raw_style_sha256,
+        "enforced_style_constraints": extract_enforced_style_constraints(raw_style),
+    })
     return style_contract, identity_contract
 
 
 
-def prompt_writer_payload(writer_json: Dict[str, Any]) -> Dict[str, str]:
+def prompt_writer_payload(writer_json: Dict[str, Any], parser_json: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    # Writer extraction is technical only: valid JSON plus required prompt fields.
+    # Semantic/style quality is critic-owned. Do not turn imperfect wording into
+    # a technical failure, otherwise the loop cannot select the best writer result
+    # when the critic rejects all attempts.
     return prompt_package_from(writer_json)
 
 
 
-def build_previous_prompt_result_for_retry(plan: Dict[str, Any], prompt: Dict[str, str], critic: Dict[str, Any]) -> Dict[str, Any]:
-    return _compact_retry_context("failed_semantic_plan", plan, "failed_prompt", prompt, critic)
-
-
-def validate_semantic_plan(plan: Dict[str, Any]) -> None:
-    for key in ["main_subject", "main_action", "setting", "emotional_intent", "visual_consequence", "must_show", "avoid_as_main_subject"]:
+def validate_semantic_plan(
+    plan: Dict[str, Any],
+    range_visual_state: Optional[Dict[str, Any]] = None,
+) -> None:
+    for key in ["range_narrative_agent", "range_setting", "main_subject", "main_action", "setting", "emotional_intent", "visual_consequence", "must_show", "avoid_as_main_subject"]:
         if key not in plan:
             raise RuntimeError(f"Semantic planner JSON missing key: {key}")
+    for key in ["range_narrative_agent", "range_setting", "main_subject", "main_action", "setting", "emotional_intent", "visual_consequence"]:
+        if not str(plan.get(key, "")).strip():
+            raise RuntimeError(f"Semantic planner JSON field must not be empty: {key}")
+    for key in ["must_show", "avoid_as_main_subject"]:
+        if not isinstance(plan.get(key), list):
+            raise RuntimeError(f"Semantic planner JSON field must be a list: {key}")
+
 
 
 def compact_for_llm(value: Any, limit: int = 900) -> str:
@@ -4754,29 +4978,34 @@ def build_range_visual_state_after_subrange(
 ) -> Dict[str, Any]:
     state = dict(previous_state or {})
     sub_i = int(subrange.get("sub_index", 1))
+    semantic_plan = prompt.get("_semantic_plan") if isinstance(prompt.get("_semantic_plan"), dict) else {}
     current = {
         "subrange_index": sub_i,
         "subrange_text": compact_for_llm(str(subrange.get("text", "")), 360),
         "scene_summary": compact_for_llm(prompt.get("scene_summary", ""), 500),
-        "image_prompt": compact_for_llm(prompt.get("image_prompt", ""), 700),
-        "video_prompt": compact_for_llm(prompt.get("video_prompt", ""), 700),
+        "main_action": compact_for_llm(semantic_plan.get("main_action", ""), 180),
+        "visual_consequence": compact_for_llm(semantic_plan.get("visual_consequence", ""), 240),
     }
     if not state:
         state = {
             "mode": "established_from_first_subrange",
             "established_by_subrange": sub_i,
             "continuity_lock": (
-                "Inside the same semantic range, later subranges should continue the same visible scene, "
-                "main subject, location, scale, palette, and identity lens unless the current subrange explicitly requires a change."
+                "Technical subranges inside one semantic range are consecutive beats of one scene. "
+                "Later semantic plans must copy the locked main_subject and setting exactly."
             ),
-            "established_scene": current,
-            "recent_subranges": [current],
+            "scene_contract": {
+                "main_subject": str(semantic_plan.get("range_narrative_agent") or semantic_plan.get("main_subject", "")).strip(),
+                "setting": str(semantic_plan.get("range_setting") or semantic_plan.get("setting", "")).strip(),
+                "style_prefix": str(prompt.get("_required_style_prefix", "")).strip(),
+            },
+            "recent_beats": [current],
         }
     else:
-        recent = list(state.get("recent_subranges") or [])
+        recent = list(state.get("recent_beats") or [])
         recent.append(current)
-        state["recent_subranges"] = recent[-4:]
-        state["last_scene"] = current
+        state["recent_beats"] = recent[-3:]
+        state["last_beat"] = current
     return state
 
 
@@ -4787,14 +5016,27 @@ def continuity_instruction_for_subrange(subrange: Dict[str, Any], range_visual_s
         return "Single-subrange semantic range: establish and complete one coherent scene."
     if sub_i == 1 or not range_visual_state:
         return (
-            "This is the first subrange of a multi-part semantic range. Establish a stable visual scene, "
-            "main subject, location, scale, palette, and identity lens that later subranges can continue."
+            "This is the first technical subrange of one semantic scene. Use the FULL SEMANTIC RANGE to establish "
+            "one stable narrative agent/main subject and one setting; use the current slice only for this beat's action."
         )
+    scene_contract = range_visual_state.get("scene_contract") or {}
     return (
-        "This is a later subrange inside the same semantic range. Treat it as a continuation of the established scene. "
-        "Preserve the same main subject, location, scale, palette, and identity/world lens unless the current subrange text explicitly demands a new one. "
-        "Change the action and visible consequence according to the current subrange; do not redesign the subject or restage the world."
+        "This is a later technical subrange of the same scene. Copy locked main_subject and setting exactly: "
+        f"main_subject={scene_contract.get('main_subject', '')!r}; setting={scene_contract.get('setting', '')!r}. "
+        "The current slice may change only action and visible consequence. A new semantic range, not a subrange, owns scene changes."
     )
+
+
+def compact_previous_visual_context(values: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for item in values[-5:]:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "segment": compact_for_llm(item.get("segment", ""), 80),
+            "scene_summary": compact_for_llm(item.get("scene_summary", ""), 320),
+        })
+    return out
 
 
 def run_prompt_attempt_loop(
@@ -4807,25 +5049,31 @@ def run_prompt_attempt_loop(
     block_index: int,
     range_text: str,
     subrange_text: str,
+    block_context: str,
     song_context: Dict[str, Any],
     local_context: str,
     previous_visual_context: List[Dict[str, str]],
     style_contract: Dict[str, Any],
     identity_contract: Dict[str, Any],
+    raw_style: str,
     prompt_max_attempts: int,
     range_visual_state: Optional[Dict[str, Any]] = None,
     subrange: Optional[Dict[str, Any]] = None,
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     continuity_instruction = continuity_instruction_for_subrange(subrange or {}, range_visual_state)
+    enforced_style_constraints = extract_enforced_style_constraints(raw_style)
     base_context = {
         "BLOCK_INDEX": block_index,
         "RANGE_TEXT": range_text,
         "SUBRANGE_TEXT": subrange_text,
+        "BLOCK_CONTEXT": block_context,
         "SONG_CONTEXT_JSON": song_context,
         "LOCAL_CONTEXT": local_context,
-        "PREVIOUS_VISUAL_CONTEXT_JSON": previous_visual_context[-8:],
+        "PREVIOUS_VISUAL_CONTEXT_JSON": compact_previous_visual_context(previous_visual_context),
         "RANGE_VISUAL_STATE_JSON": range_visual_state or {},
         "SUBRANGE_CONTINUITY_INSTRUCTION": continuity_instruction,
+        "RAW_VIDEO_STYLE": raw_style,
+        "ENFORCED_STYLE_CONSTRAINTS_JSON": enforced_style_constraints,
         "STYLE_CONTRACT_JSON": style_contract,
         "IDENTITY_CONTRACT_JSON": identity_contract,
         "LITERAL_SCENE_RULES": rules["literal_scene_rules.txt"],
@@ -4851,10 +5099,11 @@ def run_prompt_attempt_loop(
         parser_context_key="SEMANTIC_PLAN_JSON",
         writer_payload_context_key="PROMPT_PACKAGE_JSON",
         writer_payload_from=prompt_writer_payload,
-        build_previous_result=build_previous_prompt_result_for_retry,
-        validate_parser_result=validate_semantic_plan,
-        validate_final_payload=prompt_package_from,
-        technical_repair="Return valid JSON for semantic plan, prompt package, and critic. Keep the current subrange lyric event central and preserve relevant identity anchors without replacing the action.",
+        validate_parser_result=lambda plan: validate_semantic_plan(plan, range_visual_state),
+        technical_repair=(
+            "Return valid JSON; preserve every explicit style directive in both prompts; keep the range's locked "
+            "main subject and setting while changing only the current beat's action and consequence."
+        ),
     )
     final_prompt = prompt_package_from(final_result["result"])
     part_debug_dir.mkdir(parents=True, exist_ok=True)
@@ -4867,7 +5116,14 @@ def run_prompt_attempt_loop(
     plan_path = plans_dir / f"{plan_base_name}.json"
     plan_path.write_text(json.dumps(final_prompt, ensure_ascii=False, indent=2), encoding="utf-8")
     write_json(plans_dir / f"{plan_base_name}_final_result.json", final_result)
-    return final_prompt
+    returned = dict(final_prompt)
+    returned["_semantic_plan"] = dict(final_result.get("parser") or {})
+    required_phrases = enforced_style_constraints["required_style_phrases"]
+    returned["_required_style_prefix"] = (
+        ", ".join(required_phrases)
+        if required_phrases else str(style_contract.get("required_style_prefix", "")).strip()
+    )
+    return returned
 
 
 
@@ -4895,9 +5151,24 @@ def song_context_payload_from(value: Dict[str, Any]) -> Dict[str, Any]:
     return dict(src)
 
 
+def validate_parsed_song_facts(value: Dict[str, Any]) -> None:
+    facts = value.get("source_facts")
+    if not isinstance(facts, dict):
+        raise RuntimeError("Song parser JSON missing object: source_facts")
+    required = ["arc", "narrative_agents", "characters", "locations", "props", "motifs", "actions", "tone", "avoid"]
+    missing = [key for key in required if not isinstance(facts.get(key), list)]
+    if missing:
+        raise RuntimeError(f"Song parser source_facts missing list field(s): {missing}")
+    if not isinstance(value.get("sections"), list):
+        raise RuntimeError("Song parser JSON field must be a list: sections")
 
-def build_previous_song_context_result_for_retry(parsed_song: Dict[str, Any], song_context: Dict[str, Any], critic: Dict[str, Any]) -> Dict[str, Any]:
-    return _compact_retry_context("failed_parsed_song", parsed_song, "failed_song_context", song_context, critic)
+
+def song_context_writer_payload(
+    writer_json: Dict[str, Any],
+    parser_json: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return song_context_payload_from(writer_json)
+
 
 
 def get_or_create_song_context(
@@ -4912,10 +5183,20 @@ def get_or_create_song_context(
     """Load cached song_context.json or build it through the standard LLM quality loop."""
     plans_dir.mkdir(parents=True, exist_ok=True)
     clean_path = plans_dir / "song_context.json"
+    meta_path = plans_dir / "song_context_meta.json"
+    all_lyrics = lyrics_text_from_verses(verses)
+    source_sha256 = text_sha256(video_style + "\n\0\n" + all_lyrics)
 
+    if clean_path.exists() and meta_path.exists():
+        meta = load_json(meta_path)
+        if (
+            int(meta.get("prompt_pipeline_schema_version", 0)) == PROMPT_PIPELINE_SCHEMA_VERSION
+            and str(meta.get("source_sha256", "")) == source_sha256
+        ):
+            log(f"[stage] use cached song context: {clean_path}")
+            return song_context_payload_from(load_json(clean_path))
     if clean_path.exists():
-        log(f"[stage] use cached song context: {clean_path}")
-        return load_json(clean_path)
+        log(f"[stage] rebuild stale song context: {clean_path}")
 
     log("[stage] build missing song context")
     task_dir = plans_dir / "song_context_quality_loop"
@@ -4929,7 +5210,7 @@ def get_or_create_song_context(
         max_attempts=max_attempts,
         base_context={
             "VIDEO_STYLE": video_style,
-            "ALL_LYRICS": lyrics_text_from_verses(verses),
+            "ALL_LYRICS": all_lyrics,
         },
         parser_stage_name="song_context_parser",
         parser_system_rule="song_context_parser_system.txt",
@@ -4942,14 +5223,17 @@ def get_or_create_song_context(
         critic_user_rule="song_context_critic_user.txt",
         parser_context_key="PARSED_SONG_JSON",
         writer_payload_context_key="SONG_CONTEXT_JSON",
-        writer_payload_from=song_context_payload_from,
-        build_previous_result=build_previous_song_context_result_for_retry,
-        validate_final_payload=song_context_payload_from,
+        writer_payload_from=song_context_writer_payload,
+        validate_parser_result=validate_parsed_song_facts,
         technical_repair="Return valid JSON for song parser, song context writer, and critic. Keep reusable visual continuity facts grounded in the lyrics and visual style without quoting lyrics or inventing visible text.",
     )
     ctx = song_context_payload_from(final_result["result"])
     write_json(plans_dir / "song_context_final_result.json", final_result)
     clean_path.write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(meta_path, {
+        "prompt_pipeline_schema_version": PROMPT_PIPELINE_SCHEMA_VERSION,
+        "source_sha256": source_sha256,
+    })
     return ctx
 
 
@@ -5451,14 +5735,14 @@ def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any]) 
         )
     elif sub_text:
         subrange_section = (
-            "CURRENT SUBRANGE TEXT — HIGHEST FACTUAL PRIORITY:\n"
+            "CURRENT SUBRANGE TEXT — CURRENT ACTION BEAT:\n"
             + sub_text
-            + "\n\nDepict this current subrange as the main action. "
-              "Use the full semantic range only for continuity and meaning."
+            + "\n\nUse this slice for the current action and consequence. "
+              "Use the full semantic range for narrative agent, setting, relationships, and meaning."
         )
     else:
         subrange_section = (
-            "CURRENT SUBRANGE — HIGHEST FACTUAL PRIORITY:\n"
+            "CURRENT SUBRANGE — CURRENT ACTION BEAT:\n"
             "No lyrics are sung in this subrange. Continue the visual motion of this semantic range."
         )
 
@@ -5472,8 +5756,9 @@ def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any]) 
         f"{subrange_section}\n\n"
         "Priority rules:\n"
         "- Always follow VISUAL STYLE for medium, look, palette, character design, camera and rendering.\n"
-        "- For factual action, follow CURRENT SUBRANGE when it provides text.\n"
-        "- If this is not the first subrange of the semantic range, treat it as a continuation shot unless the current subrange explicitly changes subject or location.\n"
+        "- FULL SEMANTIC RANGE establishes the scene's narrative agent and setting.\n"
+        "- CURRENT SUBRANGE controls only the current action beat and consequence.\n"
+        "- Every later subrange is a continuation shot with the same main subject and setting.\n"
         "- Bracket directives are metadata, not sung lyrics and never visible text.\n"
         "- Do not render captions, signs, section labels, lyric cards, or written words."
     )
@@ -6538,6 +6823,15 @@ def main() -> None:
             log(f"  [subrange] {sub_i}/{sub_count} time={float(subrange['start']):.3f}s..{float(subrange['end']):.3f}s duration={sub_duration:.2f}s")
 
             current_instruction = build_subrange_instruction(block, subrange)
+            subrange_slice_text = str(subrange.get("text", "")).strip()
+            if subrange_slice_text:
+                directives = [str(x) for x in block.get("bracket_directives", []) if str(x).strip()]
+                prompt_block_context = (
+                    "Bracket directives (mood/section metadata only):\n" + "\n".join(f"- {x}" for x in directives)
+                    if directives else "No additional block metadata."
+                )
+            else:
+                prompt_block_context = current_instruction
             part_debug_dir = range_part_debug_dir(debug_dir, block_i, sub_i)
             part_debug_dir.mkdir(parents=True, exist_ok=True)
             write_json(part_debug_dir / "planner_context.json", {
@@ -6564,12 +6858,14 @@ def main() -> None:
                 plan_base_name,
                 block_i,
                 str(block.get("text", "")),
-                current_instruction,
+                subrange_slice_text,
+                prompt_block_context,
                 song_context,
                 local_context,
                 part_continuity,
                 style_contract,
                 identity_contract,
+                raw_style,
                 int(config["prompt_max_attempts"]),
                 range_visual_state=range_visual_state,
                 subrange=subrange,

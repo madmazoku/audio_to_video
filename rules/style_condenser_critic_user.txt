@@ -6,14 +6,36 @@ Range index if range-specific: {{BLOCK_INDEX}}
 RAW VIDEO STYLE:
 {{RAW_VIDEO_STYLE}}
 
+DETERMINISTIC HARD DIRECTIVES EXTRACTED BY RUNNER:
+{{ENFORCED_STYLE_CONSTRAINTS_JSON}}
+
 PARSED SOURCE FACTS:
 {{PARSED_STYLE_JSON}}
 
 CONTRACT DRAFT:
 {{CONTRACT_JSON}}
 
-PREVIOUS FAILED RESULT / REPAIR CONTEXT:
-{{PREVIOUS_RESULT_JSON}}
+PREVIOUS CRITIC FEEDBACK FROM PREVIOUS ATTEMPT, IF ANY:
+{{PREVIOUS_CRITIC_FEEDBACK_JSON}}
+
+Feedback usage:
+- PREVIOUS_CRITIC_FEEDBACK_JSON is repair guidance only, not source material.
+- Apply only concrete issues/repairs relevant to this role.
+- Do not quote, summarize, debate, or copy previous feedback.
+- Do not mention previous attempts, scores, or repairs in the output.
+- Generate a fresh compact JSON object; do not patch or repeat old drafts.
+
+Critic isolation rule:
+- Evaluate only the current draft/payload shown above. Do not judge any previous failed answer.
+- Previous feedback, if present, is context for expected improvements only, not the artifact being scored.
+
+Hard style authority:
+- RAW VIDEO STYLE and DETERMINISTIC HARD DIRECTIVES are source authority.
+- Required_style_phrases are opaque required rendering instructions, not negotiable suggestions.
+- Never call a source-required style phrase contradictory, unsupported, mismatched, or invented.
+- Never ask to remove, replace, weaken, or avoid a required/source style phrase.
+- Hybrid style combinations are valid when the source requests them.
+- Required schema key names are fixed by the runner; never ask to rename schema keys.
 
 PARSER TECHNICAL STATUS:
 {{PARSER_STATUS_JSON}}
@@ -32,18 +54,41 @@ Return ONLY valid JSON with exactly these keys:
   "repairs": []
 }
 
+JSON-only discipline:
+- No analysis, no reasoning text, no markdown, no comments, no prose outside JSON.
+- Return the required object only; close the final brace and stop.
+- Prefer short phrases and empty arrays over explanatory filler.
+
 Compact output limits:
 - Max 6 issues and max 6 repairs.
 - Each issue/repair max 16 words.
 - Do not return the contract, repaired contract, parser facts, writer result, analysis, or sub-scores.
 
+Scoring rubric:
+- Use a graded quality score, not binary 0/100.
+- 90-100: directly usable, no important issues.
+- 75-89: usable with minor issues.
+- 50-74: usable fallback with noticeable issues.
+- 25-49: weak, only use if no better attempt exists.
+- 0-24: unusable or severely violates the task.
+- success=true means score >= 85 and no critical issues.
+- success=false does not imply score=0.
+- Do not collapse failed-but-usable answers to 0; reserve 0-24 for unusable outputs.
+- Do not give 100 unless the draft is essentially perfect.
+- Use intermediate scores so best-failed selection is meaningful.
+
 Critic checks:
 - Fail if parser/writer technical status reports invalid JSON or unusable structure.
-- Fail if any field invents unsupported medium, genre, era, world, species, technology, setting, palette, character, or plot.
+- Fail if any field invents unsupported medium, genre, era, world, species, technology, setting, palette, character, or plot; source-required style phrases are always supported.
 - Fail if style_must_not contains a source-positive required medium, technique, style, desired subject, or desired motif.
-- Fail if style_must_not includes invented project-default negatives rather than source-grounded negatives.
-- Fail if required_style_prefix omits the source-required medium/look.
+- Fail if style_must_not includes invented project-default negatives or pipeline policy rather than source-grounded negatives.
+- Fail if required_style_prefix does not contain every required_style_phrases item intact; do not judge the required phrase aesthetically.
+- Fail if a positive source_style_payload item is absent from all style_contract fields.
+- If forbidden_style_phrases is non-empty, fail if style_must_not omits any item; if it is empty, do not require default negatives.
+- Fail if an explicit required style phrase was split between style and identity fields.
+- Do not ask to rename lighting_color_texture_rules or other schema keys; judge only their contents.
+- Design/setting terms from source lines such as "use design as" may live in lighting_color_texture_rules for runner compatibility.
 - Fail if required_recurring_anchors or style_continuity_rules contain concrete characters, factions, landmarks, props, weapons, symbols, rituals, destinations, or plot beats not explicitly required in every clip.
 - Fail if concrete motifs are promoted from optional inventory into repeated requirements.
-- Fail if anchor_usage_rule does not preserve current-lyrics primacy.
+- Fail if the contract contains pipeline policy such as current-lyrics primacy, idle/camera-only prevention, or anchor optionality.
 - Success requires a compact, source-grounded, reusable contract that preserves identity without forcing the same subject/setting/action everywhere.

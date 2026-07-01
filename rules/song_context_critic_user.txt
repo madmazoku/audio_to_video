@@ -6,8 +6,19 @@ PARSED SONG FACTS:
 SONG CONTEXT DRAFT:
 {{SONG_CONTEXT_JSON}}
 
-PREVIOUS FAILED RESULT / REPAIR CONTEXT:
-{{PREVIOUS_RESULT_JSON}}
+PREVIOUS CRITIC FEEDBACK FROM PREVIOUS ATTEMPT, IF ANY:
+{{PREVIOUS_CRITIC_FEEDBACK_JSON}}
+
+Feedback usage:
+- PREVIOUS_CRITIC_FEEDBACK_JSON is repair guidance only, not source material.
+- Apply only concrete issues/repairs relevant to this role.
+- Do not quote, summarize, debate, or copy previous feedback.
+- Do not mention previous attempts, scores, or repairs in the output.
+- Generate a fresh compact JSON object; do not patch or repeat old drafts.
+
+Critic isolation rule:
+- Evaluate only the current draft/payload shown above. Do not judge any previous failed answer.
+- Previous feedback, if present, is context for expected improvements only, not the artifact being scored.
 
 PARSER TECHNICAL STATUS:
 {{PARSER_STATUS_JSON}}
@@ -26,15 +37,36 @@ Return ONLY valid JSON with exactly these keys:
   "repairs": []
 }
 
+JSON-only discipline:
+- No analysis, no reasoning text, no markdown, no comments, no prose outside JSON.
+- Return the required object only; close the final brace and stop.
+- Prefer short phrases and empty arrays over explanatory filler.
+
 Compact output limits:
 - Max 6 issues and max 6 repairs.
 - Each issue/repair max 18 words.
 - Do not return the song context, repaired context, parsed facts, writer result, analysis, or sub-scores.
 
+Scoring rubric:
+- Use a graded quality score, not binary 0/100.
+- 90-100: directly usable, no important issues.
+- 75-89: usable with minor issues.
+- 50-74: usable fallback with noticeable issues.
+- 25-49: weak, only use if no better attempt exists.
+- 0-24: unusable or severely violates the task.
+- success=true means score >= 85 and no critical issues.
+- success=false does not imply score=0.
+- Do not collapse failed-but-usable answers to 0; reserve 0-24 for unusable outputs.
+- Do not give 100 unless the draft is essentially perfect.
+- Use intermediate scores so best-failed selection is meaningful.
+
 Critic checks:
 - Fail if parser/writer technical status reports invalid JSON or unusable structure.
 - Fail if the context invents unsupported lore, style, setting, species, props, factions, characters, or visual technology.
+- Fail if any parsed narrative_agents item is missing from main_characters, or if the primary narrative agent is missing from the song_summary's through-line.
+- Fail if secondary characters displace the narrator, viewpoint character, recurring protagonist, or recurring affected group.
 - Fail if continuity_rules contain concrete characters, factions, landmarks, props, symbols, weapons, rituals, destinations, or central composition requirements not required in every clip.
 - Fail if inventory fields are wordy, duplicated, or treated as mandatory scene content.
 - Fail if avoid contains desired motifs instead of source-grounded forbidden content/style/drift.
 - Success requires compact reusable continuity that preserves identity without overriding future lyrics.
+- success=true requires issues=[] and repairs=[]. Never put praise or passed checks into issues.

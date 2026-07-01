@@ -6,8 +6,22 @@ Range index if range-specific: {{BLOCK_INDEX}}
 RAW VIDEO STYLE:
 {{RAW_VIDEO_STYLE}}
 
-PREVIOUS FAILED RESULT / REPAIR CONTEXT:
-{{PREVIOUS_RESULT_JSON}}
+DETERMINISTIC HARD DIRECTIVES EXTRACTED BY RUNNER:
+{{ENFORCED_STYLE_CONSTRAINTS_JSON}}
+
+PREVIOUS CRITIC FEEDBACK FROM PREVIOUS ATTEMPT, IF ANY:
+{{PREVIOUS_CRITIC_FEEDBACK_JSON}}
+
+Feedback usage:
+- PREVIOUS_CRITIC_FEEDBACK_JSON is repair guidance only, not source material.
+- Apply only concrete issues/repairs relevant to this role.
+- Do not quote, summarize, debate, or copy previous feedback.
+- Do not mention previous attempts, scores, or repairs in the output.
+- Generate a fresh compact JSON object; do not patch or repeat old drafts.
+- Ignore feedback that asks to remove, replace, weaken, or avoid source-required style/directive phrases.
+
+Parser retry rule:
+- Use feedback only to improve source-style fact extraction. Do not write the final contracts here.
 
 Return ONLY valid JSON with exactly these keys:
 {
@@ -34,13 +48,20 @@ Return ONLY valid JSON with exactly these keys:
   }
 }
 
+JSON-only discipline:
+- No analysis, no reasoning text, no markdown, no comments, no prose outside JSON.
+- Return the required object only; close the final brace and stop.
+- Prefer short phrases and empty arrays over explanatory filler.
+
 Compact output limits:
 - Max 5 items per array; must_preserve max 8.
-- Each item max 6 words.
+- Ordinary extracted items max 6 words. Explicit hard-directive phrases are exempt and must remain intact.
 - No sentences, paragraphs, copied source sentences, examples, prompt text, or explanations.
 - Keep the most distinctive source terms; drop redundant near-duplicates.
 
 Source grounding:
+- A required_style_phrases item is one atomic rendering-style phrase. Preserve it intact in positive.medium and notes.must_preserve; never split it between medium and identity.
+- Preserve every forbidden_style_phrases item intact in the matching negative arrays.
 - Extract only facts present in RAW VIDEO STYLE or direct near-synonyms.
 - Do not invent genre, era, place, species, technology, medium, color palette, character, or plot.
 - Negative terms require explicit source language such as no, not, never, avoid, without, must not, do not.

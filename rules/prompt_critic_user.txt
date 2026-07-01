@@ -18,6 +18,12 @@ IDENTITY CONTRACT:
 STYLE CONTRACT:
 {{STYLE_CONTRACT_JSON}}
 
+RAW VIDEO STYLE:
+{{RAW_VIDEO_STYLE}}
+
+DETERMINISTIC HARD STYLE DIRECTIVES:
+{{ENFORCED_STYLE_CONSTRAINTS_JSON}}
+
 PREVIOUS VISUAL CONTEXT:
 {{PREVIOUS_VISUAL_CONTEXT_JSON}}
 
@@ -27,8 +33,29 @@ RANGE VISUAL STATE / SAME-RANGE CONTINUITY LOCK:
 SUBRANGE CONTINUITY INSTRUCTION:
 {{SUBRANGE_CONTINUITY_INSTRUCTION}}
 
-PREVIOUS FAILED RESULT, IF ANY:
-{{PREVIOUS_RESULT_JSON}}
+PREVIOUS CRITIC FEEDBACK FROM PREVIOUS ATTEMPT, IF ANY:
+{{PREVIOUS_CRITIC_FEEDBACK_JSON}}
+
+Feedback usage:
+- PREVIOUS_CRITIC_FEEDBACK_JSON is repair guidance only, not source material.
+- Apply only concrete issues/repairs relevant to this role.
+- Do not quote, summarize, debate, or copy previous feedback.
+- Do not mention previous attempts, scores, or repairs in the output.
+- Generate a fresh compact JSON object; do not patch or repeat old drafts.
+
+Critic isolation rule:
+- Evaluate only the current draft/payload shown above. Do not judge any previous failed answer.
+- Previous feedback, if present, is context for expected improvements only, not the artifact being scored.
+
+Hard style authority:
+- RAW VIDEO STYLE, DETERMINISTIC HARD STYLE DIRECTIVES, and STYLE CONTRACT are source authority.
+- Required/source style phrases are not optional motifs and never need lyric support.
+- Never call a required/source style phrase a mismatch, contradiction, unsupported element, or invented drift.
+- Never ask to remove, replace, weaken, or avoid a required/source style phrase.
+- Hybrid style combinations are valid when the source requests them; judge whether they are preserved, not whether they are typical.
+- Cinematography/editing phrases from RAW VIDEO STYLE are style instructions, not scene changes by themselves.
+- Do not infer that one source-required style phrase contradicts another; source may intentionally request unusual hybrids.
+- Judge source style phrases only for preservation and useful visual translation, never taste or compatibility.
 
 PARSER TECHNICAL STATUS:
 {{PARSER_STATUS_JSON}}
@@ -47,22 +74,51 @@ Return ONLY valid JSON with exactly these keys:
   "repairs": []
 }
 
+JSON-only discipline:
+- No analysis, no reasoning text, no markdown, no comments, no prose outside JSON.
+- Return the required object only; close the final brace and stop.
+- Prefer short phrases and empty arrays over explanatory filler.
+
 Compact output limits:
 - Max 6 issues and max 6 repairs.
 - Each issue/repair max 16 words.
 - Do not return the prompt package, repaired prompt, semantic plan, contracts, analysis, or sub-scores.
 
+Scoring rubric:
+- Use a graded quality score, not binary 0/100.
+- 90-100: directly usable, no important issues.
+- 75-89: usable with minor issues.
+- 50-74: usable fallback with noticeable issues.
+- 25-49: weak, only use if no better attempt exists.
+- 0-24: unusable or severely violates the task.
+- success=true means score >= 85 and no critical issues.
+- success=false does not imply score=0.
+- Do not collapse failed-but-usable answers to 0; reserve 0-24 for unusable outputs.
+- Do not give 100 unless the draft is essentially perfect.
+- Use intermediate scores so best-failed selection is meaningful.
+
 Critic checks:
 - Fail if parser/writer technical status reports invalid JSON or unusable structure.
 - Fail if the semantic plan is not grounded in current subrange/range lyrics.
+- Fail if range_narrative_agent is not the best stable narrator/viewpoint actor/affected group for the FULL RANGE, or if an isolated prop displaced that agent.
+- Fail if main_subject differs from range_narrative_agent or setting differs from range_setting.
 - Fail if the plan or prompt promotes unsupported recurring anchors to main subject, primary setting, destination, main prop, final reveal, or composition center.
 - Fail if lyrics imply a group/local actor/setting/action but the plan or prompt replaces it with an iconic global subject/location/action.
 - Fail if image_prompt and video_prompt are different scenes.
 - Fail if main subject/action from a lyric-grounded semantic plan are missing.
-- Fail if video_prompt lacks visible action and same-scene consequence.
-- Fail if video_prompt implies internal montage, cut, scene change, time jump, late new landmark, new dominant color grade, or final tableau reset without semantic-plan support.
-- Fail if required medium/look is absent from image_prompt or early video_prompt.
+- Fail if prompt replaces semantic_plan.main_subject or setting with a prop, body part, symbol, or new location.
+- For later subranges, fail unless semantic_plan copied scene_contract.main_subject and scene_contract.setting exactly.
+- Reduce score if video_prompt lacks clear setup, visible action/change, and same-scene consequence.
+- Exact phase labels are examples only; do not require literal "At the start", "Then", or "By the end".
+- Fail if video_prompt implies a scene change, time jump, late landmark, new dominant color grade, or tableau reset.
+- Allow cuts/edit rhythm when RAW VIDEO STYLE explicitly requires it; do not treat required editing words as scene changes unless the prompt also changes subject, place, or time.
+- Fail if any required_style_phrases item is absent intact from either image_prompt or video_prompt; never fail because the phrase itself seems stylistically surprising.
+- Reduce score if prompts merely paste required/source style plus generic nouns without concrete visible scene/design/action cues.
+- A strong prompt translates source style into visible rendering, lighting, materials, costume, environment texture, camera, and motion cues without inventing plot.
+- If no explicit required phrase exists, fail if required_style_prefix is absent from either prompt.
+- If forbidden_style_phrases is non-empty, fail if any item is absent from negative_prompt; if it is empty, do not complain about missing forbidden terms.
 - Fail if prompt uses forbidden terms from style_contract.style_must_not or source-grounded avoid lists.
-- Fail if negative_prompt contains required medium, required subjects/actions, or desired source motifs.
+- Fail if negative_prompt contains required medium, required subjects/actions, or desired source motifs, except source-negative phrases such as "not photorealistic" are allowed inside the positive required style phrase.
 - Fail if visible text/signs/logos/subtitles are added without source requirement, or if source-grounded negatives forbid them.
 - Success requires lyric grounding, active motion, style fidelity, identity support, and non-dominating continuity.
+- success=true requires issues=[] and repairs=[]. Never put praise, passed checks, or observations into issues.
