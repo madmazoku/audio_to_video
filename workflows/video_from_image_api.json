@@ -91,7 +91,7 @@
   },
   "270": {
     "inputs": {
-      "unet_name": "ltx-2.3-22b-dev-fp8.safetensors",
+      "unet_name": "ltx-2.3-22b-dev.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",

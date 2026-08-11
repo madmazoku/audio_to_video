@@ -8,6 +8,7 @@
   "min_workflow_seconds": 1.0,
   "recommended_workflow_seconds": 12,
   "max_workflow_seconds": 16,
+  "manual_boundary_snap_max_seconds": 10.0,
   "local_context_radius": 2,
   "range_visual_preroll_seconds": 0.25,
   "subtitle_line_preroll_seconds": 0.25,

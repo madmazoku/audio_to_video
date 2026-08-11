@@ -825,15 +825,61 @@ def lyric_words(text: str) -> List[str]:
 
 
 
+LYRICS_SEPARATOR_SPLIT_RE = re.compile(
+    r"(?m)(^[ \t]*(?:\*{3}|-{3})(?:[ \t]+(?:@|#)[ \t]+(?:\d+:)?\d+:\d{2}\.\d{3})?[ \t]*$)"
+)
+LYRICS_SEPARATOR_RE = re.compile(
+    r"^(?P<separator>\*{3}|-{3})(?:\s+(?P<mode>@|#)\s+"
+    r"(?P<time>(?:\d+:)?\d+:\d{2}\.\d{3}))?$"
+)
+
+
+def parse_manual_timestamp(value: str) -> float:
+    parts = str(value).split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes_text, seconds_text = parts
+        minutes_must_fit_hour = False
+    elif len(parts) == 3:
+        hours = int(parts[0])
+        minutes_text, seconds_text = parts[1:]
+        minutes_must_fit_hour = True
+    else:
+        raise ValueError(f"Invalid manual boundary timestamp: {value}")
+    minutes = int(minutes_text)
+    seconds = float(seconds_text)
+    if minutes < 0 or (minutes_must_fit_hour and minutes >= 60) or seconds < 0.0 or seconds >= 60.0:
+        raise ValueError(f"Invalid manual boundary timestamp: {value}")
+    return hours * 3600.0 + minutes * 60.0 + seconds
+
+
+def parse_lyrics_separator(line: str) -> Optional[Dict[str, Any]]:
+    stripped = str(line).strip()
+    match = LYRICS_SEPARATOR_RE.fullmatch(stripped)
+    if not match:
+        return None
+    mode_token = match.group("mode")
+    time_text = match.group("time")
+    return {
+        "separator": match.group("separator"),
+        "mode": "exact" if mode_token == "@" else ("snap_previous" if mode_token == "#" else "automatic"),
+        "mode_token": mode_token,
+        "requested_time": parse_manual_timestamp(time_text) if time_text else None,
+        "timestamp": time_text,
+        "source": stripped,
+    }
+
+
 def is_subrange_divider_line(line: str) -> bool:
-    return str(line).strip() == "---"
+    parsed = parse_lyrics_separator(line)
+    return bool(parsed and parsed["separator"] == "---")
 
 
 def is_alignment_meta_token(text: str) -> bool:
     stripped = str(text).strip()
+    separator = parse_lyrics_separator(stripped)
     return (
-        stripped == "***"
-        or is_subrange_divider_line(stripped)
+        bool(separator)
         or (len(stripped) >= 2 and stripped.startswith("[") and stripped.endswith("]"))
         or stripped.startswith("[")
         or stripped.endswith("]")
@@ -851,10 +897,11 @@ def clean_lyrics_for_alignment_text(lyrics_text: str) -> str:
         line = raw_line.strip()
         if not line:
             continue
-        if line == "***":
+        separator = parse_lyrics_separator(line)
+        if separator and separator["separator"] == "***":
             out.append("")
             continue
-        if is_subrange_divider_line(line):
+        if separator and separator["separator"] == "---":
             continue
         if is_bracket_directive_line(line):
             continue
@@ -1917,6 +1964,8 @@ def build_line_aware_verses_from_json_words(
                 "alignment_mode": "explicit_gap_fill",
                 "bracket_directives": list(ly.get("bracket_directives", [])),
                 "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
+                "timed_subrange_boundaries": list(ly.get("timed_subrange_boundaries", [])),
+                "semantic_boundary_before": ly.get("semantic_boundary_before"),
                 "alignment_match": verse_report,
             })
             continue
@@ -2045,6 +2094,8 @@ def build_line_aware_verses_from_json_words(
             "alignment_mode": "word_json_line_aware",
             "bracket_directives": list(ly.get("bracket_directives", [])),
             "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
+            "timed_subrange_boundaries": list(ly.get("timed_subrange_boundaries", [])),
+            "semantic_boundary_before": ly.get("semantic_boundary_before"),
             "alignment_match": verse_report,
         })
 
@@ -2198,6 +2249,7 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         "min_workflow_seconds": (int, float),
         "recommended_workflow_seconds": (int, float),
         "max_workflow_seconds": (int, float),
+        "manual_boundary_snap_max_seconds": (int, float),
         "local_context_radius": int,
         "range_visual_preroll_seconds": (int, float),
         "subtitle_line_preroll_seconds": (int, float),
@@ -2227,6 +2279,7 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
     config["min_workflow_seconds"] = float(config["min_workflow_seconds"])
     config["recommended_workflow_seconds"] = float(config["recommended_workflow_seconds"])
     config["max_workflow_seconds"] = float(config["max_workflow_seconds"])
+    config["manual_boundary_snap_max_seconds"] = max(0.0, float(config["manual_boundary_snap_max_seconds"]))
     config["local_context_radius"] = int(config["local_context_radius"])
     config["range_visual_preroll_seconds"] = float(config["range_visual_preroll_seconds"])
     config["subtitle_line_preroll_seconds"] = float(config["subtitle_line_preroll_seconds"])
@@ -2303,41 +2356,73 @@ def parse_lyrics_txt(text: str) -> List[Dict[str, Any]]:
     Dividers are stored as positions after lyric lines and never become lyric
     text, alignment input, subtitles, or prompt text.
     """
+    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    tokens = LYRICS_SEPARATOR_SPLIT_RE.split(normalized)
     blocks: List[Dict[str, Any]] = []
-    for raw in text.split("***"):
-        lyric_lines: List[str] = []
-        directives: List[str] = []
-        divider_after_lines: List[int] = []
-        raw_lines = raw.splitlines()
+    lyric_lines: List[str] = []
+    directives: List[str] = []
+    divider_after_lines: List[int] = []
+    timed_dividers: List[Dict[str, Any]] = []
+    raw_parts: List[str] = []
+    boundary_before: Optional[Dict[str, Any]] = None
 
+    def finish_block() -> None:
+        nonlocal lyric_lines, directives, divider_after_lines, timed_dividers, raw_parts, boundary_before
+        valid_dividers: List[int] = []
+        for pos in divider_after_lines:
+            if 0 < pos < len(lyric_lines) and pos not in valid_dividers:
+                valid_dividers.append(pos)
+        blocks.append({
+            "index": len(blocks) + 1,
+            "block_index": len(blocks),
+            "text": "\n".join(lyric_lines),
+            "lines_text": list(lyric_lines),
+            "bracket_directives": list(directives),
+            "subrange_divider_after_lines": valid_dividers,
+            "timed_subrange_boundaries": list(timed_dividers),
+            "semantic_boundary_before": dict(boundary_before) if boundary_before else None,
+            "raw_block_text": "".join(raw_parts),
+        })
+        lyric_lines = []
+        directives = []
+        divider_after_lines = []
+        timed_dividers = []
+        raw_parts = []
+        boundary_before = None
+
+    for token in tokens:
+        if token is None or token == "":
+            continue
+        separator = parse_lyrics_separator(token)
+        if separator:
+            if separator["separator"] == "***":
+                finish_block()
+                boundary_before = separator if separator["requested_time"] is not None else None
+            elif separator["requested_time"] is None:
+                divider_after_lines.append(len(lyric_lines))
+            else:
+                timed_dividers.append(separator)
+            continue
+
+        raw_parts.append(token)
+        raw = token
+        raw_lines = raw.splitlines()
         for line in raw_lines:
             stripped = line.strip()
             if not stripped:
                 continue
+            if stripped.startswith("***") or stripped.startswith("---"):
+                raise RuntimeError(
+                    f"Invalid lyrics separator syntax: {stripped!r}. Expected ***/--- optionally followed by "
+                    "@/# MM:SS.mmm."
+                )
             if is_bracket_directive_line(stripped):
                 directive = strip_bracket_directive(stripped)
                 if directive:
                     directives.append(directive)
                 continue
-            if is_subrange_divider_line(stripped):
-                divider_after_lines.append(len(lyric_lines))
-                continue
             lyric_lines.append(stripped)
-
-        valid_dividers: List[int] = []
-        for pos in divider_after_lines:
-            if 0 < pos < len(lyric_lines) and pos not in valid_dividers:
-                valid_dividers.append(pos)
-
-        blocks.append({
-            "index": len(blocks) + 1,
-            "block_index": len(blocks),
-            "text": "\n".join(lyric_lines),
-            "lines_text": lyric_lines,
-            "bracket_directives": directives,
-            "subrange_divider_after_lines": valid_dividers,
-            "raw_block_text": raw,
-        })
+    finish_block()
     return blocks
 
 
@@ -2580,6 +2665,8 @@ def build_verses_from_json_words(
             "alignment_mode": "word_json",
             "bracket_directives": list(ly.get("bracket_directives", [])),
             "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
+            "timed_subrange_boundaries": list(ly.get("timed_subrange_boundaries", [])),
+            "semantic_boundary_before": ly.get("semantic_boundary_before"),
             "alignment_match": verse_report,
         })
 
@@ -2785,6 +2872,8 @@ def build_verses_from_lrc_and_lyrics(
                 "alignment_mode": "explicit_gap_fill",
                 "bracket_directives": list(ly.get("bracket_directives", [])),
                 "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
+                "timed_subrange_boundaries": list(ly.get("timed_subrange_boundaries", [])),
+                "semantic_boundary_before": ly.get("semantic_boundary_before"),
                 "alignment_match": range_report,
             })
             continue
@@ -2862,6 +2951,8 @@ def build_verses_from_lrc_and_lyrics(
             "alignment_mode": "line_lrc",
             "bracket_directives": list(ly.get("bracket_directives", [])),
             "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
+            "timed_subrange_boundaries": list(ly.get("timed_subrange_boundaries", [])),
+            "semantic_boundary_before": ly.get("semantic_boundary_before"),
             "alignment_match": range_report,
         })
 
@@ -4407,6 +4498,57 @@ def subrange_text_for_block(block: Dict[str, Any], sub_start: float, sub_end: fl
     return "\n".join(pieces).strip()
 
 
+def resolve_manual_boundary(
+    descriptor: Dict[str, Any],
+    candidates: List[float],
+    allowed_start: float,
+    allowed_end: float,
+    config: Dict[str, Any],
+    label: str,
+) -> Dict[str, Any]:
+    requested = float(descriptor["requested_time"])
+    if not (allowed_start < requested < allowed_end):
+        raise RuntimeError(
+            f"{label} boundary {descriptor.get('source', requested)!r} is outside the allowed interval "
+            f"{allowed_start:.3f}s..{allowed_end:.3f}s"
+        )
+
+    resolved = requested
+    reason = "exact_requested_time"
+    warning = False
+    if descriptor.get("mode") == "snap_previous":
+        lookback = max(0.0, float(config.get("manual_boundary_snap_max_seconds", 10.0)))
+        valid = sorted({
+            float(value) for value in candidates
+            if allowed_start < float(value) <= requested + 1e-6
+            and requested - float(value) <= lookback + 1e-6
+        })
+        if valid:
+            resolved = valid[-1]
+            reason = "previous_lyric_boundary"
+        else:
+            reason = "no_previous_candidate_within_radius"
+            warning = True
+            log(
+                f"WARNING: {label} {descriptor.get('source')} has no previous lyric boundary within "
+                f"{lookback:.3f}s; using exact requested time {requested:.3f}s"
+            )
+
+    result = dict(descriptor)
+    result.update({
+        "resolved_time": resolved,
+        "shift_seconds": resolved - requested,
+        "resolution_reason": reason,
+        "warning": warning,
+    })
+    if descriptor.get("mode") == "snap_previous" and not warning:
+        log(
+            f"[boundary] {label}: {requested:.3f}s -> {resolved:.3f}s "
+            f"({resolved - requested:+.3f}s, previous lyric boundary)"
+        )
+    return result
+
+
 def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> List[float]:
     start = float(block["start"])
     end = float(block["end"])
@@ -4454,6 +4596,27 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
         boundary = float(seg.get("end", start))
         if start < boundary < end:
             manual_candidates.add(boundary)
+
+    timed_dividers = list(block.get("timed_subrange_boundaries", []))
+    if not timed_dividers and isinstance(block.get("verse"), dict):
+        timed_dividers = list((block.get("verse") or {}).get("timed_subrange_boundaries", []))
+    lyric_end_candidates: List[float] = []
+    for seg in timed_lines:
+        lyric_end_candidates.append(float(seg.get("end", start)))
+        lyric_end_candidates.extend(float(w.get("end", start)) for w in seg.get("words") or [])
+    resolved_locked: List[Dict[str, Any]] = [
+        resolve_manual_boundary(item, lyric_end_candidates, start, end, config, "subrange")
+        for item in timed_dividers
+    ]
+    locked_candidates = sorted({start, end, *(float(item["resolved_time"]) for item in resolved_locked)})
+    for left, right in zip(locked_candidates, locked_candidates[1:]):
+        if right - left < min_seconds - 1e-6:
+            raise RuntimeError(
+                f"Locked subrange boundary in {format_range_id(int(block['block_index']))} creates a "
+                f"{right - left:.3f}s part, below min_workflow_seconds={min_seconds:.3f}s"
+            )
+    if resolved_locked:
+        block["resolved_timed_subrange_boundaries"] = resolved_locked
 
     def segment_duration(segment: Dict[str, Any]) -> float:
         return max(0.0, float(segment["end"]) - float(segment["start"]))
@@ -4599,6 +4762,7 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
             prefix.append(prefix[-1] + d)
 
         boundary_penalty = {
+            "locked": 1_000_000_000_000.0,
             "manual": 30.0,
             "line": 10.0,
             "word": 4.0,
@@ -4636,6 +4800,8 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
                 duration = group_duration(i, j)
                 if duration > safe_max_seconds + 1e-6:
                     break
+                if any(str(segments[k].get("start_boundary_kind")) == "locked" for k in range(i + 1, j)):
+                    continue
                 if j - i > 1 and not contains_short_atom(i, j):
                     continue
                 cost = dp[i] + segment_cost(i, j, duration)
@@ -4675,6 +4841,7 @@ def split_boundaries_for_block(block: Dict[str, Any], config: Dict[str, Any]) ->
     # list and returns a new ordered subrange list. Manual dividers are just the
     # first strategy; if a range has no --- markers it naturally returns the same
     # single subrange.
+    segments = split_at_all_candidates(segments, locked_candidates, "locked")
     segments = split_at_all_candidates(segments, sorted(manual_candidates), "manual")
     segments = split_long_using_candidates_strategy(segments, sorted(line_candidates), "line")
     segments = split_long_using_candidates_strategy(segments, sorted(word_candidates), "word")
@@ -5045,6 +5212,8 @@ def make_timeline_blocks(
                 "visual_preroll": max(0.0, lyric_start.get(i, start) - start),
                 "bracket_directives": list(src.get("bracket_directives", [])),
                 "subrange_divider_after_lines": list(src.get("subrange_divider_after_lines", [])),
+                "timed_subrange_boundaries": list(src.get("timed_subrange_boundaries", [])),
+                "semantic_boundary_before": src.get("semantic_boundary_before"),
             })
             i += 1
             continue
@@ -5083,12 +5252,58 @@ def make_timeline_blocks(
                 "verse": src_empty,
                 "bracket_directives": list(src_empty.get("bracket_directives", [])),
                 "subrange_divider_after_lines": list(src_empty.get("subrange_divider_after_lines", [])),
+                "timed_subrange_boundaries": list(src_empty.get("timed_subrange_boundaries", [])),
+                "semantic_boundary_before": src_empty.get("semantic_boundary_before"),
                 "section_text": make_nonlyrical_block_text(src_empty),
             })
 
     if blocks:
         blocks[-1]["end"] = max(float(blocks[-1]["end"]), timeline_end)
         blocks[-1]["duration"] = max(0.01, float(blocks[-1]["end"]) - float(blocks[-1]["start"]))
+
+    if len(blocks) > 1:
+        boundaries = [float(blocks[0]["start"])] + [float(block["end"]) for block in blocks]
+        resolved_semantic: Dict[int, Dict[str, Any]] = {}
+        for boundary_index in range(1, len(blocks)):
+            descriptor = source_blocks[boundary_index].get("semantic_boundary_before")
+            if not descriptor or descriptor.get("requested_time") is None:
+                continue
+            previous_candidates: List[float] = []
+            for source in source_blocks[:boundary_index]:
+                for line in source.get("lines", []) or []:
+                    previous_candidates.append(float(line.get("end", 0.0)))
+                    previous_candidates.extend(
+                        float(word.get("end", 0.0)) for word in line.get("words", []) or []
+                    )
+            resolved = resolve_manual_boundary(
+                descriptor,
+                previous_candidates,
+                0.0,
+                timeline_end,
+                config,
+                f"semantic boundary before R{boundary_index:03d}",
+            )
+            boundaries[boundary_index] = float(resolved["resolved_time"])
+            resolved_semantic[boundary_index] = resolved
+
+        for boundary_index in range(1, len(boundaries)):
+            if boundaries[boundary_index] <= boundaries[boundary_index - 1] + 0.001:
+                raise RuntimeError(
+                    f"Semantic boundaries are not monotonic near R{boundary_index:03d}: "
+                    f"{boundaries[boundary_index - 1]:.3f}s then {boundaries[boundary_index]:.3f}s"
+                )
+
+        for block_index, block in enumerate(blocks):
+            block["start"] = boundaries[block_index]
+            block["end"] = boundaries[block_index + 1]
+            block["duration"] = max(0.01, block["end"] - block["start"])
+            if block_index in resolved_semantic:
+                block["resolved_semantic_boundary_before"] = resolved_semantic[block_index]
+            verse = block.get("verse")
+            if isinstance(verse, dict):
+                verse["start"] = block["start"]
+                verse["end"] = block["end"]
+                verse["duration"] = block["duration"]
 
     return blocks, audio_end
 

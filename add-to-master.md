@@ -27,10 +27,10 @@ This skill generates all branch and PR metadata automatically from the current c
 
 **STEPS 1-7: Prepare metadata**
 1. Validate repository root and ensure on `master` branch. If you are currently on an existing `AI-<n>` branch or a merge commit branch, switch back to `master` before creating a new branch. Do not start a new AI branch from an already merged AI branch or from a PR merge commit branch.
-2. Run `git status --short` and ensure the working tree is ready. Confirm that the current changes are the ones you want to include in the new AI change and are not already part of another branch's commit.
+2. Run `git status --short` and inspect both tracked and untracked changes. Explicitly identify the files that belong to the requested change. Preserve unrelated user changes and never include them merely because they are present in the working tree.
 3. Summarize the current diff into a concise phrase describing the change. Use the exact changed files and current task, not the previous branch purpose or an earlier feature idea.
 4. Confirm the summary by reading the diff of the changed files. If the summary does not match the actual changes, rewrite it until it clearly describes the current work.
-5. Determine the next unused AI number `n` by inspecting existing branches and merged PRs using `AI-<n>` naming.
+5. Fetch current remote branch metadata, then determine the next unused AI number `n` by inspecting local/remote branches and merged PRs using `AI-<n>` naming. Verify GitHub CLI authentication before creating the branch so a known authentication failure is found before repository mutations.
 6. Construct branch name from the actual change summary: `AI-<n>-<short-description>`.
 7. Construct commit message from the actual change summary: `AI-<n>: <short description>`.
 8. Construct PR title and body from the same generated summary.
@@ -38,7 +38,7 @@ This skill generates all branch and PR metadata automatically from the current c
 
 **STEPS 8-11: Create and push branch**
 8. Create or switch to the generated branch: `git checkout -b AI-<n>-<short-description>`
-9. Stage all changes: `git add -A`
+9. Stage only the explicitly reviewed files that belong to the change, using `git add <file>...`. Run `git diff --cached --name-status` and `git diff --cached --check` before committing. Do not use `git add -A` in a dirty worktree unless every tracked and untracked path was explicitly confirmed as in scope.
 10. Commit with the generated message: `git commit -m "AI-<n>: ..."`
 11. Push the generated branch to `origin`: `git push origin AI-<n>-<short-description>`
 
@@ -55,8 +55,9 @@ This skill generates all branch and PR metadata automatically from the current c
 
 **ADDITIONAL SAFETY RULES**
 - If the current branch name already contains `AI-<n>`, do not reuse that branch name for a new change.
+- Never stash, reset, discard, or stage unrelated user changes just to make the working tree clean. A feature branch may be created with unrelated unstaged files present as long as the commit scope is explicit and verified.
 - Always start a new AI branch from `master`; do not start from `AI-6`, `AI-7`, or any other existing AI branch.
-- If you have unstaged changes after a failed workflow attempt, stash or reset them and then return to `master` before creating the new AI branch.
+- If you have task-related unstaged changes after a failed workflow attempt, preserve them, return to `master` only when that checkout is safe, and resume with explicit file staging. Do not stash or reset unrelated user work without approval.
 - If a PR already exists for the generated branch name, do not create a duplicate PR; instead use the existing PR number.
 - If a merge commit is present in the current working branch (`Merge pull request #...`), return to `master` and create a clean branch from there.
 - Generate the branch name, commit message, and PR metadata from the current diff only. Do not reuse titles, labels, or feature areas from previous work.

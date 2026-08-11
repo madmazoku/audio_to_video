@@ -476,6 +476,26 @@ Second lyric line
 Next lyric line
 ```
 
+Separators may carry an absolute manual timestamp. `@` uses the requested time
+exactly; `#` snaps backward to the latest lyric line/word end within
+`manual_boundary_snap_max_seconds` (10 seconds by default). If no candidate is
+available in that lookback window, `#` uses the requested time exactly and logs
+a warning.
+
+```text
+[Outro]
+Last sung line
+*** # 02:54.300
+[Instrumental]
+*** @ 03:20.000
+[End]
+```
+
+`*** @/#` sets the shared boundary between two public semantic ranges. Times
+are absolute from the beginning of the source audio. Use
+`--refresh-alignment --preview-subtitles-only` after changing manual boundaries;
+once the preview is accepted, normal runs reuse the cached matched alignment.
+
 Lines in square brackets are metadata/directives, not sung lyrics. They:
 
 - do not participate in matching,
@@ -650,8 +670,12 @@ instrumental
 outro
 ```
 
-Long gaps without lyrics become `instrumental` blocks when they exceed the threshold configured in `config.json`.
-Short intro/outro gaps use the same threshold as instrumental pauses. If the intro before the first sung line or the outro after the last sung line is shorter than the instrumental gap threshold, it is merged into the first/last lyric range instead of becoming a separate generated clip.
+The semantic block list follows `lyrics.txt` exactly: every segment separated by
+`***` becomes one public range. A segment without lyric lines fills the available
+gap between its neighboring lyric ranges (or the corresponding audio edge) and
+becomes `intro`, `instrumental`, or `outro` according to its position. Consecutive
+empty segments divide their available gap evenly unless manual `*** @/#`
+boundaries override those edges.
 
 
 Every semantic block is rendered through one or more internal subranges:
@@ -663,6 +687,23 @@ semantic block -> subrange(s) -> one semantic clip
 If the block duration is within `max_workflow_seconds`, it has exactly one subrange. That single subrange has empty subrange text, so the prompt does not repeat the full lyrics twice.
 
 If the block is longer than `max_workflow_seconds`, lyric-aware line/word boundaries are used only when they naturally fit under the workflow cap. Any remaining oversized segment is split evenly into near-`recommended_workflow_seconds` pieces, so the result is several medium subranges rather than one oversized subrange plus a tiny remainder.
+
+`---` remains a preferred internal divider after the preceding lyric line. It
+can also carry an absolute timestamp:
+
+```text
+First lyric line
+--- # 01:42.500
+Second lyric line
+--- @ 01:55.250
+Third lyric line
+```
+
+`--- #` snaps backward to the latest preceding lyric boundary; `--- @` stays at
+the exact requested time. Timed internal boundaries are locked: later automatic
+line/word/even splitting may add boundaries inside either side, but the short
+subrange merge cannot remove or cross them. A timed boundary that creates a
+part shorter than `min_workflow_seconds` is rejected before visual generation.
 
 Rendering flow:
 
@@ -692,7 +733,9 @@ Word-level karaoke is gap-aware: gaps between word timestamps are preserved inst
 
 Subtitle artifacts are lazy. `work/subs/karaoke.ass` is the full-song release subtitle file used by final rendering, `work/subs/preview_karaoke.ass` is the full-song preview karaoke subtitle file, `work/subs/preview_debug.ass` is the debug overlay, and `subtitle_preview.mp4` is a black-screen full-song preview video with audio, preview subtitles, and debug overlay. Existing files are reused until deleted or invalidated by `--refresh-alignment`. The preview is independent of `--limit`; a limited final render naturally burns only release subtitle events that fall inside the limited video/audio duration. The debug overlay is vector-drawn ASS graphics with three progress bars: full song progress with range/subrange boundary ticks, current range progress, and current subrange progress. Range labels use compact zero-based `Rnumber/count` labels without the range kind. `count` is always the total full-song range count, independent of `--limit`; this total is the maximum useful value for `--limit`. For example, `R000/027` through `R026/027` means `--limit 27` selects the whole song. Subranges use `Snumber/count`. `preview_debug.ass` is never used for the final video. This happens before song-context LLM, planner LLM, image generation, or video generation. Use `--preview-subtitles-only` to stop after this file is created.
 
-Intro, outro, and instrumental gaps use the same threshold predicate. A silent gap becomes its own semantic block only when its duration is at least `instrumental_gap_threshold`; shorter intro/outro gaps are merged into the nearest lyric range.
+Silent gaps do not create public ranges implicitly. Add an empty `***` segment
+with an optional bracket directive such as `[Instrumental]` when a gap must be a
+separate semantic block.
 
 Debug for ranges/subranges is written under `output/work/debug/ranges/range_NNN/`, with one folder per semantic range and one `part_MMM/` folder per internal subrange.
 
@@ -839,11 +882,11 @@ Default technical/timeline configuration:
   "video_width": 1280,
   "video_height": 720,
   "video_fps": 24,
-  "clip_duration_tolerance_ratio": 0.05,
+  "clip_duration_tolerance_ratio": 0.15,
+  "min_workflow_seconds": 1.0,
   "recommended_workflow_seconds": 12,
   "max_workflow_seconds": 16,
-  "instrumental_gap_min_seconds": 8.0,
-  "instrumental_gap_min_ratio_of_median_verse": 0.5,
+  "manual_boundary_snap_max_seconds": 10.0,
   "local_context_radius": 2,
   "range_visual_preroll_seconds": 0.25,
   "subtitle_line_preroll_seconds": 0.25,
@@ -851,7 +894,9 @@ Default technical/timeline configuration:
   "alignment_match_lookahead_words": 5,
   "alignment_match_similarity_threshold": 0.72,
   "alignment_match_warn_ratio": 0.2,
-  "alignment_match_max_extra_ratio": 0.5
+  "alignment_match_max_extra_ratio": 0.5,
+  "llm_max_ctx": 12288,
+  "llm_max_length": 12288
 }
 ```
 
@@ -861,15 +906,6 @@ Input override:
 
 ```text
 input/config.json
-```
-
-The instrumental gap threshold is:
-
-```text
-max(
-  instrumental_gap_min_seconds,
-  median_verse_duration * instrumental_gap_min_ratio_of_median_verse
-)
 ```
 
 `local_context_radius` controls how many neighboring verses are passed to the block planner as local context. For normal verse blocks, `2` means up to two previous and two next verses. For intro, the runner passes the first `radius` verses as early-song context. For outro, it passes the last `radius` verses as final-song context.
