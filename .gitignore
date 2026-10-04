@@ -6,6 +6,7 @@ output*/
 # Python cache
 __pycache__/
 *.pyc
+vram_log.csv
 
 # OS/editor noise
 .DS_Store

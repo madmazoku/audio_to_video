@@ -2,31 +2,9 @@
 
 Generate a stylized music video from prepared song audio, lyrics, lyric timing, and ComfyUI workflows.
 
+Current runner version: **1.7.3** (`aligned_song_video_runner.py --version`).
+
 This repository contains the orchestration code and versioned prompt/workflow templates. Song-specific files live in `input/`, and generated artifacts live in `output/`. The default `.gitignore` excludes `input*/` and `output*/` so the repository can be used as code/config while keeping large media files outside git.
-
-
-
-### AI-11 r6 logging note
-
-Runner stdout now prefixes every non-empty log line with a local timestamp including milliseconds:
-
-```text
-2026-06-29 23:11:14.123  [comfy] free memory ok (before video generation): /free
-2026-06-29 23:11:17.456  [comfy] node: 304 FPS [PrimitiveFloat]
-2026-06-29 23:12:17.789  [comfy] t+60.3s node+60.0s | running... | 395 VAE Decode [VAEDecode]
-```
-
-This is runner-side reporting only; ComfyUI itself is unchanged.
-
-
-### AI-11 r7 VAE decode note
-
-Final video decode is back to normal `VAEDecode`. The workflow still keeps `UnloadAllModels` immediately before node `395` so the cleanup dependency remains:
-
-```text
-378 Video Latent -> 9103 UnloadAllModels -> 395 VAE Decode
-```
-
 ## 1. What this project does
 
 `aligned_song_video_runner.py` builds a music video in these stages:
@@ -47,6 +25,8 @@ The public unit is always a semantic range/block. Internal subranges are only us
 ```text
 audio_to_video/
   aligned_song_video_runner.py
+  planner_vram_probe.py
+  track-vram.ps1
   requirements.txt
   run_full.cmd
   run_limit_2.cmd
@@ -109,14 +89,7 @@ ffmpeg -version
 ffprobe -version
 ```
 
-The runner resolves FFmpeg commands from `PATH` by default. Optional environment overrides are:
-
-```text
-
-
-
-
-```
+The runner first checks sibling installations under `../ffmpeg/bin/`, then falls back to commands available on `PATH`.
 
 On Windows, install a compiled FFmpeg build, extract it, and add the `bin` directory to `PATH`, for example:
 
@@ -476,25 +449,36 @@ Second lyric line
 Next lyric line
 ```
 
-Separators may carry an absolute manual timestamp. `@` uses the requested time
-exactly; `#` snaps backward to the latest lyric line/word end within
+Separators may carry an absolute manual timestamp. The timestamp is always
+absolute from the beginning of the source audio. Four modes are supported:
+
+```text
+*** @  02:54.300   # exact: use 02:54.300 exactly
+*** #< 02:54.300   # soft: snap to the nearest valid lyric boundary at/before the requested time
+*** #> 02:54.300   # soft: snap to the nearest valid lyric boundary at/after the requested time
+*** #  02:54.300   # backward-compatible alias for #<
+```
+
+For `#<` and `#>`, the candidate must be within
 `manual_boundary_snap_max_seconds` (10 seconds by default). If no candidate is
-available in that lookback window, `#` uses the requested time exactly and logs
-a warning.
+available in the requested direction inside that radius, the runner keeps the
+requested timestamp exactly and logs a warning. `@` never snaps.
+
+Example:
 
 ```text
 [Outro]
 Last sung line
-*** # 02:54.300
+*** #> 02:54.300
 [Instrumental]
 *** @ 03:20.000
 [End]
 ```
 
-`*** @/#` sets the shared boundary between two public semantic ranges. Times
-are absolute from the beginning of the source audio. Use
-`--refresh-alignment --preview-subtitles-only` after changing manual boundaries;
-once the preview is accepted, normal runs reuse the cached matched alignment.
+`*** @`, `*** #<`, and `*** #>` set the shared boundary between two public
+semantic ranges. Use `--refresh-alignment --preview-subtitles-only` after
+changing manual boundaries; once the preview is accepted, normal runs reuse the
+cached matched alignment.
 
 Lines in square brackets are metadata/directives, not sung lyrics. They:
 
@@ -517,7 +501,10 @@ Overrides defaults from `data/config.json`.
 video_style_N.txt
 ```
 
-Art direction override for public zero-based range `N`.
+Art direction override for public **zero-based** range `N`. The number is the
+same `RNNN` id shown in `subtitle_preview.mp4`, without the `R` prefix. For
+example, `R000` uses `video_style_0.txt`. Adding a new semantic range at the
+start of `lyrics.txt` shifts all following range ids by +1.
 
 Examples:
 
@@ -544,7 +531,8 @@ Song-level ASS style override.
 subtitle_styles_N.ass
 ```
 
-ASS style override for public zero-based range `N`.
+ASS style override for public **zero-based** range `N`, using the same `RNNN`
+id shown in `subtitle_preview.mp4`.
 
 Examples:
 
@@ -674,7 +662,7 @@ The semantic block list follows `lyrics.txt` exactly: every segment separated by
 `***` becomes one public range. A segment without lyric lines fills the available
 gap between its neighboring lyric ranges (or the corresponding audio edge) and
 becomes `intro`, `instrumental`, or `outro` according to its position. Consecutive
-empty segments divide their available gap evenly unless manual `*** @/#`
+empty segments divide their available gap evenly unless manual `*** @`, `*** #<`, or `*** #>`
 boundaries override those edges.
 
 
@@ -689,21 +677,40 @@ If the block duration is within `max_workflow_seconds`, it has exactly one subra
 If the block is longer than `max_workflow_seconds`, lyric-aware line/word boundaries are used only when they naturally fit under the workflow cap. Any remaining oversized segment is split evenly into near-`recommended_workflow_seconds` pieces, so the result is several medium subranges rather than one oversized subrange plus a tiny remainder.
 
 `---` remains a preferred internal divider after the preceding lyric line. It
-can also carry an absolute timestamp:
+can also carry an absolute timestamp with the same exact/directional snap syntax
+as `***`:
 
 ```text
 First lyric line
---- # 01:42.500
+--- #< 01:42.500
 Second lyric line
---- @ 01:55.250
+--- #> 01:48.000
 Third lyric line
+--- @ 01:55.250
+Fourth lyric line
 ```
 
-`--- #` snaps backward to the latest preceding lyric boundary; `--- @` stays at
-the exact requested time. Timed internal boundaries are locked: later automatic
-line/word/even splitting may add boundaries inside either side, but the short
-subrange merge cannot remove or cross them. A timed boundary that creates a
-part shorter than `min_workflow_seconds` is rejected before visual generation.
+The modes are:
+
+- `--- @ TIME` — exact boundary at `TIME`; no snapping.
+- `--- #< TIME` — snap to the nearest valid lyric line/word boundary at or before `TIME`.
+- `--- #> TIME` — snap to the nearest valid lyric line/word boundary at or after `TIME`.
+- `--- # TIME` — backward-compatible alias for `--- #< TIME`.
+
+Directional snapping is limited by `manual_boundary_snap_max_seconds`. If no
+candidate exists in the requested direction within that radius, the exact
+requested time is used and a warning is logged.
+
+Timed internal boundaries are locked: later automatic line/word/even splitting
+may add boundaries inside either side, but the short-subrange merge cannot
+remove or cross them. A timed boundary that creates a part shorter than
+`min_workflow_seconds` is rejected before visual generation.
+
+A useful pattern for silence between lyric lines is to put the requested time
+somewhere inside the silent gap and choose its side explicitly. For example,
+`--- #< 00:22.000` attaches the boundary to the lyric edge before the gap,
+while `--- #> 00:22.000` attaches it to the lyric edge after the gap, provided
+each candidate is within the configured snap radius.
 
 Rendering flow:
 
@@ -755,10 +762,6 @@ CURRENT SUBRANGE TEXT, when present
 Visual style is the mandatory style contract. Current subrange text is the highest factual priority when a semantic block is split. Bracket directives are metadata and must not be rendered as visible text.
 
 
-
-### Future prompt generation architecture
-
-The planned prompt-generation replacement is documented in [`PROMPT_GENERATION_PLAN.md`](PROMPT_GENERATION_PLAN.md). It uses an effective style contract, semantic planner, prompt writer, critic, and retry loop. `video_style_N.txt` is planned as a full zero-based range style override rather than a diff. No legacy single-pass prompt path is kept in that design.
 
 ### Action-oriented video prompts
 
@@ -896,7 +899,7 @@ Default technical/timeline configuration:
   "alignment_match_warn_ratio": 0.2,
   "alignment_match_max_extra_ratio": 0.5,
   "llm_max_ctx": 12288,
-  "llm_max_length": 12288
+  "llm_max_length": 4096
 }
 ```
 
@@ -909,6 +912,16 @@ input/config.json
 ```
 
 `local_context_radius` controls how many neighboring verses are passed to the block planner as local context. For normal verse blocks, `2` means up to two previous and two next verses. For intro, the runner passes the first `radius` verses as early-song context. For outro, it passes the last `radius` verses as final-song context.
+
+`llm_max_ctx` is applied to `llama_cpp_model_loader.n_ctx`. `llm_max_length` is applied to `llama_cpp_parameters.max_tokens`; the installed llama-cpp-vlm node accepts at most 4096 generated tokens. Sampling controls such as temperature and repetition penalties live together in the planner workflow.
+
+Large input styles can override the context size in `input/config.json`. For example, a roughly 30 KB style plus song and block context can use:
+
+```json
+{
+  "llm_max_ctx": 32768
+}
+```
 
 ```text
 data/subtitle_styles.ass
@@ -924,15 +937,17 @@ Workflow files are ComfyUI API workflows. They are versioned with the runner. Do
 workflows/planner_visual_prompts_api.json
 ```
 
-LLM planner workflow. Expected node classes include:
+The current llama-cpp-vlm planner uses:
 
 ```text
-GGUFLoader
-LLM_local
+llama_cpp_model_loader
+llama_cpp_parameters
+llama_cpp_instruct_adv
+llama_cpp_unload_model
 Basic data handling: PathSaveStringFile
 ```
 
-This workflow writes JSON prompt plans to `output/work/plans/`.
+The runner replaces the workflow's system and request prompt placeholders from `rules/` and the current planning request, then writes JSON prompt plans to `output/work/plans/`. Context and output limits come from config; sampler settings remain in the workflow.
 
 ```text
 workflows/image_from_prompt_api.json
@@ -973,6 +988,22 @@ SaveVideo
 ```
 
 The runner patches start image, video prompt, negative prompt, float duration seconds, fps, width, height, seeds, and output prefix. The workflow converts duration seconds and fps to an LTXV-valid frame count.
+
+The final video latent is decoded by the workflow's standard `VAEDecode` node before `CreateVideo`/`SaveVideo` output handling.
+
+### 14.1 VRAM diagnostics
+
+`planner_vram_probe.py` repeatedly runs the planner workflow while recording model-load and cleanup behavior. Its default artifacts are written under `output/work/vram_probe/planner/`.
+
+```powershell
+python.exe .\planner_vram_probe.py
+```
+
+`track-vram.ps1` is a lightweight continuous `nvidia-smi` logger. It writes `vram_log.csv` beside the script until interrupted:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\track-vram.ps1
+```
 
 ## 15. External repositories and tools
 
@@ -1052,7 +1083,7 @@ python.exe -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -U stable-ts
 ```
 
-Then edit `` in `the runner's stable-ts integration`.
+The runner discovers a sibling stable-ts virtual environment automatically, or falls back to `stable-ts` on `PATH`.
 
 ### ACE-Step 1.5
 
@@ -1133,9 +1164,7 @@ HAS_MISMATCH
 
 The full lyrics are still written to subtitles even when stable-ts misses part of a line. Missing, partial, or collapsed words are kept in the subtitle text, but unreliable timing is marked internally and estimated from neighboring reliable lines so it does not distort range/subrange boundaries or the following lines.
 
-### Line-aware matching improvements
-
-The alignment matcher now scores candidate lyric-line spans instead of greedily pairing words. It rejects collapsed/low-confidence spans as timing anchors, supports partial lines without dropping lyric text, and performs a final global timing-estimation pass across range boundaries so missing/collapsed ranges do not become near-zero length.
+The alignment matcher scores candidate lyric-line spans instead of greedily pairing words. It rejects collapsed/low-confidence spans as timing anchors, supports partial lines without dropping lyric text, and performs a final global timing-estimation pass across range boundaries so missing/collapsed ranges do not become near-zero length.
 
 Diagnostic files:
 
@@ -1143,13 +1172,3 @@ Diagnostic files:
 - `work/debug/alignment_diagnostics.txt`
 - `work/debug/alignment_match_report.json`
 - `work/debug/alignment_match_report.txt`
-
-
-
-### AI-11 r4 VRAM note
-
-The video workflow uses `UnloadAllModels` before the LTXV refine sampler and before final decode, and uses built-in `VAEDecodeTiled` for node `395` to reduce peak VRAM during the final video VAE decode. Required custom node remains `SeanScripts/ComfyUI-Unload-Model` for the unload nodes.
-
-### AI-11 r5 timed reporting
-
-ComfyUI progress lines printed by `aligned_song_video_runner.py` now include wall-clock time, workflow elapsed time, and per-node elapsed time where applicable. This is runner-side logging only; ComfyUI and workflow execution behavior are unchanged.

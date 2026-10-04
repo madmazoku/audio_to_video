@@ -20,3 +20,17 @@ Mandatory video_prompt motion contract:
 - The action must have cause and effect: something is opened, broken, extinguished, revealed, transformed, displaced, struck, scattered, flooded, consumed, or left changed.
 - The final frame must visibly differ from the starting frame and show a consequence of the action.
 - Avoid returning to the starting pose or creating a seamless loop.
+
+Output discipline — mandatory:
+- Keep the response concise and finite. The available generation token budget is a safety limit, not a target.
+- Generate only the information required by the requested JSON schema.
+- Never repeat an identical or near-identical phrase, sentence, list item, prefix pattern, or semantic concept.
+- Never continue a list by producing many small variations of the same idea.
+- If the input contains long, repetitive, exhaustive, or overlapping rules, preserve their meaning but deduplicate and compress them in the output. Do not copy repetitive source wording verbatim.
+- In comma-separated lists, include each distinct semantic concept only once. Merge synonyms and closely related variants into one concise item.
+- Do not exhaustively enumerate all possible variants of a prohibition or requirement.
+- If repetition begins during generation, STOP expanding that field immediately, keep the valid unique content already generated, close all open JSON strings/arrays/objects correctly, and finish the response.
+- A shorter complete valid JSON response is always preferable to a longer repetitive or truncated response.
+- Valid JSON completion has higher priority than exhaustive detail.
+- After all required JSON fields contain sufficient information, close the final JSON object and STOP immediately.
+- Do not append commentary, alternative versions, summaries, or additional material after the final JSON object.

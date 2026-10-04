@@ -4,21 +4,32 @@ import argparse
 import difflib
 import json
 import math
-import os
 import re
 import shutil
 import subprocess
 import time
 from datetime import datetime
-import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 import random
-import statistics
 import websocket
+
+__version__ = "1.7.3"
+RUNNER_BUILD_ID = __version__
+
+# Rendering-only gap between adjacent identical karaoke lines.
+# This is intentionally a code constant, not a config.json parameter.
+KARAOKE_REPEAT_RESET_SECONDS = 0.08
+
+# Final-song karaoke readability guard. Forced alignment often marks the
+# lexical end of the last word too tightly because there is no following
+# sung word to act as a right-hand anchor. This minimum applies only to the
+# final lyric word before a terminal metadata-only/non-lyrical tail.
+TERMINAL_SONG_WORD_MIN_KARAOKE_SECONDS = 1.10
+TERMINAL_SONG_WORD_MAX_EXTRA_SECONDS = 0.55
 
 IMAGE_N = {
     "image_prompt": "1004",
@@ -59,11 +70,6 @@ def log(msg: str) -> None:
             print("", flush=True)
 
 
-def wall_clock_ms() -> str:
-    now = time.time()
-    return time.strftime("%H:%M:%S", time.localtime(now)) + f".{int((now % 1.0) * 1000):03d}"
-
-
 def fmt_elapsed(seconds: float) -> str:
     seconds = max(0.0, float(seconds))
     if seconds < 100.0:
@@ -82,13 +88,6 @@ def log_comfy(msg: str, workflow_start: Optional[float] = None, node_start: Opti
         log(f"[comfy] {' '.join(parts)} | {msg}")
     else:
         log(f"[comfy] {msg}")
-
-
-def clean_fresh_output_dir(output_root: Path) -> None:
-    """Remove previous generated artifacts for a manual clean run helper."""
-    if output_root.exists():
-        shutil.rmtree(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
 
 
 def remove_path(path: Path) -> None:
@@ -144,8 +143,8 @@ def ensure_alignment_artifact(
 ) -> None:
     """Create the alignment artifact if it is missing.
 
-    Alignment is a lazy artifact: --refresh-alignment invalidates it, and this
-    function recreates it only when the timeline/subtitles stage needs it.
+    Cache lifetime is explicit: existing alignment artifacts are trusted until
+    the user removes the cache/work directory or requests --refresh-alignment.
     """
     json_path = alignment_dir / "alignment.json"
     lrc_path = alignment_dir / "alignment.lrc"
@@ -172,7 +171,6 @@ def ensure_alignment_artifact(
             "mode": "line_level_no_stable_ts",
         })
         log(f"[stage] use LRC line timing without stable-ts: {align_path}")
-
 
 def format_range_id(index: int) -> str:
     return f"R{int(index):03d}"
@@ -275,6 +273,34 @@ def load_json(path: Path) -> Any:
 def write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def invalidate_timeline_derived_artifacts(output_root: Path) -> None:
+    """Invalidate artifacts derived from matched semantic/timing data only."""
+    work = output_root / "work"
+    for path in [
+        work / "clips",
+        work / "subs" / "karaoke.ass",
+        work / "subs" / "preview_karaoke.ass",
+        work / "subs" / "preview_debug.ass",
+        output_root / "subtitle_preview.mp4",
+        output_root / "final_video.mp4",
+        output_root / "manifest.json",
+    ]:
+        remove_path(path)
+
+    debug = work / "debug"
+    for pattern in [
+        "parsed_verses_all.json",
+        "timeline_blocks.json",
+        "preview_timeline_blocks.json",
+        "timing_report.json",
+        "preview_timing_report.json",
+        "clip_scaling_report.json",
+        "clip_validation_report.json",
+    ]:
+        for path in debug.glob(pattern):
+            remove_path(path)
 
 
 def format_lrc_timestamp(seconds: float) -> str:
@@ -399,10 +425,6 @@ def make_run_id() -> str:
 
 def random_seed() -> int:
     return random.SystemRandom().randint(1, 2**31 - 1)
-
-
-def comfy_segment_subdir(run_id: str, index: int) -> str:
-    return f"aligned_song/{run_id}/segment_{index:03d}"
 
 
 def queue_prompt(workflow: Dict[str, Any], comfy_url: str, client_id: Optional[str] = None) -> Tuple[str, str]:
@@ -787,21 +809,6 @@ def run_cmd(cmd: List[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def infer_orientation_size(video_style: str) -> tuple[int, int]:
-    text = video_style.lower()
-    m = re.search(r"(\d{3,4})\s*[x×]\s*(\d{3,4})", video_style)
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    if "portrait" in text or "vertical" in text:
-        return 720, 1280
-    return 1280, 720
-
-
-def extract_fps(video_style: str) -> int:
-    m = re.search(r"(\d{2,3})\s*fps\b", video_style, re.I)
-    return int(m.group(1)) if m else 24
-
-
 APOSTROPHE_CHARS = "'’‘ʼ`´"
 WORD_JOIN_CHARS = "-" + APOSTROPHE_CHARS
 
@@ -826,10 +833,10 @@ def lyric_words(text: str) -> List[str]:
 
 
 LYRICS_SEPARATOR_SPLIT_RE = re.compile(
-    r"(?m)(^[ \t]*(?:\*{3}|-{3})(?:[ \t]+(?:@|#)[ \t]+(?:\d+:)?\d+:\d{2}\.\d{3})?[ \t]*$)"
+    r"(?m)(^[ \t]*(?:\*{3}|-{3})(?:[ \t]+(?:@|#(?:<|>)?)[ \t]+(?:\d+:)?\d+:\d{2}\.\d{3})?[ \t]*$)"
 )
 LYRICS_SEPARATOR_RE = re.compile(
-    r"^(?P<separator>\*{3}|-{3})(?:\s+(?P<mode>@|#)\s+"
+    r"^(?P<separator>\*{3}|-{3})(?:\s+(?P<mode>@|#(?:<|>)?)\s+"
     r"(?P<time>(?:\d+:)?\d+:\d{2}\.\d{3}))?$"
 )
 
@@ -860,9 +867,18 @@ def parse_lyrics_separator(line: str) -> Optional[Dict[str, Any]]:
         return None
     mode_token = match.group("mode")
     time_text = match.group("time")
+    if mode_token == "@":
+        mode = "exact"
+    elif mode_token in {"#", "#<"}:
+        # Bare # is retained as a backward-compatible alias for #<.
+        mode = "snap_previous"
+    elif mode_token == "#>":
+        mode = "snap_next"
+    else:
+        mode = "automatic"
     return {
         "separator": match.group("separator"),
-        "mode": "exact" if mode_token == "@" else ("snap_previous" if mode_token == "#" else "automatic"),
+        "mode": mode,
         "mode_token": mode_token,
         "requested_time": parse_manual_timestamp(time_text) if time_text else None,
         "timestamp": time_text,
@@ -939,11 +955,26 @@ def word_similarity(a: str, b: str) -> float:
 
 
 def word_match_threshold(a: str, b: str, base_threshold: float) -> float:
-    max_len = max(len(norm_word(a)), len(norm_word(b)))
+    """Return a conservative fuzzy threshold for lyric/alignment tokens.
+
+    Short words are dangerous anchors: e.g. ``one`` vs ``stone`` or
+    ``and`` vs ``stand`` can score around 0.75 with SequenceMatcher.  Those
+    false positives are especially destructive in repeated choruses because
+    they advance the monotonic cursor.  Require much stronger similarity for
+    short tokens while keeping the configured threshold for longer words.
+    """
+    aa = norm_word(a)
+    bb = norm_word(b)
+    min_len = min(len(aa), len(bb))
+    max_len = max(len(aa), len(bb))
     if max_len <= 2:
         return 1.0
-    if max_len <= 4:
+    if min_len <= 3:
+        return max(0.90, base_threshold)
+    if max_len <= 5:
         return max(0.84, base_threshold)
+    if max_len <= 7:
+        return max(0.80, base_threshold)
     return base_threshold
 
 
@@ -970,51 +1001,37 @@ def next_lyric_line_words(verse_line_words: List[List[List[str]]], verse_index: 
 
 
 def block_has_lyric_text(block: Dict[str, Any]) -> bool:
+    """Return True only when a block contains actual sung lyric text.
+
+    A semantic block is non-lyrical when, after removing blank lines,
+    bracket metadata and separator/control lines, no display/sung text remains.
+    This deliberately treats both metadata-only blocks and completely empty
+    blocks as musical/non-lyrical sections.
+    """
+    def is_sung(value: Any) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if parse_lyrics_separator(text):
+            return False
+        if is_bracket_directive_line(text):
+            return False
+        return bool(lyric_words(text))
+
     lines = block.get("lines_text")
     if isinstance(lines, list):
-        return any(str(line).strip() for line in lines)
+        return any(is_sung(line) for line in lines)
+
     lines = block.get("lines")
     if isinstance(lines, list):
-        return any(str(line.get("text", "")).strip() if isinstance(line, dict) else str(line).strip() for line in lines)
-    return bool(str(block.get("text", "")).strip())
+        for line in lines:
+            value = line.get("text", "") if isinstance(line, dict) else line
+            if is_sung(value):
+                return True
+        return False
 
-def expected_words_for_lyrics_verses(lyrics_verses: List[Dict[str, Any]]) -> List[List[str]]:
-    return [lyric_words(str(v.get("text", ""))) if block_has_lyric_text(v) else [] for v in lyrics_verses]
-
-
-def find_next_range_prefix(
-    words: List[Dict[str, Any]],
-    cursor: int,
-    next_expected: List[str],
-    lookahead: int,
-    threshold: float,
-) -> Optional[int]:
-    if not next_expected:
-        return None
-
-    prefix = next_expected[:min(3, len(next_expected))]
-    if not prefix:
-        return None
-
-    max_start = min(len(words), cursor + max(1, lookahead))
-    for start in range(cursor, max_start):
-        score = 0
-        checked = 0
-        for j, ew in enumerate(prefix):
-            if start + j >= len(words):
-                break
-            aw = words[start + j]["text"]
-            ok, _, _ = words_are_match(ew, aw, threshold)
-            checked += 1
-            if ok:
-                score += 1
-        if checked >= min(2, len(prefix)) and score >= min(2, len(prefix)):
-            return start
-        if len(prefix) == 1 and checked == 1 and score == 1:
-            return start
-
-    return None
-
+    text = str(block.get("text", "") or "")
+    return any(is_sung(line) for line in text.splitlines())
 
 def synthesize_word_timing(
     expected: str,
@@ -1044,230 +1061,6 @@ def synthesize_word_timing(
         "synthetic_timing": True,
         "similarity": 0.0,
     }
-
-
-def match_expected_range_words(
-    expected_words: List[str],
-    words: List[Dict[str, Any]],
-    cursor: int,
-    next_expected_words: List[str],
-    config: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
-    lookahead = max(1, int(config.get("alignment_match_lookahead_words", 5)))
-    threshold = float(config.get("alignment_match_similarity_threshold", 0.72))
-    out: List[Dict[str, Any]] = []
-    events: List[Dict[str, Any]] = []
-    extras: List[Dict[str, Any]] = []
-    stats = {
-        "expected": len(expected_words),
-        "matched": 0,
-        "fuzzy": 0,
-        "mismatch": 0,
-        "missing": 0,
-        "extra": 0,
-        "start_cursor": cursor,
-        "end_cursor": cursor,
-        "events": events,
-        "extra_actual": extras,
-        "boundary_reason": "expected_exhausted",
-    }
-
-    i = 0
-    previous_end: Optional[float] = None
-
-    while i < len(expected_words):
-        ew = expected_words[i]
-
-        if cursor >= len(words):
-            item = synthesize_word_timing(ew, previous_end, None)
-            out.append(item)
-            stats["missing"] += 1
-            events.append({"status": "missing_expected", "expected": ew, "reason": "no_aligned_words_left"})
-            previous_end = item["end"]
-            i += 1
-            continue
-
-        # If the next range prefix is already here and we still have expected
-        # words in current range, close current range with synthetic missing
-        # words rather than stealing the next range.
-        next_prefix_pos = find_next_range_prefix(words, cursor, next_expected_words, lookahead, threshold)
-        if next_prefix_pos == cursor and i > 0:
-            stats["boundary_reason"] = "next_range_prefix_detected"
-            while i < len(expected_words):
-                item = synthesize_word_timing(expected_words[i], previous_end, words[cursor]["start"])
-                out.append(item)
-                stats["missing"] += 1
-                events.append({"status": "missing_expected", "expected": expected_words[i], "reason": "next_range_prefix_detected"})
-                previous_end = item["end"]
-                i += 1
-            break
-
-        aw = words[cursor]
-        ok, sim, status = words_are_match(ew, str(aw["text"]), threshold)
-        if ok:
-            item = {
-                "text": ew,
-                "aligned_text": aw["text"],
-                "start": aw["start"],
-                "end": aw["end"],
-                "probability": aw.get("probability"),
-                "match_status": status,
-                "synthetic_timing": False,
-                "similarity": sim,
-            }
-            out.append(item)
-            stats["matched"] += 1
-            if status == "fuzzy_match":
-                stats["fuzzy"] += 1
-            events.append({
-                "status": status,
-                "expected": ew,
-                "actual": aw["text"],
-                "start": aw["start"],
-                "end": aw["end"],
-                "similarity": sim,
-            })
-            previous_end = item["end"]
-            cursor += 1
-            i += 1
-            continue
-
-        # Look ahead actual words for current expected word. Skipped actuals
-        # become extra and are not used in subtitles.
-        found_actual: Optional[int] = None
-        found_sim = 0.0
-        found_status = "mismatch"
-        max_actual = min(len(words), cursor + lookahead + 1)
-        for j in range(cursor + 1, max_actual):
-            ok2, sim2, status2 = words_are_match(ew, str(words[j]["text"]), threshold)
-            if ok2:
-                found_actual = j
-                found_sim = sim2
-                found_status = status2
-                break
-
-        # Look ahead expected words for current actual word. Missing expected
-        # words get synthetic timing.
-        found_expected: Optional[int] = None
-        found_expected_sim = 0.0
-        found_expected_status = "mismatch"
-        max_expected = min(len(expected_words), i + lookahead + 1)
-        for k in range(i + 1, max_expected):
-            ok3, sim3, status3 = words_are_match(expected_words[k], str(aw["text"]), threshold)
-            if ok3:
-                found_expected = k
-                found_expected_sim = sim3
-                found_expected_status = status3
-                break
-
-        if found_actual is not None and (found_expected is None or (found_actual - cursor) <= (found_expected - i)):
-            for j in range(cursor, found_actual):
-                extra = words[j]
-                extra_event = {
-                    "status": "extra_actual",
-                    "actual": extra["text"],
-                    "start": extra["start"],
-                    "end": extra["end"],
-                }
-                extras.append(extra_event)
-                events.append(extra_event)
-                stats["extra"] += 1
-            aw2 = words[found_actual]
-            item = {
-                "text": ew,
-                "aligned_text": aw2["text"],
-                "start": aw2["start"],
-                "end": aw2["end"],
-                "probability": aw2.get("probability"),
-                "match_status": found_status,
-                "synthetic_timing": False,
-                "similarity": found_sim,
-            }
-            out.append(item)
-            stats["matched"] += 1
-            if found_status == "fuzzy_match":
-                stats["fuzzy"] += 1
-            events.append({
-                "status": found_status,
-                "expected": ew,
-                "actual": aw2["text"],
-                "start": aw2["start"],
-                "end": aw2["end"],
-                "similarity": found_sim,
-                "after_extra_actual": found_actual - cursor,
-            })
-            previous_end = item["end"]
-            cursor = found_actual + 1
-            i += 1
-            continue
-
-        if found_expected is not None:
-            for k in range(i, found_expected):
-                item = synthesize_word_timing(expected_words[k], previous_end, aw["start"])
-                out.append(item)
-                stats["missing"] += 1
-                events.append({
-                    "status": "missing_expected",
-                    "expected": expected_words[k],
-                    "reason": "later_expected_matches_current_actual",
-                })
-                previous_end = item["end"]
-            ew2 = expected_words[found_expected]
-            item = {
-                "text": ew2,
-                "aligned_text": aw["text"],
-                "start": aw["start"],
-                "end": aw["end"],
-                "probability": aw.get("probability"),
-                "match_status": found_expected_status,
-                "synthetic_timing": False,
-                "similarity": found_expected_sim,
-            }
-            out.append(item)
-            stats["matched"] += 1
-            if found_expected_status == "fuzzy_match":
-                stats["fuzzy"] += 1
-            events.append({
-                "status": found_expected_status,
-                "expected": ew2,
-                "actual": aw["text"],
-                "start": aw["start"],
-                "end": aw["end"],
-                "similarity": found_expected_sim,
-                "after_missing_expected": found_expected - i,
-            })
-            previous_end = item["end"]
-            cursor += 1
-            i = found_expected + 1
-            continue
-
-        # Last-resort pair as mismatch to keep time moving.
-        item = {
-            "text": ew,
-            "aligned_text": aw["text"],
-            "start": aw["start"],
-            "end": aw["end"],
-            "probability": aw.get("probability"),
-            "match_status": "mismatch",
-            "synthetic_timing": False,
-            "similarity": sim,
-        }
-        out.append(item)
-        stats["mismatch"] += 1
-        events.append({
-            "status": "mismatch",
-            "expected": ew,
-            "actual": aw["text"],
-            "start": aw["start"],
-            "end": aw["end"],
-            "similarity": sim,
-        })
-        previous_end = item["end"]
-        cursor += 1
-        i += 1
-
-    stats["end_cursor"] = cursor
-    return out, cursor, stats
 
 
 
@@ -1301,6 +1094,25 @@ def analyze_matched_line_timing(
         if w.get("probability") is not None and not w.get("synthetic_timing")
     ]
     mean_probability = sum(probabilities) / len(probabilities) if probabilities else None
+    very_low_probability_ratio = (
+        sum(1 for p in probabilities if p <= 0.05) / len(probabilities)
+        if probabilities else 0.0
+    )
+    low_probability_ratio = (
+        sum(1 for p in probabilities if p <= 0.15) / len(probabilities)
+        if probabilities else 0.0
+    )
+
+    real_words = [w for w in line_words if not w.get("synthetic_timing")]
+    internal_gaps: List[float] = []
+    for previous, current in zip(real_words, real_words[1:]):
+        try:
+            previous_end = float(previous.get("end", previous.get("start", 0.0)))
+            current_start = float(current.get("start", previous_end))
+            internal_gaps.append(max(0.0, current_start - previous_end))
+        except Exception:
+            pass
+    max_internal_gap = max(internal_gaps) if internal_gaps else 0.0
 
     words_per_second = expected_count / max(0.01, duration) if expected_count else 0.0
     min_plausible_duration = max(0.18, expected_count * 0.09)
@@ -1337,12 +1149,26 @@ def analyze_matched_line_timing(
                 reliable = False
                 issues.append(f"too many missing words for timing anchor: missing_ratio={missing_ratio:.2f}")
 
+        # A line can also be structurally collapsed even when its overall
+        # duration looks plausible: stable-ts sometimes pins several consecutive
+        # words to exactly the same timestamp and leaves the final one with a
+        # normal duration.  That is unusable for karaoke and, more importantly,
+        # makes the line a bad anchor for neighboring timing repair.
+        zeroish_cluster_collapsed = (
+            expected_count >= 3
+            and zeroish_ratio >= float(config.get("alignment_line_zeroish_cluster_ratio", 0.60))
+            and duration < max(1.80, expected_count * 0.45)
+        )
         collapsed = (
-            expected_count >= 2
-            and (
-                duration < min_plausible_duration
-                or words_per_second > 14.0
-                or (zeroish_ratio >= 0.65 and duration < max(2.00, expected_count * 0.35))
+            (expected_count == 1 and (duration <= 0.04 or zeroish_ratio >= 1.0))
+            or (
+                expected_count >= 2
+                and (
+                    duration < min_plausible_duration
+                    or words_per_second > 14.0
+                    or (zeroish_ratio >= 0.65 and duration < max(2.00, expected_count * 0.35))
+                    or zeroish_cluster_collapsed
+                )
             )
         )
         if collapsed:
@@ -1359,6 +1185,32 @@ def analyze_matched_line_timing(
             if mean_probability < 0.05 and (zeroish_ratio >= 0.50 or duration < max(1.50, expected_count * 0.25)):
                 reliable = False
                 issues.append("low-confidence timing is not usable as an anchor")
+
+
+        # Forced alignment can preserve the exact lyric token sequence even
+        # when the singer omits/holds/replaces material.  In that situation the
+        # failure signal is often temporal rather than textual: one low-
+        # confidence word is placed many seconds after its neighbors.  Such a
+        # sparse line must not become a hard timing anchor for the rest of the
+        # song.
+        sparse_gap_limit = float(config.get("alignment_line_sparse_gap_seconds", 3.5))
+        sparse_extreme_limit = float(config.get("alignment_line_extreme_gap_seconds", 8.0))
+        sparse_low_confidence = float(config.get("alignment_line_sparse_max_mean_probability", 0.20))
+        sparse = max_internal_gap >= sparse_gap_limit and (
+            max_internal_gap >= sparse_extreme_limit
+            or mean_probability is None
+            or mean_probability <= sparse_low_confidence
+        )
+        if sparse:
+            reliable = False
+            if status == "GOOD":
+                status = "SPARSE_TIMING"
+            elif "SPARSE" not in status:
+                status = f"{status}_SPARSE"
+            issues.append(
+                f"sparse timing: max_internal_gap={max_internal_gap:.2f}s"
+                + (f", mean_probability={mean_probability:.3f}" if mean_probability is not None else "")
+            )
 
         if mismatch_count:
             issues.append(f"mismatched words: {mismatch_count}")
@@ -1383,7 +1235,10 @@ def analyze_matched_line_timing(
         "duration": duration,
         "zeroish_word_ratio": zeroish_ratio,
         "mean_probability": mean_probability,
+        "very_low_probability_ratio": very_low_probability_ratio,
+        "low_probability_ratio": low_probability_ratio,
         "words_per_second": words_per_second,
+        "max_internal_gap": max_internal_gap,
         "issues": issues,
     }
 
@@ -1399,6 +1254,20 @@ def redistribute_line_word_timings(line: Dict[str, Any], start: float, end: floa
     duration = max(0.01, float(line["end"]) - float(line["start"]))
     slot = duration / max(1, len(words))
     for i, w in enumerate(words):
+        # Preserve the original forced-alignment evidence before replacing it.
+        # Later diagnostics/repair passes may need to know which side of a large
+        # sparse gap contained the real sung phrase.
+        if "raw_start" not in w:
+            try:
+                w["raw_start"] = float(w.get("start", line["start"]))
+            except Exception:
+                w["raw_start"] = float(line["start"])
+        if "raw_end" not in w:
+            try:
+                w["raw_end"] = float(w.get("end", w["raw_start"]))
+            except Exception:
+                w["raw_end"] = float(w["raw_start"])
+
         ws = float(line["start"]) + slot * i
         we = float(line["start"]) + slot * (i + 1)
         w["start"] = ws
@@ -1409,61 +1278,905 @@ def redistribute_line_word_timings(line: Dict[str, Any], start: float, end: floa
 
 
 def estimate_unreliable_line_timings(lines: List[Dict[str, Any]], config: Dict[str, Any]) -> None:
+    """Repair unreliable lyric lines while respecting local semantic order.
+
+    The forced aligner can return the correct token sequence with bad temporal
+    evidence: one word may be thrown many seconds into a musical gap, or a short
+    repeated chant may collapse to zero duration.  Repair is deliberately local
+    to the current lyric block.  Once a line has been estimated, later global
+    reconciliation passes leave it alone instead of pulling it toward a distant
+    neighboring section.
+    """
     if not lines:
         return
 
+    cluster_gap_seconds = max(1.0, float(config.get("alignment_repair_cluster_gap_seconds", 4.0)))
+    cluster_anchor_slack = max(0.25, float(config.get("alignment_repair_anchor_slack_seconds", 1.25)))
+
+    def needs_repair(line: Dict[str, Any]) -> bool:
+        return (not bool(line.get("timing_reliable", False))) and (not bool(line.get("timing_estimated", False)))
+
+    def expected_word_count(line: Dict[str, Any]) -> int:
+        return max(
+            1,
+            int(
+                line.get("diagnostics", {}).get("expected_words", 0)
+                or len(lyric_words(str(line.get("text", ""))))
+                or 1
+            ),
+        )
+
+    def plausible_duration(line: Dict[str, Any]) -> float:
+        count = expected_word_count(line)
+        chars = sum(len(norm_word(w)) for w in lyric_words(str(line.get("text", ""))))
+        # One-word chants need enough visible time to be distinguishable in
+        # karaoke. Multi-word lines scale mostly with lexical size.
+        minimum = 0.65 if count == 1 else 0.50
+        base = max(minimum, min(5.00, count * 0.34 + chars * 0.035))
+        raw_start = float(line.get("raw_start", line.get("start", 0.0)))
+        raw_end = float(line.get("raw_end", line.get("end", raw_start)))
+        raw_span = max(0.0, raw_end - raw_start)
+        status = str(line.get("diagnostics", {}).get("status", ""))
+        if "SPARSE" not in status and 0.20 <= raw_span <= max(5.0, base * 2.2):
+            base = max(base, min(raw_span, base * 1.65))
+        return base
+
+    def raw_word_evidence(run: List[Dict[str, Any]]) -> List[Dict[str, float]]:
+        evidence: List[Dict[str, float]] = []
+        ordinal = 0
+        for line in run:
+            for word in line.get("words", []) or []:
+                try:
+                    ws = float(word.get("raw_start", word.get("start", 0.0)))
+                    we = float(word.get("raw_end", word.get("end", ws)))
+                except Exception:
+                    ordinal += 1
+                    continue
+                if not math.isfinite(ws) or not math.isfinite(we):
+                    ordinal += 1
+                    continue
+                if we < ws:
+                    we = ws
+                probability = word.get("probability")
+                try:
+                    p = float(probability) if probability is not None else 0.0
+                except Exception:
+                    p = 0.0
+                evidence.append({
+                    "ordinal": float(ordinal),
+                    "start": ws,
+                    "end": we,
+                    "probability": p,
+                })
+                ordinal += 1
+        return evidence
+
+    def evidence_clusters(evidence: List[Dict[str, float]]) -> List[List[Dict[str, float]]]:
+        if not evidence:
+            return []
+        clusters: List[List[Dict[str, float]]] = [[evidence[0]]]
+        previous_end = float(evidence[0]["end"])
+        for item in evidence[1:]:
+            gap = float(item["start"]) - previous_end
+            if gap > cluster_gap_seconds:
+                clusters.append([item])
+            else:
+                clusters[-1].append(item)
+            previous_end = max(previous_end, float(item["end"]))
+        return clusters
+
+    def average_missing_word_duration(run: List[Dict[str, Any]], desired_total: float) -> float:
+        total_words = sum(expected_word_count(line) for line in run)
+        return max(0.22, min(0.75, desired_total / max(1, total_words)))
+
     i = 0
     while i < len(lines):
-        if lines[i].get("timing_reliable", False):
+        if not needs_repair(lines[i]):
             i += 1
             continue
 
         run_start = i
-        while i < len(lines) and not lines[i].get("timing_reliable", False):
+        while i < len(lines) and needs_repair(lines[i]):
             i += 1
         run_end = i
 
         prev_line = lines[run_start - 1] if run_start > 0 else None
         next_line = lines[run_end] if run_end < len(lines) else None
+        run = lines[run_start:run_end]
+        desired = [plausible_duration(line) for line in run]
+        desired_total = max(0.10, sum(desired))
 
-        word_counts = [max(1, int(lines[j].get("diagnostics", {}).get("expected_words", 0))) for j in range(run_start, run_end)]
-        total_weight = max(1, sum(word_counts))
+        raw_starts = [float(line.get("raw_start", line.get("start", 0.0))) for line in run]
+        raw_ends = [float(line.get("raw_end", line.get("end", raw_starts[k]))) for k, line in enumerate(run)]
+        raw_start = min(raw_starts) if raw_starts else 0.0
+        raw_end = max(raw_ends) if raw_ends else raw_start
 
-        if prev_line is not None and next_line is not None:
-            start = float(prev_line["end"])
-            end = float(next_line["start"])
-            if end <= start + 0.05:
-                # No usable gap: keep a very small monotonic window rather than
-                # damaging the neighboring reliable anchors.
-                end = start + max(0.05 * total_weight, 0.10)
-        elif prev_line is not None:
-            start = float(prev_line["end"])
-            estimated_duration = max(0.25 * total_weight, 0.50)
-            raw_end = max(float(lines[j].get("end", start)) for j in range(run_start, run_end))
-            end = max(start + estimated_duration, raw_end)
-        elif next_line is not None:
-            end = float(next_line["start"])
-            estimated_duration = max(0.25 * total_weight, 0.50)
-            raw_start = min(float(lines[j].get("start", end)) for j in range(run_start, run_end))
-            start = min(raw_start, max(0.0, end - estimated_duration))
+        prev_end = float(prev_line["end"]) if prev_line is not None else None
+        next_start = float(next_line["start"]) if next_line is not None else None
+
+        evidence = raw_word_evidence(run)
+        clusters = evidence_clusters(evidence)
+        avg_missing = average_missing_word_duration(run, desired_total)
+        expected_total_words = sum(expected_word_count(line) for line in run)
+
+        if prev_end is not None and next_start is not None:
+            window_start = prev_end
+            window_end = max(window_start + 0.01, next_start)
+            available = max(0.01, window_end - window_start)
+            use_total = min(desired_total, available)
+
+            run_sparse = any("SPARSE" in str(line.get("diagnostics", {}).get("status", "")) for line in run)
+            raw_span = max(0.0, raw_end - raw_start)
+            extreme_span = run_sparse and raw_span > max(3.0, desired_total * 2.0)
+
+            edge_slack = max(0.55, use_total * 0.45)
+            near_left = raw_start <= window_start + edge_slack
+            near_right = raw_end >= window_end - edge_slack
+
+            # Sparse evidence is often a good prefix/suffix plus one outlier.
+            # Decide which side owns the phrase from the cluster nearest that
+            # local anchor instead of always choosing the right edge.
+            if extreme_span and clusters:
+                first_cluster = clusters[0]
+                last_cluster = clusters[-1]
+                first_start = float(first_cluster[0]["start"])
+                first_end = max(float(x["end"]) for x in first_cluster)
+                last_start = min(float(x["start"]) for x in last_cluster)
+                last_end = max(float(x["end"]) for x in last_cluster)
+                left_distance = abs(first_start - window_start)
+                right_distance = abs(window_end - last_end)
+                left_words = len(first_cluster)
+                right_words = len(last_cluster)
+
+                if left_distance <= right_distance + cluster_anchor_slack and left_words >= right_words:
+                    missing_after = max(0, expected_total_words - left_words)
+                    placed_start = window_start
+                    placed_end = min(
+                        window_end,
+                        max(window_start + use_total, first_end + missing_after * avg_missing),
+                    )
+                elif right_distance < left_distance + cluster_anchor_slack:
+                    missing_before = max(0, expected_total_words - right_words)
+                    placed_end = window_end
+                    placed_start = max(
+                        window_start,
+                        min(window_end - use_total, last_start - missing_before * avg_missing),
+                    )
+                else:
+                    raw_center = (raw_start + raw_end) / 2.0
+                    placed_start = raw_center - use_total / 2.0
+                    placed_start = min(max(window_start, placed_start), window_end - use_total)
+                    placed_end = placed_start + use_total
+            elif available <= desired_total * 1.25:
+                placed_start, placed_end = window_start, window_end
+            elif near_right and not near_left:
+                placed_end = window_end
+                placed_start = max(window_start, placed_end - use_total)
+            elif near_left and not near_right:
+                placed_start = window_start
+                placed_end = min(window_end, placed_start + use_total)
+            else:
+                raw_center = (raw_start + raw_end) / 2.0
+                placed_start = raw_center - use_total / 2.0
+                placed_start = min(max(window_start, placed_start), window_end - use_total)
+                placed_end = placed_start + use_total
+
+        elif prev_end is not None:
+            # Trailing unreliable line: prefer the raw prefix attached to the
+            # previous lyric anchor. A distant suffix after a large gap is an
+            # outlier, not evidence that the lyric lasts through the gap.
+            placed_start = prev_end
+            placed_end = placed_start + desired_total
+            if clusters:
+                prefix = clusters[0]
+                prefix_start = float(prefix[0]["start"])
+                prefix_end = max(float(x["end"]) for x in prefix)
+                if prefix_start <= prev_end + cluster_anchor_slack:
+                    missing_after = max(0, expected_total_words - len(prefix))
+                    evidence_end = prefix_end + missing_after * avg_missing
+                    placed_end = max(placed_end, evidence_end)
+                    # Do not let a dubious sung tail consume an arbitrary amount
+                    # of music even if the raw cluster itself is unusually long.
+                    max_tail = max(8.0, desired_total * 3.5)
+                    placed_end = min(placed_end, placed_start + max_tail)
+
+        elif next_start is not None:
+            # Leading unreliable line: mirror the rule above and use the suffix
+            # cluster attached to the following reliable lyric anchor. This is
+            # especially important after an instrumental/vocalise gap.
+            placed_end = next_start
+            placed_start = max(0.0, placed_end - desired_total)
+            if clusters:
+                suffix = clusters[-1]
+                suffix_start = min(float(x["start"]) for x in suffix)
+                suffix_end = max(float(x["end"]) for x in suffix)
+                missing_before = max(0, expected_total_words - len(suffix))
+                if suffix_end >= next_start - cluster_anchor_slack:
+                    placed_start = max(0.0, suffix_start - missing_before * avg_missing)
+                    placed_end = next_start
+                else:
+                    # No evidence touches the next anchor. Preserve the compact
+                    # raw region instead of stretching the lyric over silence.
+                    placed_start = max(0.0, min(raw_start, next_start - desired_total))
+                    placed_end = min(next_start, max(raw_end, placed_start + desired_total))
         else:
-            start = min(float(lines[j].get("start", 0.0)) for j in range(run_start, run_end))
-            end = max(float(lines[j].get("end", start + 0.01)) for j in range(run_start, run_end))
-            if end <= start + 0.05:
-                end = start + max(0.25 * total_weight, 0.50)
+            placed_start = raw_start
+            placed_end = max(placed_start + desired_total, raw_end)
 
-        cursor = start
-        available = max(0.01, end - start)
-        for j, weight in zip(range(run_start, run_end), word_counts):
-            part = available * (weight / total_weight)
+        if placed_end <= placed_start + 0.01:
+            placed_end = placed_start + max(0.10, desired_total)
+
+        available_for_run = max(0.01, placed_end - placed_start)
+        weight_sum = max(0.01, sum(desired))
+        cursor = placed_start
+        for offset, line in enumerate(run):
+            weight = desired[offset]
+            part = available_for_run * (weight / weight_sum)
             line_start = cursor
-            line_end = end if j == run_end - 1 else cursor + part
-            redistribute_line_word_timings(lines[j], line_start, line_end, estimated=True)
-            lines[j]["timing_reliable"] = False
-            lines[j]["timing_estimated"] = True
-            lines[j].setdefault("diagnostics", {}).setdefault("issues", []).append("timing estimated from neighboring reliable lines")
+            line_end = placed_end if offset == len(run) - 1 else min(placed_end, cursor + part)
+            redistribute_line_word_timings(line, line_start, line_end, estimated=True)
+            line["timing_reliable"] = False
+            line["timing_estimated"] = True
+            repair_issue = "timing estimated from local raw-cluster anchors"
+            issues = line.setdefault("diagnostics", {}).setdefault("issues", [])
+            if repair_issue not in issues:
+                issues.append(repair_issue)
+            line["diagnostics"]["repair_window"] = {
+                "start": placed_start,
+                "end": placed_end,
+                "raw_start": raw_start,
+                "raw_end": raw_end,
+                "previous_reliable_end": prev_end,
+                "next_reliable_start": next_start,
+                "raw_cluster_count": len(clusters),
+            }
             cursor = line_end
 
+
+def _raw_word_start(word: Dict[str, Any]) -> float:
+    try:
+        return float(word.get("raw_start", word.get("start", 0.0)))
+    except Exception:
+        return float(word.get("start", 0.0) or 0.0)
+
+
+def _raw_word_end(word: Dict[str, Any]) -> float:
+    start = _raw_word_start(word)
+    try:
+        return max(start, float(word.get("raw_end", word.get("end", start))))
+    except Exception:
+        return max(start, float(word.get("end", start) or start))
+
+
+def _word_probability(word: Dict[str, Any]) -> float:
+    try:
+        value = word.get("probability")
+        return float(value) if value is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+def _lexical_word_duration(text: str) -> float:
+    letters = max(1, len(norm_word(text)))
+    return max(0.22, min(1.25, 0.18 + letters * 0.085))
+
+
+def _line_weight(line: Dict[str, Any]) -> float:
+    words = lyric_words(str(line.get("text", "")))
+    if not words:
+        return 1.0
+    return max(0.45, sum(_lexical_word_duration(w) for w in words))
+
+
+def _raw_line_was_unreliable(line: Dict[str, Any]) -> bool:
+    diag = line.get("diagnostics", {}) or {}
+    raw = diag.get("raw_diagnostics") if isinstance(diag.get("raw_diagnostics"), dict) else diag
+    if not bool(raw.get("timing_reliable", line.get("timing_reliable", False))):
+        return True
+    status = str(raw.get("status", ""))
+    return any(token in status for token in ("COLLAPSED", "SPARSE", "LOW_CONFIDENCE", "MISSING", "PARTIAL"))
+
+
+def repair_repeated_single_word_lines(lines: List[Dict[str, Any]], config: Dict[str, Any]) -> None:
+    """Repair consecutive identical one-word lyric lines without losing repeats.
+
+    There are two common forced-alignment failures:
+      * the first repeat has a usable onset while the last repeat collapses to
+        near-zero duration (keep the distinct onsets and infer the last duration
+        from the preceding repeat);
+      * the whole repeated chant is collapsed at the *right* edge of the space
+        between surrounding reliable lines (spread the chant backwards over the
+        available vocal window).
+
+    The rule is lexical/temporal and applies to any repeated one-word lines.
+    """
+    if len(lines) < 2:
+        return
+
+    min_visible = max(0.10, float(config.get("alignment_repeat_min_visible_seconds", 0.18)))
+    normal_last = max(min_visible, float(config.get("alignment_repeat_last_word_seconds", 0.65)))
+    late_onset = max(0.40, float(config.get("alignment_repeat_late_onset_seconds", 0.75)))
+    compressed_ratio = max(0.10, min(0.80, float(config.get("alignment_repeat_compressed_ratio", 0.45))))
+
+    def single_norm(line: Dict[str, Any]) -> Optional[str]:
+        words = lyric_words(str(line.get("text", "")))
+        if len(words) != 1:
+            return None
+        return norm_word(words[0]) or None
+
+    i = 0
+    while i < len(lines) - 1:
+        token = single_norm(lines[i])
+        if not token:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and single_norm(lines[j]) == token:
+            j += 1
+        if j - i < 2:
+            i = j
+            continue
+
+        run = lines[i:j]
+        if not any(_raw_line_was_unreliable(line) or bool(line.get("timing_estimated", False)) for line in run):
+            i = j
+            continue
+
+        raw_starts: List[float] = []
+        raw_ends: List[float] = []
+        raw_probs: List[float] = []
+        for line in run:
+            words = line.get("words", []) or []
+            if words:
+                raw_starts.append(_raw_word_start(words[0]))
+                raw_ends.append(_raw_word_end(words[-1]))
+                raw_probs.append(_word_probability(words[0]))
+            else:
+                raw_starts.append(float(line.get("raw_start", line.get("start", 0.0))))
+                raw_ends.append(float(line.get("raw_end", line.get("end", raw_starts[-1]))))
+                raw_probs.append(0.0)
+
+        if any(not math.isfinite(x) for x in raw_starts + raw_ends):
+            i = j
+            continue
+        if any(raw_starts[k + 1] < raw_starts[k] - 1e-6 for k in range(len(raw_starts) - 1)):
+            i = j
+            continue
+
+        prev_end = float(lines[i - 1]["end"]) if i > 0 else max(0.0, raw_starts[0])
+        next_start = float(lines[j]["start"]) if j < len(lines) else None
+        first_start = max(prev_end, raw_starts[0])
+        raw_group_end = max(raw_ends)
+        raw_span = max(0.0, raw_group_end - raw_starts[0])
+        available = (next_start - prev_end) if next_start is not None else None
+        low_conf_ratio = sum(1 for p in raw_probs if p <= 0.15) / max(1, len(raw_probs))
+
+        # A chant whose raw onsets arrive very late and occupy only a tiny part
+        # of the space before the next reliable line was usually collapsed onto
+        # the next phrase. Spread it over that local window. This fixes cases
+        # like two short repeated calls that are sung before the timestamps.
+        use_full_window = (
+            next_start is not None
+            and available is not None
+            and available >= min_visible * len(run)
+            and raw_starts[0] - prev_end >= late_onset
+            and raw_span <= available * compressed_ratio
+            and low_conf_ratio >= 0.50
+        )
+
+        if use_full_window:
+            boundaries = [prev_end + available * k / len(run) for k in range(len(run) + 1)]
+            mode = "spread_collapsed_repeat_over_neighbor_window"
+        else:
+            boundaries = [first_start]
+            for k in range(1, len(run)):
+                candidate = max(boundaries[-1] + min_visible, raw_starts[k])
+                if next_start is not None:
+                    remaining = len(run) - k
+                    candidate = min(candidate, next_start - min_visible * remaining)
+                boundaries.append(max(boundaries[-1] + 0.01, candidate))
+
+            # If the last repeat collapsed, infer its hold from earlier repeats
+            # rather than giving it a fixed 0.65 s and making it disappear halfway.
+            reference_durations = [
+                max(0.0, raw_ends[k] - raw_starts[k])
+                for k in range(max(0, len(run) - 1))
+                if raw_ends[k] - raw_starts[k] >= min_visible
+            ]
+            reference = max(reference_durations) if reference_durations else normal_last
+            final_duration = max(normal_last, reference)
+            final_end = max(boundaries[-1] + min_visible, raw_ends[-1], boundaries[-1] + final_duration)
+            if next_start is not None:
+                final_end = min(final_end, next_start)
+
+                # When the last item of an unreliable repeat group collapsed, a
+                # short residual gap before the next lyric onset is ambiguous:
+                # it can be the missing tail of the repeated sung word rather
+                # than actual silence.  Bridge only a small, locally-scaled gap
+                # and only for a genuinely unreliable final repeat.  This is
+                # token-agnostic and applies to any repeated one-word chant.
+                residual_gap = max(0.0, next_start - final_end)
+                bridge_cap = max(
+                    min_visible,
+                    float(config.get("alignment_repeat_bridge_gap_seconds", 1.25)),
+                )
+                bridge_fraction = min(1.0, max(0.25, float(config.get("alignment_repeat_bridge_reference_fraction", 0.75))))
+                reference_scaled_cap = max(bridge_cap, reference * 1.25)
+                final_repeat_unreliable = (
+                    _raw_line_was_unreliable(run[-1])
+                    or raw_probs[-1] <= 0.15
+                    or max(0.0, raw_ends[-1] - raw_starts[-1]) < min_visible
+                )
+                if (
+                    final_repeat_unreliable
+                    and low_conf_ratio >= 0.50
+                    and 0.0 < residual_gap <= reference_scaled_cap
+                ):
+                    # Do not blindly fill the entire silence. Extend by a
+                    # fraction of the duration demonstrated by the preceding
+                    # repeat, capped by the actual residual gap. This keeps the
+                    # subtitle alive through a likely sustained repeat while
+                    # preserving a real short pause when one exists.
+                    bridge = min(residual_gap, max(min_visible, reference * bridge_fraction))
+                    final_end += bridge
+                    mode = "preserve_repeat_onsets_and_bridge_short_residual_gap"
+                else:
+                    mode = "preserve_repeat_onsets_and_infer_final_hold"
+            else:
+                mode = "preserve_repeat_onsets_and_infer_final_hold"
+            if final_end <= boundaries[-1] + 0.01:
+                final_end = boundaries[-1] + min_visible
+            boundaries.append(final_end)
+
+        for offset, line in enumerate(run):
+            line_start = float(boundaries[offset])
+            line_end = max(line_start + 0.01, float(boundaries[offset + 1]))
+            redistribute_line_word_timings(line, line_start, line_end, estimated=True)
+            line["timing_reliable"] = False
+            line["timing_estimated"] = True
+            issues = line.setdefault("diagnostics", {}).setdefault("issues", [])
+            issue = "repeated single-word timing repaired from local chant window"
+            if issue not in issues:
+                issues.append(issue)
+            line["diagnostics"]["repeat_repair"] = {
+                "token": token,
+                "group_size": len(run),
+                "raw_starts": raw_starts,
+                "raw_ends": raw_ends,
+                "previous_line_end": prev_end,
+                "next_line_start": next_start,
+                "mode": mode,
+                "start": line_start,
+                "end": line_end,
+            }
+
+        i = j
+
+
+def repair_adjacent_line_boundary_holds(lines: List[Dict[str, Any]], config: Dict[str, Any]) -> None:
+    """Repair ambiguous sustained-word boundaries between adjacent lyric lines.
+
+    Forced alignment often assigns a sung hold to the wrong side of a line
+    boundary. Two generic signatures are handled:
+      1) previous final word is low-confidence, next first word is zero-duration
+         and low-confidence, and a later word in the next line starts much later;
+      2) next line's first word consumes an implausibly long interval while the
+         previous line ends exactly at that word's onset.
+
+    The result moves the *line boundary*; it never allows a semantic range to
+    split a word later in the pipeline.
+    """
+    if len(lines) < 2:
+        return
+
+    delayed_gap = max(0.60, float(config.get("alignment_boundary_delayed_prefix_gap_seconds", 1.20)))
+    low_conf = max(0.01, float(config.get("alignment_boundary_low_probability", 0.08)))
+    zeroish = max(0.01, float(config.get("alignment_boundary_zeroish_seconds", 0.06)))
+    long_first_min = max(1.0, float(config.get("alignment_boundary_long_first_word_seconds", 2.20)))
+    long_first_ratio = max(1.5, float(config.get("alignment_boundary_long_first_word_ratio", 2.8)))
+
+    for idx in range(len(lines) - 1):
+        prev_line = lines[idx]
+        next_line = lines[idx + 1]
+        prev_words = prev_line.get("words", []) or []
+        next_words = next_line.get("words", []) or []
+        if not prev_words or not next_words:
+            continue
+
+        pw = prev_words[-1]
+        nw = next_words[0]
+        prev_p = _word_probability(pw)
+        next_p = _word_probability(nw)
+        prev_end = float(prev_line.get("end", _raw_word_end(pw)))
+        next_start = float(next_line.get("start", _raw_word_start(nw)))
+        raw_next_first_start = _raw_word_start(nw)
+        raw_next_first_end = _raw_word_end(nw)
+        raw_next_first_duration = max(0.0, raw_next_first_end - raw_next_first_start)
+
+        # Pattern 1: the next line begins with a zero-ish weak token, then has a
+        # delayed non-zero token. Put the weak prefix immediately before that
+        # delayed token and extend the previous held word to the new boundary.
+        delayed_index: Optional[int] = None
+        for k in range(1, len(next_words)):
+            ws = _raw_word_start(next_words[k])
+            we = _raw_word_end(next_words[k])
+            if ws - raw_next_first_end >= delayed_gap and we - ws >= zeroish:
+                delayed_index = k
+                break
+
+        if (
+            delayed_index is not None
+            and prev_p <= low_conf
+            and next_p <= low_conf
+            and raw_next_first_duration <= zeroish
+        ):
+            delayed_start = _raw_word_start(next_words[delayed_index])
+            prefix_words = next_words[:delayed_index]
+            prefix_duration = sum(_lexical_word_duration(str(w.get("text", ""))) for w in prefix_words)
+            new_boundary = max(prev_end, delayed_start - prefix_duration)
+            new_boundary = min(delayed_start - 0.02, new_boundary)
+            if new_boundary > prev_end + 0.10:
+                pw["end"] = new_boundary
+                pw["timing_estimated"] = True
+                pw["timing_source"] = "boundary_hold_extended_previous_word"
+                prev_line["end"] = new_boundary
+                prev_line["timing_estimated"] = True
+
+                # Prefix occupies the short interval immediately before the first
+                # delayed token. The rest of the next line is distributed only
+                # inside its existing line end, so distant outliers stay ignored.
+                cursor = new_boundary
+                prefix_total = max(0.02, delayed_start - new_boundary)
+                prefix_weights = [_lexical_word_duration(str(w.get("text", ""))) for w in prefix_words]
+                weight_sum = max(0.01, sum(prefix_weights))
+                for w, weight in zip(prefix_words, prefix_weights):
+                    ws = cursor
+                    we = delayed_start if w is prefix_words[-1] else cursor + prefix_total * weight / weight_sum
+                    w["start"] = ws
+                    w["end"] = max(ws + 0.01, we)
+                    w["timing_estimated"] = True
+                    w["timing_source"] = "boundary_hold_delayed_prefix"
+                    cursor = w["end"]
+
+                suffix = next_words[delayed_index:]
+                suffix_start = delayed_start
+                suffix_end = max(suffix_start + 0.01, float(next_line.get("end", suffix_start + 0.01)))
+                suffix_weights = [_lexical_word_duration(str(w.get("text", ""))) for w in suffix]
+                suffix_sum = max(0.01, sum(suffix_weights))
+                cursor = suffix_start
+                for n, (w, weight) in enumerate(zip(suffix, suffix_weights)):
+                    ws = cursor
+                    we = suffix_end if n == len(suffix) - 1 else cursor + (suffix_end - suffix_start) * weight / suffix_sum
+                    w["start"] = ws
+                    w["end"] = max(ws + 0.01, we)
+                    w["timing_estimated"] = True
+                    w["timing_source"] = "boundary_hold_suffix_redistributed"
+                    cursor = w["end"]
+
+                next_line["start"] = new_boundary
+                next_line["timing_estimated"] = True
+                issue = "adjacent line boundary moved after low-confidence held word"
+                for line in (prev_line, next_line):
+                    issues = line.setdefault("diagnostics", {}).setdefault("issues", [])
+                    if issue not in issues:
+                        issues.append(issue)
+                    line["diagnostics"]["boundary_hold_repair"] = {
+                        "mode": "delayed_weak_prefix",
+                        "old_boundary": next_start,
+                        "new_boundary": new_boundary,
+                        "delayed_word_start": delayed_start,
+                    }
+                continue
+
+        # Pattern 2: the first word of the next line is an extreme duration
+        # outlier. A line transition inside such a hold is acoustically ambiguous;
+        # split the combined two-word hold by lexical weight instead of trusting
+        # the forced onset blindly.
+        expected_next = _lexical_word_duration(str(nw.get("text", "")))
+        if (
+            abs(prev_end - next_start) <= 0.08
+            and raw_next_first_duration >= long_first_min
+            and raw_next_first_duration >= expected_next * long_first_ratio
+        ):
+            prev_word_start = float(pw.get("start", _raw_word_start(pw)))
+            combined_end = float(nw.get("end", raw_next_first_end))
+            if combined_end - prev_word_start >= 0.80:
+                prev_weight = _lexical_word_duration(str(pw.get("text", "")))
+                next_weight = expected_next
+                split = prev_word_start + (combined_end - prev_word_start) * prev_weight / max(0.01, prev_weight + next_weight)
+                split = min(combined_end - 0.10, max(prev_word_start + 0.10, split))
+                if split > prev_end + 0.10:
+                    pw["end"] = split
+                    pw["timing_estimated"] = True
+                    pw["timing_source"] = "boundary_hold_balanced_long_next_word"
+                    nw["start"] = split
+                    nw["timing_estimated"] = True
+                    nw["timing_source"] = "boundary_hold_balanced_long_next_word"
+                    prev_line["end"] = split
+                    next_line["start"] = split
+                    prev_line["timing_estimated"] = True
+                    next_line["timing_estimated"] = True
+                    issue = "adjacent line boundary balanced across implausibly long first word"
+                    for line in (prev_line, next_line):
+                        issues = line.setdefault("diagnostics", {}).setdefault("issues", [])
+                        if issue not in issues:
+                            issues.append(issue)
+                        line["diagnostics"]["boundary_hold_repair"] = {
+                            "mode": "balance_long_first_word",
+                            "old_boundary": next_start,
+                            "new_boundary": split,
+                            "combined_end": combined_end,
+                        }
+
+
+def repair_uncertain_terminal_lines_before_nonlyrical_blocks(
+    verses: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> None:
+    """Give highly uncertain terminal lyrics a conservative sung-tail allowance.
+
+    Forced alignment has no reliable right-hand lyric anchor when a lyrical
+    section is followed by a metadata-only/empty musical block.  If almost the
+    entire final lyric line has very low word confidence, its synthesized final
+    word can end slightly before the singer actually releases it.
+
+    This repair is deliberately narrow and content-agnostic:
+      * current block must contain lyrics;
+      * the immediately following block must contain no lyrics;
+      * the final line must already be estimated/unreliable;
+      * a large majority of its raw words must have very low confidence.
+
+    Under those conditions only, extend the final word by a small amount derived
+    from lexical duration and uncertainty.  The semantic timeline is rebuilt
+    from the resulting word edge later, so no R boundary can cut through it.
+    """
+    if len(verses) < 2:
+        return
+
+    low_probability = max(0.001, float(config.get("alignment_terminal_low_probability", 0.10)))
+    low_ratio_required = min(1.0, max(0.50, float(config.get("alignment_terminal_low_confidence_ratio", 0.67))))
+    min_tail = max(0.05, float(config.get("alignment_terminal_uncertainty_min_seconds", 0.30)))
+    max_tail = max(min_tail, float(config.get("alignment_terminal_uncertainty_max_seconds", 0.90)))
+
+    for idx in range(len(verses) - 1):
+        current = verses[idx]
+        following = verses[idx + 1]
+        if not block_has_lyric_text(current) or block_has_lyric_text(following):
+            continue
+
+        lines = current.get("lines", []) or []
+        if not lines:
+            continue
+        line = lines[-1]
+        words = line.get("words", []) or []
+        if not words:
+            continue
+
+        # Do not alter a normally aligned terminal phrase merely because a
+        # musical block follows it.  This pass is for severe forced-alignment
+        # uncertainty only.
+        if not (bool(line.get("timing_estimated", False)) or _raw_line_was_unreliable(line)):
+            continue
+
+        probs = [_word_probability(w) for w in words]
+        low_count = sum(1 for p in probs if p <= low_probability)
+        low_ratio = low_count / max(1, len(probs))
+        if low_ratio < low_ratio_required:
+            continue
+
+        last = words[-1]
+        last_start = float(last.get("start", line.get("start", 0.0)))
+        last_end = float(last.get("end", last_start))
+        current_duration = max(0.01, last_end - last_start)
+        lexical = _lexical_word_duration(str(last.get("text", "")))
+
+        # More uncertainty permits a somewhat larger release tail, but it is
+        # always tightly capped.  This avoids swallowing a true instrumental
+        # pause while still preventing an estimated terminal word from being
+        # visibly cut off just as the next semantic range begins.
+        uncertainty = min(1.0, max(0.0, low_ratio))
+        tail = lexical * (1.0 + 0.50 * uncertainty)
+        tail = min(max_tail, max(min_tail, tail))
+
+        new_end = last_end + tail
+        last["end"] = new_end
+        last["timing_estimated"] = True
+        last["timing_source"] = "terminal_low_confidence_release_tail"
+        line["end"] = new_end
+        line["timing_estimated"] = True
+        line.setdefault("diagnostics", {}).setdefault("issues", []).append(
+            "terminal low-confidence lyric given conservative release tail before non-lyrical block"
+        )
+        line["diagnostics"]["terminal_release_tail"] = {
+            "low_confidence_ratio": low_ratio,
+            "low_probability_threshold": low_probability,
+            "previous_end": last_end,
+            "new_end": new_end,
+            "tail_seconds": tail,
+            "previous_word_duration": current_duration,
+        }
+
+
+
+def repair_final_song_word_release_before_terminal_nonlyrical_tail(
+    verses: List[Dict[str, Any]],
+) -> None:
+    """Give the final sung word a small universal release hold.
+
+    This is intentionally content-agnostic.  The rule applies only when the
+    final lyrical block is followed exclusively by one or more non-lyrical
+    blocks (for example a terminal metadata marker such as [End] or an outro
+    tail).  With no following sung word, forced alignment has no right-hand
+    lexical anchor and frequently ends a sustained final vowel too tightly.
+
+    The adjustment is conservative:
+      * only the last word of the last lyrical line can change;
+      * an already-long word is left untouched;
+      * the extra time is capped;
+      * an earlier low-confidence terminal-tail repair is not extended again.
+
+    Timeline construction later uses the repaired lyric end, so the following
+    R boundary moves with the word and can never cut through it.
+    """
+    if len(verses) < 2:
+        return
+
+    lyrical_indices = [i for i, verse in enumerate(verses) if block_has_lyric_text(verse)]
+    if not lyrical_indices:
+        return
+    last_lyric_index = lyrical_indices[-1]
+    if last_lyric_index >= len(verses) - 1:
+        return
+    if any(block_has_lyric_text(verse) for verse in verses[last_lyric_index + 1:]):
+        return
+
+    verse = verses[last_lyric_index]
+    lines = verse.get("lines", []) or []
+    if not lines:
+        return
+    line = lines[-1]
+    words = line.get("words", []) or []
+    if not words:
+        return
+
+    last = words[-1]
+    if str(last.get("timing_source", "")) == "terminal_low_confidence_release_tail":
+        return
+
+    try:
+        start = float(last.get("start", line.get("start", 0.0)))
+        end = float(last.get("end", start))
+    except Exception:
+        return
+    duration = max(0.0, end - start)
+    desired_extra = max(0.0, TERMINAL_SONG_WORD_MIN_KARAOKE_SECONDS - duration)
+    extra = min(TERMINAL_SONG_WORD_MAX_EXTRA_SECONDS, desired_extra)
+    if extra <= 1e-6:
+        return
+
+    new_end = end + extra
+    last["end"] = new_end
+    last["timing_estimated"] = True
+    last["timing_source"] = "terminal_song_word_release_hold"
+    line["end"] = new_end
+    line["timing_estimated"] = True
+    diagnostics = line.setdefault("diagnostics", {})
+    issues = diagnostics.setdefault("issues", [])
+    issue = "final song word given conservative release hold before terminal non-lyrical tail"
+    if issue not in issues:
+        issues.append(issue)
+    diagnostics["terminal_song_word_release_hold"] = {
+        "previous_end": end,
+        "new_end": new_end,
+        "previous_duration": duration,
+        "extra_seconds": extra,
+        "minimum_target_duration": TERMINAL_SONG_WORD_MIN_KARAOKE_SECONDS,
+        "maximum_extra_seconds": TERMINAL_SONG_WORD_MAX_EXTRA_SECONDS,
+    }
+
+
+def repair_leading_unreliable_lines_across_lyric_blocks(
+    verses: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> None:
+    """Use the previous lyric block as a left anchor for collapsed leading lines.
+
+    Per-block repair cannot see the preceding section. If a new lyrical block
+    begins with one or more collapsed lines, forced alignment may pin all of them
+    to the first reliable line on the right. When there is *no explicit
+    metadata-only musical block between sections*, the previous lyric end is a
+    valid local anchor. Spread only the unreliable leading run over that local
+    window. Explicit instrumental/empty blocks remain hard barriers.
+    """
+    previous_lyric: Optional[Dict[str, Any]] = None
+    max_window = max(2.0, float(config.get("alignment_cross_block_leading_max_seconds", 6.0)))
+
+    for verse in verses:
+        if not block_has_lyric_text(verse):
+            previous_lyric = None
+            continue
+        lines = verse.get("lines", []) or []
+        if not lines:
+            previous_lyric = verse
+            continue
+
+        if previous_lyric is not None:
+            def _leading_collapsed_candidate(line: Dict[str, Any]) -> bool:
+                diag = line.get("diagnostics", {}) or {}
+                raw = diag.get("raw_diagnostics") if isinstance(diag.get("raw_diagnostics"), dict) else diag
+                status = str(raw.get("status", ""))
+                if any(token in status for token in ("COLLAPSED", "MISSING", "PARTIAL")):
+                    return True
+                try:
+                    raw_span = float(line.get("raw_end", line.get("end", 0.0))) - float(line.get("raw_start", line.get("start", 0.0)))
+                except Exception:
+                    raw_span = 999.0
+                expected_words = max(1, len(lyric_words(str(line.get("text", "")))))
+                return raw_span <= max(0.10, expected_words * 0.07) and not bool(raw.get("timing_reliable", False))
+
+            run_end = 0
+            while run_end < len(lines) and _leading_collapsed_candidate(lines[run_end]):
+                run_end += 1
+            if 0 < run_end < len(lines):
+                prev_lines = previous_lyric.get("lines", []) or []
+                if prev_lines:
+                    left = float(prev_lines[-1].get("end", previous_lyric.get("end", 0.0)))
+                    right = float(lines[run_end].get("start", left))
+                    available = right - left
+                    run = lines[:run_end]
+                    weights = [_line_weight(line) for line in run]
+                    desired = sum(weights)
+                    raw_starts = [float(line.get("raw_start", line.get("start", right))) for line in run]
+                    raw_ends = [float(line.get("raw_end", line.get("end", right))) for line in run]
+                    raw_span = max(raw_ends) - min(raw_starts) if raw_starts else 0.0
+
+                    # Keep this local. A very large unexplained pause should be a
+                    # musical gap, not silently filled with lyrics; modest gaps or
+                    # visibly collapsed evidence are safe to reconstruct.
+                    if (
+                        available > 0.10
+                        and available <= max(max_window, desired * 2.25)
+                        and (raw_span < desired * 0.75 or available <= desired * 1.8)
+                    ):
+                        cursor = left
+                        total_weight = max(0.01, sum(weights))
+                        for n, (line, weight) in enumerate(zip(run, weights)):
+                            line_start = cursor
+                            line_end = right if n == len(run) - 1 else cursor + available * weight / total_weight
+                            redistribute_line_word_timings(line, line_start, line_end, estimated=True)
+                            line["timing_reliable"] = False
+                            line["timing_estimated"] = True
+                            issues = line.setdefault("diagnostics", {}).setdefault("issues", [])
+                            issue = "leading collapsed line repaired from adjacent lyric-block anchors"
+                            if issue not in issues:
+                                issues.append(issue)
+                            line["diagnostics"]["cross_block_leading_repair"] = {
+                                "left_anchor": left,
+                                "right_anchor": right,
+                                "run_size": len(run),
+                                "raw_span": raw_span,
+                            }
+                            cursor = line_end
+
+        previous_lyric = verse
+
+
+def refresh_line_and_verse_bounds(verses: List[Dict[str, Any]]) -> None:
+    """Recompute line/verse bounds after timing repair without changing words."""
+    for verse in verses:
+        if not block_has_lyric_text(verse):
+            continue
+        lines = verse.get("lines", []) or []
+        for line in lines:
+            words = line.get("words", []) or []
+            if words:
+                line["start"] = min(float(w.get("start", line.get("start", 0.0))) for w in words)
+                line["end"] = max(float(w.get("end", line.get("end", line["start"]))) for w in words)
+                line["end"] = max(line["start"] + 0.01, line["end"])
+        if lines:
+            verse["start"] = min(float(line["start"]) for line in lines)
+            verse["end"] = max(float(line["end"]) for line in lines)
+            verse["duration"] = max(0.01, verse["end"] - verse["start"])
 
 
 def actual_word_duration(word: Dict[str, Any]) -> float:
@@ -1527,15 +2240,29 @@ def sanitize_matched_line_word_timings(line_text: str, words: List[Dict[str, Any
 
         confidence_bad = (probability_value is not None and probability_value <= low_probability)
         confidence_unknown_but_gap_extreme = probability_value is None and gap >= far_gap_without_probability_seconds
+        very_low_probability = probability_value is not None and probability_value <= 0.05
+        extreme_low_confidence_jump = (
+            gap >= 3.0
+            and duration <= 1.50
+            and very_low_probability
+        )
         should_repair = (
-            gap >= far_gap_seconds
-            and duration <= zeroish_seconds
-            and (confidence_bad or confidence_unknown_but_gap_extreme)
+            (
+                gap >= far_gap_seconds
+                and duration <= zeroish_seconds
+                and (confidence_bad or confidence_unknown_but_gap_extreme)
+            )
+            or extreme_low_confidence_jump
         )
 
         if should_repair:
             new_start = previous_end
-            new_duration = estimate_sanitized_word_duration(str(word.get("text", "")), gap)
+            # For an extreme low-confidence jump, the gap is evidence of an
+            # alignment failure, not evidence that the word itself lasts for
+            # several seconds.  Use lexical duration only; otherwise a 20s bad
+            # jump can turn into an artificial 4.5s subtitle word.
+            duration_gap_hint = 0.0 if extreme_low_confidence_jump else gap
+            new_duration = estimate_sanitized_word_duration(str(word.get("text", "")), duration_gap_hint)
             new_end = min(start, new_start + new_duration) if start > new_start + 0.05 else new_start + new_duration
             new_end = max(new_start + 0.05, new_end)
             word["original_start"] = start
@@ -1709,6 +2436,19 @@ def find_best_line_candidate(
             candidate = build_line_candidate_from_start(expected_line_words, words, actual_start, expected_offset, config)
             if candidate is None:
                 continue
+
+            # Locality must be measured from the caller's monotonic cursor, not
+            # from actual_start (the old score accidentally subtracted
+            # first_actual-actual_start, which is normally zero).  Without this
+            # penalty a repeated chorus ten seconds later can beat the correct
+            # occurrence merely because Whisper assigned it a slightly higher
+            # probability.  A few true extra words can still be skipped, but a
+            # distant repeat no longer wins by default.
+            skipped_actual_words = max(0, int(candidate["first_actual"]) - int(cursor))
+            skip_penalty = float(config.get("alignment_line_candidate_skip_word_penalty", 2.0))
+            candidate["score"] -= skip_penalty * skipped_actual_words
+            candidate["skipped_actual_words"] = skipped_actual_words
+
             if not allow_long_start_gap and cursor < len(words):
                 cursor_time = float(words[cursor].get("start", 0.0))
                 first_time = float(words[int(candidate["first_actual"])].get("start", cursor_time))
@@ -1832,6 +2572,97 @@ def materialize_line_candidate(
     stats["candidate_last_actual"] = int(candidate["last_actual"])
     return out, int(candidate["new_cursor"]), stats
 
+def normalized_expected_lyric_stream(lyrics_verses: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for verse in lyrics_verses:
+        for line in verse.get("lines_text", []) or []:
+            out.extend(norm_word(word) for word in lyric_words(str(line)) if norm_word(word))
+    return out
+
+
+def normalized_alignment_stream(words: List[Dict[str, Any]]) -> List[str]:
+    return [norm_word(str(word.get("text", ""))) for word in words if norm_word(str(word.get("text", "")))]
+
+
+def materialize_exact_forced_line(
+    expected_line_words: List[str],
+    words: List[Dict[str, Any]],
+    cursor: int,
+) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+    """Map a forced-alignment line by token index when the full streams match.
+
+    stable-ts ``--align`` is a forced aligner: when its normalized output token
+    stream is identical to the normalized lyrics stream, searching for each
+    line again is both unnecessary and unsafe around repeated phrases.  Token
+    identity is taken from lyrics; stable-ts contributes timing/probability only.
+    """
+    count = len(expected_line_words)
+    actual_slice = words[cursor:cursor + count]
+    out: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+    if len(actual_slice) != count:
+        raise RuntimeError(
+            "forced_sequence_exact invariant violated: "
+            f"expected {count} tokens at cursor {cursor}, got {len(actual_slice)}"
+        )
+
+    for offset, (expected, actual) in enumerate(zip(expected_line_words, actual_slice)):
+        actual_text = str(actual.get("text", ""))
+        if norm_word(expected) != norm_word(actual_text):
+            raise RuntimeError(
+                "forced_sequence_exact invariant violated: "
+                f"cursor={cursor}, offset={offset}, "
+                f"expected={expected!r}, actual={actual_text!r}"
+            )
+        item = {
+            "text": expected,
+            "aligned_text": actual.get("text"),
+            "start": actual.get("start"),
+            "end": actual.get("end"),
+            "probability": actual.get("probability"),
+            "match_status": "match",
+            "synthetic_timing": False,
+            "similarity": 1.0,
+            "timing_source": "forced_sequence_exact",
+        }
+        out.append(item)
+        events.append({
+            "status": "match",
+            "expected": expected,
+            "actual": actual.get("text"),
+            "start": actual.get("start"),
+            "end": actual.get("end"),
+            "similarity": 1.0,
+        })
+
+    new_cursor = cursor + len(actual_slice)
+    report = {
+        "expected": count,
+        "matched": len(actual_slice),
+        "fuzzy": 0,
+        "mismatch": 0,
+        "missing": max(0, count - len(actual_slice)),
+        "extra": 0,
+        "start_cursor": cursor,
+        "end_cursor": new_cursor,
+        "line_start_cursor": cursor,
+        "line_end_cursor": new_cursor,
+        "events": events,
+        "extra_actual": [],
+        "boundary_reason": "forced_sequence_exact",
+        "candidate_score": 100.0 if len(actual_slice) == count else None,
+        "candidate_matched_ratio": (len(actual_slice) / max(1, count)),
+        "candidate_collapsed": False,
+        "candidate_duration": (
+            max(0.0, float(actual_slice[-1].get("end", 0.0)) - float(actual_slice[0].get("start", 0.0)))
+            if actual_slice else 0.0
+        ),
+        "candidate_first_actual": cursor if actual_slice else None,
+        "candidate_last_actual": new_cursor - 1 if actual_slice else None,
+    }
+    return out, new_cursor, report
+
+
 def match_lyrics_line_words(
     expected_line_words: List[str],
     words: List[Dict[str, Any]],
@@ -1862,12 +2693,22 @@ def build_line_aware_verses_from_json_words(
     config = config or {}
 
     ignored_meta_words: List[Dict[str, Any]] = []
+    ignored_nonlexical_words: List[Dict[str, Any]] = []
     clean_words: List[Dict[str, Any]] = []
     for w in words:
-        if is_alignment_meta_token(str(w.get("text", ""))):
+        text = str(w.get("text", ""))
+        if is_alignment_meta_token(text):
             ignored_meta_words.append(w)
-        else:
-            clean_words.append(w)
+            continue
+        # Keep the cursor/materialization token space identical to the
+        # normalized stream used to decide whether forced_sequence_exact is
+        # safe.  stable-ts may emit standalone punctuation (notably an em
+        # dash) as a timed word; norm_word() intentionally removes such
+        # tokens, so leaving them in clean_words shifts every later cursor.
+        if not norm_word(text):
+            ignored_nonlexical_words.append(w)
+            continue
+        clean_words.append(w)
 
     if not lyrics_verses:
         ly = {
@@ -1884,6 +2725,7 @@ def build_line_aware_verses_from_json_words(
         "alignment_words_total": len(words),
         "alignment_words_clean": len(clean_words),
         "ignored_meta_words": ignored_meta_words,
+        "ignored_nonlexical_words": ignored_nonlexical_words,
         "ranges": [],
         "trailing_extra_actual": [],
     }
@@ -1912,6 +2754,21 @@ def build_line_aware_verses_from_json_words(
         for ly in lyrics_verses
     ]
 
+    expected_stream = normalized_expected_lyric_stream(lyrics_verses)
+    actual_stream = normalized_alignment_stream(clean_words)
+    exact_forced_sequence = (
+        bool(expected_stream)
+        and len(expected_stream) == len(actual_stream)
+        and expected_stream == actual_stream
+    )
+    report["forced_sequence_exact"] = exact_forced_sequence
+    report["expected_words_normalized"] = len(expected_stream)
+    report["alignment_words_normalized"] = len(actual_stream)
+    report["mapping_strategy"] = (
+        "forced_sequence_exact" if exact_forced_sequence else "local_monotonic_fallback"
+    )
+    diagnostics["mapping_strategy"] = report["mapping_strategy"]
+
     for vi, ly in enumerate(lyrics_verses):
         out_lines: List[Dict[str, Any]] = []
         range_events: List[Dict[str, Any]] = []
@@ -1927,7 +2784,9 @@ def build_line_aware_verses_from_json_words(
             "end_cursor": cursor,
             "events": range_events,
             "extra_actual": range_extra,
-            "boundary_reason": "line_aware_expected_exhausted",
+            "boundary_reason": (
+                "forced_sequence_exact" if exact_forced_sequence else "line_aware_expected_exhausted"
+            ),
             "line_statuses": [],
         }
 
@@ -1975,26 +2834,55 @@ def build_line_aware_verses_from_json_words(
             expected_line_words = verse_line_words[vi][li - 1]
             next_expected = next_lyric_line_words(verse_line_words, vi, li - 1)
 
-            matched_words, cursor, line_report = match_lyrics_line_words(
-                expected_line_words,
-                clean_words,
-                cursor,
-                next_expected,
-                config,
-                allow_long_start_gap=(li == 1),
-            )
+            if exact_forced_sequence:
+                matched_words, cursor, line_report = materialize_exact_forced_line(
+                    expected_line_words,
+                    clean_words,
+                    cursor,
+                )
+            else:
+                matched_words, cursor, line_report = match_lyrics_line_words(
+                    expected_line_words,
+                    clean_words,
+                    cursor,
+                    next_expected,
+                    config,
+                    allow_long_start_gap=(li == 1),
+                )
 
-            sanitizer_report = sanitize_matched_line_word_timings(line_text, matched_words)
             if out_lines:
                 default_line_start = float(out_lines[-1]["end"])
             else:
                 default_line_start = 0.0
-            line_start, line_end = line_timing_bounds_from_words(matched_words, default_line_start)
 
+            raw_line_start, raw_line_end = line_timing_bounds_from_words(matched_words, default_line_start)
+            raw_diag = analyze_matched_line_timing(line_text, matched_words, config)
+
+            # Preserve whole-line evidence for sparse/collapsed/low-support lines.
+            # Sanitizing an isolated word is useful for cases like a single
+            # low-confidence "fight" jumping several seconds forward, but doing
+            # that to an already-unreliable line destroys the evidence needed to
+            # place the whole phrase near the correct neighboring anchor.
+            sanitizer_report = {"line_text": line_text, "repaired_words": [], "checked_words": len(matched_words)}
+            if bool(raw_diag.get("timing_reliable", False)):
+                sanitizer_report = sanitize_matched_line_word_timings(line_text, matched_words)
+
+            line_start, line_end = line_timing_bounds_from_words(matched_words, raw_line_start)
             diag = analyze_matched_line_timing(line_text, matched_words, config)
+            if not bool(raw_diag.get("timing_reliable", False)):
+                # Do not let a later post-sanitizer analysis accidentally promote
+                # a line whose raw forced timing was structurally untrustworthy.
+                diag["timing_reliable"] = False
+                raw_status = str(raw_diag.get("status", "UNRELIABLE"))
+                if str(diag.get("status", "GOOD")) == "GOOD":
+                    diag["status"] = raw_status
+                for issue in raw_diag.get("issues", []):
+                    if issue not in diag.setdefault("issues", []):
+                        diag["issues"].append(issue)
+                diag["raw_diagnostics"] = raw_diag
             if sanitizer_report.get("repaired_words"):
                 diag.setdefault("issues", []).append(
-                    f"sanitized word timings: {len(sanitizer_report.get('repaired_words', []))}"
+                    f"sanitized isolated word timings: {len(sanitizer_report.get('repaired_words', []))}"
                 )
                 diag["timing_sanitizer"] = sanitizer_report
             line = {
@@ -2002,6 +2890,8 @@ def build_line_aware_verses_from_json_words(
                 "text": line_text,
                 "start": line_start,
                 "end": max(line_start + 0.01, line_end),
+                "raw_start": raw_line_start,
+                "raw_end": raw_line_end,
                 "words": matched_words,
                 "timing_reliable": bool(diag.get("timing_reliable", False)),
                 "timing_estimated": False,
@@ -2022,6 +2912,8 @@ def build_line_aware_verses_from_json_words(
             range_extra.extend(line_report.get("extra_actual", []))
 
         estimate_unreliable_line_timings(out_lines, config)
+        repair_repeated_single_word_lines(out_lines, config)
+        repair_adjacent_line_boundary_holds(out_lines, config)
 
         # Recompute diagnostics after estimating timings so reports reflect the
         # final timing used by subtitles/ranges while preserving original issues.
@@ -2099,15 +2991,40 @@ def build_line_aware_verses_from_json_words(
             "alignment_match": verse_report,
         })
 
-    # Final global timing estimation across range boundaries. A whole range can
-    # be missing/collapsed while the next range has a reliable anchor; estimating
-    # only inside each range would leave such ranges near-zero. This pass keeps
-    # the full song timeline monotonic and distributes unreliable lyric lines
-    # between neighboring reliable anchors.
-    all_lines: List[Dict[str, Any]] = []
+    # Reconcile starts that could not be repaired inside an isolated lyric block.
+    # This may cross a plain *** lyric-to-lyric boundary, but never an explicit
+    # metadata-only/empty musical block.
+    repair_leading_unreliable_lines_across_lyric_blocks(verses, config)
+    for _verse in verses:
+        if block_has_lyric_text(_verse):
+            _lines = _verse.get("lines", []) or []
+            repair_repeated_single_word_lines(_lines, config)
+            repair_adjacent_line_boundary_holds(_lines, config)
+    refresh_line_and_verse_bounds(verses)
+
+    # Final timing estimation across contiguous lyrical range boundaries.
+    # Adjacent vocal sections may share anchors, but an empty/metadata-only block
+    # is an explicit musical-gap barrier and must stop interpolation.
+    contiguous_lines: List[Dict[str, Any]] = []
     for verse in verses:
-        all_lines.extend(verse.get("lines", []) or [])
-    estimate_unreliable_line_timings(all_lines, config)
+        if block_has_lyric_text(verse):
+            contiguous_lines.extend(verse.get("lines", []) or [])
+            continue
+        if contiguous_lines:
+            estimate_unreliable_line_timings(contiguous_lines, config)
+            contiguous_lines = []
+    if contiguous_lines:
+        estimate_unreliable_line_timings(contiguous_lines, config)
+
+    # A terminal lyric immediately before a non-lyrical block has no trustworthy
+    # right lyric anchor.  Apply a small confidence-gated release tail before
+    # final verse/timeline bounds are calculated.
+    repair_uncertain_terminal_lines_before_nonlyrical_blocks(verses, config)
+    # The very last sung word has no following lexical anchor even when its
+    # confidence is high. Give it a small release hold before a terminal
+    # metadata/non-lyrical tail so karaoke does not disappear on the release.
+    repair_final_song_word_release_before_terminal_nonlyrical_tail(verses)
+    refresh_line_and_verse_bounds(verses)
 
     diagnostics["summary"] = {
         "ranges": len(lyrics_verses),
@@ -2175,7 +3092,6 @@ def build_line_aware_verses_from_json_words(
                 })
             range_diag["status"] = "WARN" if range_has_warning else "OK"
             range_diag["lines"] = diagnostic_lines
-
     while cursor < len(clean_words):
         w = clean_words[cursor]
         report["trailing_extra_actual"].append({
@@ -2186,41 +3102,6 @@ def build_line_aware_verses_from_json_words(
         cursor += 1
 
     return verses, report, diagnostics
-
-
-def split_matched_words_into_lines(
-    ly: Dict[str, Any],
-    matched_words: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    # Kept for compatibility with non-JSON fallback helpers. JSON alignment now
-    # uses build_line_aware_verses_from_json_words().
-    cursor = 0
-    out_lines: List[Dict[str, Any]] = []
-
-    for li, line_text in enumerate(ly["lines_text"], 1):
-        expected_line_words = lyric_words(line_text)
-        count = len(expected_line_words)
-        line_words = matched_words[cursor:cursor + count]
-        cursor += count
-
-        if line_words:
-            start = float(line_words[0]["start"])
-            end = float(line_words[-1]["end"])
-        elif out_lines:
-            start = float(out_lines[-1]["end"])
-            end = start + 0.25
-        else:
-            start = end = 0.0
-
-        out_lines.append({
-            "index": li,
-            "text": line_text,
-            "start": start,
-            "end": max(start + 0.01, end),
-            "words": line_words,
-        })
-
-    return out_lines
 
 
 def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
@@ -2353,6 +3234,8 @@ def parse_lyrics_txt(text: str) -> List[Dict[str, Any]]:
 
     *** separates semantic ranges. [metadata] lines are range directives.
     --- marks a preferred subrange divider inside the current semantic range.
+    Timed separators support @ for an exact boundary, # / #< for snapping to
+    the previous lyric boundary, and #> for snapping to the next lyric boundary.
     Dividers are stored as positions after lyric lines and never become lyric
     text, alignment input, subtitles, or prompt text.
     """
@@ -2414,7 +3297,7 @@ def parse_lyrics_txt(text: str) -> List[Dict[str, Any]]:
             if stripped.startswith("***") or stripped.startswith("---"):
                 raise RuntimeError(
                     f"Invalid lyrics separator syntax: {stripped!r}. Expected ***/--- optionally followed by "
-                    "@/# MM:SS.mmm."
+                    "@, #, #<, or #> plus MM:SS.mmm."
                 )
             if is_bracket_directive_line(stripped):
                 directive = strip_bracket_directive(stripped)
@@ -2423,55 +3306,16 @@ def parse_lyrics_txt(text: str) -> List[Dict[str, Any]]:
                 continue
             lyric_lines.append(stripped)
     finish_block()
+
+    # Preserve terminal metadata-only blocks such as [End].  The timeline
+    # builder gives them the real audio tail after the last sung lyric.  If the
+    # tail is shorter than min_workflow_seconds, the generic non-lyrical block
+    # coalescer folds it into the previous visual range safely.
+
+    for i, block in enumerate(blocks):
+        block["index"] = i + 1
+        block["block_index"] = i
     return blocks
-
-
-
-
-def wrap_flat_text(text: str, max_chars: int = 42) -> List[str]:
-    """Wrap flattened lyrics into readable subtitle/prompt lines."""
-    words = text.strip().split()
-    lines: List[str] = []
-    cur: List[str] = []
-
-    for w in words:
-        candidate = (" ".join(cur + [w])).strip()
-        if cur and len(candidate) > max_chars:
-            lines.append(" ".join(cur))
-            cur = [w]
-        else:
-            cur.append(w)
-
-        if cur and re.search(r"[.!?;:]$|[.!?;:]\"$", w) and len(" ".join(cur)) >= max_chars * 0.55:
-            lines.append(" ".join(cur))
-            cur = []
-
-    if cur:
-        lines.append(" ".join(cur))
-
-    return lines or [text.strip()]
-
-
-def parse_alignment_top_text_as_lyrics(data: Any) -> List[Dict[str, Any]]:
-    """Fallback when alignment.json has top-level flattened text with *** separators."""
-    text = str(data.get("text", "")).strip() if isinstance(data, dict) else ""
-    if not text or "***" not in text:
-        return []
-
-    verses: List[Dict[str, Any]] = []
-    for raw in text.split("***"):
-        raw = raw.strip()
-        if not raw:
-            continue
-        lines = wrap_flat_text(raw)
-        verses.append({
-            "index": len(verses) + 1,
-            "text": "\n".join(lines),
-            "lines_text": lines,
-            "subrange_divider_after_lines": [],
-        })
-
-    return verses
 
 
 def lrc_time_to_seconds(ts: str) -> float:
@@ -2512,48 +3356,6 @@ def parse_lrc(path: Path) -> List[Dict[str, Any]]:
     return lines
 
 
-def build_verses_from_lrc(lrc_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    verses: List[Dict[str, Any]] = []
-    cur: List[Dict[str, Any]] = []
-
-    def flush(end_override: Optional[float] = None) -> None:
-        nonlocal cur
-        if not cur:
-            return
-        idx = len(verses) + 1
-        start = cur[0]["start"]
-        end = end_override if end_override is not None else cur[-1]["end"]
-        lines = []
-        for j, l in enumerate(cur, 1):
-            lines.append({
-                "index": j,
-                "text": l["text"],
-                "start": l["start"],
-                "end": min(l.get("end", end), end),
-                "words": [],
-            })
-        verses.append({
-            "index": idx,
-            "start": start,
-            "end": end,
-            "duration": max(0.01, end - start),
-            "text": "\n".join(x["text"] for x in cur),
-            "lines": lines,
-            "alignment_mode": "line_lrc",
-            "bracket_directives": [],
-            "subrange_divider_after_lines": [],
-        })
-        cur = []
-
-    for line in lrc_lines:
-        if line["text"].strip() == "***":
-            flush(end_override=line["start"])
-        else:
-            cur.append(line)
-    flush()
-    return verses
-
-
 def extract_json_words(data: Any) -> List[Dict[str, Any]]:
     words: List[Dict[str, Any]] = []
     for seg in data.get("segments", []):
@@ -2574,186 +3376,6 @@ def extract_json_words(data: Any) -> List[Dict[str, Any]]:
             })
     words.sort(key=lambda x: (x["start"], x["end"]))
     return words
-
-
-def build_verses_from_json_words(
-    words: List[Dict[str, Any]],
-    lyrics_verses: List[Dict[str, Any]],
-    config: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Match clean lyrics.txt ranges against a sequential alignment word stream.
-
-    lyrics.txt is the source of semantic ranges. alignment.json is only timing
-    evidence. This function does not require *** in alignment.json.
-    """
-    config = config or {}
-
-    ignored_meta_words: List[Dict[str, Any]] = []
-    clean_words: List[Dict[str, Any]] = []
-    for w in words:
-        if is_alignment_meta_token(str(w.get("text", ""))):
-            ignored_meta_words.append(w)
-        else:
-            clean_words.append(w)
-
-    report: Dict[str, Any] = {
-        "mode": "lyrics_driven_fuzzy_sequential",
-        "alignment_words_total": len(words),
-        "alignment_words_clean": len(clean_words),
-        "ignored_meta_words": ignored_meta_words,
-        "ranges": [],
-        "trailing_extra_actual": [],
-    }
-
-    if not lyrics_verses:
-        # Fallback when lyrics.txt is absent: treat the whole alignment as one range.
-        ly = {
-            "index": 1,
-            "text": " ".join(w["text"] for w in clean_words),
-            "lines_text": [" ".join(w["text"] for w in clean_words)],
-            "bracket_directives": [],
-            "subrange_divider_after_lines": [],
-        }
-        lyrics_verses = [ly]
-
-    all_expected = expected_words_for_lyrics_verses(lyrics_verses)
-    cursor = 0
-    verses: List[Dict[str, Any]] = []
-
-    for i, ly in enumerate(lyrics_verses):
-        expected_words = all_expected[i]
-        next_expected = all_expected[i + 1] if i + 1 < len(all_expected) else []
-        matched_words, cursor, range_report = match_expected_range_words(
-            expected_words,
-            clean_words,
-            cursor,
-            next_expected,
-            config,
-        )
-
-        out_lines = split_matched_words_into_lines(ly, matched_words)
-
-        starts = [float(w["start"]) for w in matched_words if w.get("start") is not None]
-        ends = [float(w["end"]) for w in matched_words if w.get("end") is not None]
-        if starts and ends:
-            start = min(starts)
-            end = max(ends)
-        elif out_lines:
-            start = float(out_lines[0]["start"])
-            end = float(out_lines[-1]["end"])
-        else:
-            start = end = 0.0
-
-        verse_report = {
-            "range_index": i + 1,
-            "lyric_index": ly.get("index", i + 1),
-            "text_preview": str(ly.get("text", "")).splitlines()[0] if str(ly.get("text", "")).splitlines() else "",
-            **range_report,
-            "start": start,
-            "end": end,
-            "duration": max(0.01, end - start),
-        }
-        report["ranges"].append(verse_report)
-
-        verses.append({
-            "index": i + 1,
-            "start": start,
-            "end": end,
-            "duration": max(0.01, end - start),
-            "text": ly["text"],
-            "lines": out_lines,
-            "alignment_mode": "word_json",
-            "bracket_directives": list(ly.get("bracket_directives", [])),
-            "subrange_divider_after_lines": list(ly.get("subrange_divider_after_lines", [])),
-            "timed_subrange_boundaries": list(ly.get("timed_subrange_boundaries", [])),
-            "semantic_boundary_before": ly.get("semantic_boundary_before"),
-            "alignment_match": verse_report,
-        })
-
-    # Any remaining actual words are extra. They are not used in subtitles.
-    # Final global timing estimation across range boundaries. A whole range can
-    # be missing/collapsed while the next range has a reliable anchor; estimating
-    # only inside each range would leave such ranges near-zero. This pass keeps
-    # the full song timeline monotonic and distributes unreliable lyric lines
-    # between neighboring reliable anchors.
-    all_lines: List[Dict[str, Any]] = []
-    for verse in verses:
-        all_lines.extend(verse.get("lines", []) or [])
-    estimate_unreliable_line_timings(all_lines, config)
-
-    diagnostics["summary"] = {
-        "ranges": len(lyrics_verses),
-        "lines": 0,
-        "good_lines": 0,
-        "warning_lines": 0,
-        "estimated_lines": 0,
-        "collapsed_lines": 0,
-        "missing_lines": 0,
-        "partial_lines": 0,
-    }
-
-    for vi, verse in enumerate(verses):
-        out_lines = verse.get("lines", []) or []
-        starts = [float(line["start"]) for line in out_lines]
-        ends = [float(line["end"]) for line in out_lines]
-        start = min(starts) if starts else 0.0
-        end = max(ends) if ends else start + 0.01
-        verse["start"] = start
-        verse["end"] = end
-        verse["duration"] = max(0.01, end - start)
-        if vi < len(report.get("ranges", [])):
-            report["ranges"][vi]["start"] = start
-            report["ranges"][vi]["end"] = end
-            report["ranges"][vi]["duration"] = max(0.01, end - start)
-        if vi < len(diagnostics.get("ranges", [])):
-            range_diag = diagnostics["ranges"][vi]
-            range_diag["start"] = start
-            range_diag["end"] = end
-            range_diag["duration"] = max(0.01, end - start)
-            diagnostic_lines: List[Dict[str, Any]] = []
-            range_has_warning = False
-            for line in out_lines:
-                diag = dict(line.get("diagnostics", {}))
-                diag["final_start"] = float(line.get("start", 0.0))
-                diag["final_end"] = float(line.get("end", 0.0))
-                diag["final_duration"] = max(0.0, diag["final_end"] - diag["final_start"])
-                diag["timing_estimated"] = bool(line.get("timing_estimated", False))
-                line["diagnostics"] = diag
-
-                diagnostics["summary"]["lines"] += 1
-                status = str(diag.get("status", ""))
-                if status == "GOOD":
-                    diagnostics["summary"]["good_lines"] += 1
-                else:
-                    diagnostics["summary"]["warning_lines"] += 1
-                    range_has_warning = True
-                if line.get("timing_estimated"):
-                    diagnostics["summary"]["estimated_lines"] += 1
-                if "COLLAPSED" in status:
-                    diagnostics["summary"]["collapsed_lines"] += 1
-                if status == "MISSING":
-                    diagnostics["summary"]["missing_lines"] += 1
-                if status.startswith("PARTIAL"):
-                    diagnostics["summary"]["partial_lines"] += 1
-
-                diagnostic_lines.append({
-                    "line_index": line.get("index"),
-                    "text": line.get("text"),
-                    **diag,
-                })
-            range_diag["status"] = "WARN" if range_has_warning else "OK"
-            range_diag["lines"] = diagnostic_lines
-
-    while cursor < len(clean_words):
-        w = clean_words[cursor]
-        report["trailing_extra_actual"].append({
-            "actual": w.get("text"),
-            "start": w.get("start"),
-            "end": w.get("end"),
-        })
-        cursor += 1
-
-    return verses, report
 
 
 
@@ -2992,10 +3614,12 @@ def parse_alignment(
     debug_dir: Path,
     config: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], str]:
-    # Matched lyrics/timeline input is a lazy artifact. If it exists, trust it
-    # until --refresh-alignment invalidates the alignment directory. This keeps
-    # normal rework/rebuild runs from rematching lyrics when neither the raw
-    # alignment nor lyrics were intentionally refreshed.
+    """Parse raw alignment, reusing matched_verses.json when present.
+
+    Cache lifetime is explicit: changing lyrics.txt does not automatically
+    invalidate alignment artifacts. Remove the cache/work directory or use
+    --refresh-alignment when lyrics or alignment inputs change.
+    """
     matched_cache_path = alignment_dir / "matched_verses.json"
     lyrics_text = read_text(input_dir / "lyrics.txt", required=False)
     lyrics_verses = parse_lyrics_txt(lyrics_text) if lyrics_text else []
@@ -3008,6 +3632,7 @@ def parse_alignment(
         else:
             verses = cached
             mode = "cached"
+
         cache_ok = (
             isinstance(verses, list)
             and bool(verses)
@@ -3018,7 +3643,10 @@ def parse_alignment(
             ensure_line_level_lrc_from_matched_verses(verses, alignment_dir)
             log(f"[stage] use cached matched alignment: {matched_cache_path}")
             return verses, mode
-        log(f"[stage] ignore stale matched alignment cache: {matched_cache_path}")
+
+        # Structural corruption/incompatibility is still detected; normal lyric
+        # edits are intentionally not fingerprinted here.
+        log(f"[stage] ignore invalid matched alignment cache: {matched_cache_path}")
 
     json_path = alignment_dir / "alignment.json"
     lrc_path = alignment_dir / "alignment.lrc"
@@ -3038,7 +3666,7 @@ def parse_alignment(
         write_json(debug_dir / "alignment_ignored_meta_words.json", match_report.get("ignored_meta_words", []))
         write_alignment_diagnostics_report(diagnostics, debug_dir / "alignment_diagnostics.txt")
         write_json(matched_cache_path, {"alignment_mode": "json", "verses": verses})
-        ensure_line_level_lrc_from_matched_verses(verses, alignment_dir)
+        write_line_level_lrc_from_matched_verses(verses, alignment_dir / "alignment.lrc")
         return verses, "json"
 
     if lrc_path.exists():
@@ -3052,15 +3680,12 @@ def parse_alignment(
         write_json(debug_dir / "lrc_match_report.json", lrc_report)
         write_lrc_match_report(lrc_report, debug_dir / "lrc_match_report.txt")
         write_json(matched_cache_path, {"alignment_mode": "lrc", "verses": verses})
-        ensure_line_level_lrc_from_matched_verses(verses, alignment_dir)
         return verses, "lrc"
 
     raise FileNotFoundError(
         f"No generated alignment found. Expected {alignment_dir / 'alignment.json'} "
         f"or {alignment_dir / 'alignment.lrc'}. Run a normal fresh generation first."
     )
-
-
 
 def resolve_command(candidates: List[Path], fallback: str) -> str:
     for candidate in candidates:
@@ -3069,33 +3694,6 @@ def resolve_command(candidates: List[Path], fallback: str) -> str:
 
     found = shutil.which(fallback)
     return found or fallback
-
-
-def resolve_stable_ts_command(script_dir: Path) -> str:
-    parent = script_dir.parent
-    candidates = [
-        parent / "stable-ts" / ".venv" / "Scripts" / "stable-ts.exe",
-        parent / "stable-ts" / ".venv" / "bin" / "stable-ts",
-    ]
-    return resolve_command(candidates, "stable-ts")
-
-
-def resolve_ffmpeg_command(script_dir: Path) -> str:
-    parent = script_dir.parent
-    candidates = [
-        parent / "ffmpeg" / "bin" / "ffmpeg.exe",
-        parent / "ffmpeg" / "bin" / "ffmpeg",
-    ]
-    return resolve_command(candidates, "ffmpeg")
-
-
-def resolve_ffprobe_command(script_dir: Path) -> str:
-    parent = script_dir.parent
-    candidates = [
-        parent / "ffmpeg" / "bin" / "ffprobe.exe",
-        parent / "ffmpeg" / "bin" / "ffprobe",
-    ]
-    return resolve_command(candidates, "ffprobe")
 
 
 
@@ -3138,36 +3736,6 @@ def resolve_ffprobe_command(script_dir: Path) -> str:
     return resolve_command(candidates, "ffprobe")
 
 
-
-
-
-def find_first_existing(input_dir: Path, stem: str, extensions: Tuple[str, ...] = (".mp3", ".wav", ".m4a", ".flac")) -> Optional[Path]:
-    for ext in extensions:
-        p = input_dir / f"{stem}{ext}"
-        if p.exists():
-            return p
-    return None
-
-
-def detect_alignment_source(input_dir: Path) -> Tuple[str, Optional[Path], Optional[Path]]:
-    vocals = find_first_existing(input_dir, "vocals")
-    if vocals:
-        return "vocals", vocals, None
-
-    lrc = input_dir / "lyrics.lrc"
-    if lrc.exists():
-        return "lrc", lrc, None
-
-    legacy_lrc = input_dir / "alignment.lrc"
-    if legacy_lrc.exists():
-        return "lrc", legacy_lrc, None
-
-    raise FileNotFoundError(
-        "No alignment source found. Use input/vocals.* for stable-ts word alignment, "
-        "or input/lyrics.lrc for line-level timing when only full audio is available."
-    )
-
-
 def find_first_existing(input_dir: Path, stem: str, extensions: Tuple[str, ...] = (".mp3", ".wav", ".m4a", ".flac")) -> Optional[Path]:
     for ext in extensions:
         p = input_dir / f"{stem}{ext}"
@@ -3207,51 +3775,6 @@ def detect_audio(input_dir: Path) -> Tuple[str, Path, Optional[Path]]:
         return "stems", vocals, instrumental
 
     raise FileNotFoundError("No final audio found. Use input/audio.* or input/vocals.* + input/instrumental.*")
-
-
-def prepare_audio(
-    mode: str,
-    a: Path,
-    b: Optional[Path],
-    out_dir: Path,
-    ffmpeg: str,
-    selected_start: float,
-    selected_end: float,
-) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    full_mix = out_dir / "full_mix.wav"
-
-    if mode == "stems":
-        assert b is not None
-        vocals_wav = out_dir / "vocals_48k.wav"
-        inst_wav = out_dir / "instrumental_48k.wav"
-        run_cmd([ffmpeg, "-y", "-i", str(a), "-ar", "48000", "-ac", "2", str(vocals_wav)])
-        run_cmd([ffmpeg, "-y", "-i", str(b), "-ar", "48000", "-ac", "2", str(inst_wav)])
-        # Keep stems 1:1. If Suno stems are already normalized, this is usually OK.
-        run_cmd([
-            ffmpeg, "-y",
-            "-i", str(inst_wav),
-            "-i", str(vocals_wav),
-            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,alimiter=limit=0.97",
-            "-ar", "48000",
-            "-ac", "2",
-            str(full_mix),
-        ])
-    else:
-        run_cmd([ffmpeg, "-y", "-i", str(a), "-ar", "48000", "-ac", "2", str(full_mix)])
-
-    cut = out_dir / "full_mix_cut.wav"
-    duration = max(0.01, selected_end - selected_start)
-    run_cmd([
-        ffmpeg, "-y",
-        "-ss", f"{selected_start:.3f}",
-        "-i", str(full_mix),
-        "-t", f"{duration:.3f}",
-        "-ar", "48000",
-        "-ac", "2",
-        str(cut),
-    ])
-    return cut
 
 
 def ass_timestamp(sec: float) -> str:
@@ -3379,13 +3902,6 @@ def build_word_karaoke_line(
 
     line_duration = max(min_unit, float(line["end"]) - float(line["start"]))
     return build_char_karaoke_text(str(line["text"]), line_duration, min_unit)
-
-
-
-
-def build_plain_subtitle_text(text: str) -> str:
-    """Build normal visible subtitle text without karaoke timing tags."""
-    return ass_escape(text).replace("\n", r"\N")
 
 
 
@@ -3596,6 +4112,14 @@ def build_ass_subtitles(
     config = config or {}
     subtitle_preroll = max(0.0, float(config.get("subtitle_line_preroll_seconds", 0.0)))
     min_unit = max(0.01, float(config.get("min_karaoke_unit_seconds", 0.01)))
+    # Adjacent identical lyric lines are distinct sung repetitions, but ASS has no
+    # visual discontinuity when one event ends at exactly the same instant the
+    # next event with the same text starts.  To a viewer this can look like one
+    # long karaoke event whose progress simply continues. Insert a tiny
+    # rendering-only reset gap between such events. The gap is a code constant,
+    # not a config.json parameter; it does not alter alignment, semantic ranges,
+    # or word ownership.
+    repeat_reset_seconds = KARAOKE_REPEAT_RESET_SECONDS
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -3620,6 +4144,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     events: List[str] = []
     timing_report: List[Dict[str, Any]] = []
     previous_event_end = 0.0
+    previous_line_key = ""
 
     for verse in verses:
         verse_index = int(verse.get("index", 0))
@@ -3644,6 +4169,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 previous_event_end,
                 karaoke_start - subtitle_preroll,
             )
+
+            line_key = " ".join(norm_word(w) for w in lyric_words(str(line.get("text", ""))) if norm_word(w))
+            repeat_reset_applied = 0.0
+            if repeat_reset_seconds > 0.0 and line_key and line_key == previous_line_key:
+                # Only add a reset where the two identical events would otherwise
+                # visually touch.  Never consume the whole next event: preserve at
+                # least 0.12 s of render time for extremely short lines.
+                natural_gap = max(0.0, karaoke_start - previous_event_end)
+                if natural_gap < repeat_reset_seconds:
+                    available = max(0.0, raw_line_end - display_start - 0.12)
+                    extra_gap = min(max(0.0, repeat_reset_seconds - natural_gap), available)
+                    if extra_gap > 1e-6:
+                        display_start += extra_gap
+                        repeat_reset_applied = extra_gap
+
             end = max(display_start + 0.1, raw_line_end)
 
             if mode == "word" and line.get("words"):
@@ -3663,10 +4203,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "karaoke_start": karaoke_start,
                 "line_end": end,
                 "subtitle_leadin": max(0.0, karaoke_start - display_start),
+                "repeat_reset_applied_seconds": repeat_reset_applied,
                 "block_visual_preroll": float(block.get("visual_preroll", 0.0)),
                 "text": str(line.get("text", "")),
             })
             previous_event_end = end
+            previous_line_key = line_key
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
@@ -3675,6 +4217,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         write_json(timing_report_path, {
             "subtitle_line_preroll_seconds": subtitle_preroll,
             "min_karaoke_unit_seconds": min_unit,
+            "karaoke_repeat_reset_constant_seconds": repeat_reset_seconds,
             "events": timing_report,
         })
 
@@ -3846,9 +4389,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             add_text(5, t, nt, time_x, y_range - 4, f"{format_progress_time(elapsed)} / {format_progress_time(duration)}")
             t = nt
 
-        for sub in subranges:
-            sub_i = int(sub["sub_index"])
-            sub_count = int(sub["sub_count"])
+        sub_count = len(subranges)
+        for sub_i, sub in enumerate(subranges):
             ss = max(start, float(sub["start"]))
             se = min(end, max(ss + 0.1, float(sub["end"])))
             sd = max(0.1, se - ss)
@@ -4006,37 +4548,38 @@ def render_subtitle_preview(
     ])
 
 
+def apply_llm_workflow_config(
+    template: Dict[str, Any],
+    llm_max_ctx: int,
+    llm_max_length: int,
+) -> Dict[str, Any]:
+    """Apply config limits to the llama-cpp-vlm planner workflow.
 
-def approx_token_count_for_log(text: str) -> int:
-    # Rough tokenizer-independent estimate for context diagnostics only.
-    return max(1, int(len(text) / 4)) if text else 0
-
-
-def apply_llm_workflow_config(template: Dict[str, Any], llm_max_ctx: int, llm_max_length: int) -> Dict[str, Any]:
-    """Apply LLM runtime settings from config to the ComfyUI LLM workflow template.
-
-    The project uses data/config.json (or input/config.json override) as the
-    source of truth. The workflow file can keep default values, but the runner
-    patches every node that exposes max_ctx and/or max_length inputs before any
-    LLM call. max_ctx controls context window; max_length controls generated
-    response length.
+    data/config.json (or input/config.json override) remains the source of truth.
+    llm_max_ctx maps to the model loader's n_ctx, while llm_max_length maps to
+    the parameter node's max_tokens. Sampling settings remain in the workflow.
     """
     wf = json.loads(json.dumps(template))
     patched_ctx_nodes: List[str] = []
     patched_length_nodes: List[str] = []
+
     for node_id, node in wf.items():
         inputs = node.get("inputs") if isinstance(node, dict) else None
-        if isinstance(inputs, dict):
-            if "max_ctx" in inputs:
-                inputs["max_ctx"] = int(llm_max_ctx)
-                patched_ctx_nodes.append(str(node_id))
-            if "max_length" in inputs:
-                inputs["max_length"] = int(llm_max_length)
-                patched_length_nodes.append(str(node_id))
+        if not isinstance(inputs, dict):
+            continue
+
+        if "n_ctx" in inputs:
+            inputs["n_ctx"] = int(llm_max_ctx)
+            patched_ctx_nodes.append(str(node_id))
+
+        if "max_tokens" in inputs:
+            inputs["max_tokens"] = int(llm_max_length)
+            patched_length_nodes.append(str(node_id))
+
     if not patched_ctx_nodes:
-        raise RuntimeError("LLM workflow config error: no workflow node exposes a max_ctx input")
+        raise RuntimeError("LLM workflow config error: no workflow node exposes n_ctx")
     if not patched_length_nodes:
-        raise RuntimeError("LLM workflow config error: no workflow node exposes a max_length input")
+        raise RuntimeError("LLM workflow config error: no workflow node exposes max_tokens")
     return wf
 
 
@@ -4131,7 +4674,7 @@ def patch_planner_workflow(
 ) -> Dict[str, Any]:
     wf = json.loads(json.dumps(template))
     if "2" not in wf or "3" not in wf:
-        raise RuntimeError("Planner workflow must contain nodes 2=LLM_local and 3=PathSaveStringFile")
+        raise RuntimeError("Planner workflow must contain nodes 2=LLM planner and 3=PathSaveStringFile")
 
     user_prompt, template_name = build_planner_user_prompt(
         rules=rules,
@@ -4147,13 +4690,9 @@ def patch_planner_workflow(
     if request_path is not None:
         save_prompt_debug(request_path, user_prompt)
 
-    wf["2"]["inputs"]["system_prompt"] = rules["block_planner_system.txt"]
-    wf["2"]["inputs"]["user_prompt"] = user_prompt
-    wf["2"]["inputs"]["historical_record"] = ""
-    wf["2"]["inputs"]["conversation_rounds"] = 1
-    wf["2"]["inputs"]["is_memory"] = "disable"
-    wf["2"]["inputs"]["is_locked"] = "disable"
-    wf["2"]["inputs"]["main_brain"] = "enable"
+    planner_inputs = wf["2"].get("inputs", {})
+    planner_inputs["system_prompt"] = rules["block_planner_system.txt"]
+    planner_inputs["custom_prompt"] = user_prompt
     wf["3"]["inputs"]["path"] = str(plan_path)
     return wf
 
@@ -4255,18 +4794,14 @@ def patch_song_context_workflow(
 ) -> Dict[str, Any]:
     wf = json.loads(json.dumps(template))
     if "2" not in wf or "3" not in wf:
-        raise RuntimeError("Planner workflow must contain nodes 2=LLM_local and 3=PathSaveStringFile")
+        raise RuntimeError("Planner workflow must contain nodes 2=LLM planner and 3=PathSaveStringFile")
 
     prompt = build_song_context_prompt(rules, video_style, verses)
     save_prompt_debug(request_path, prompt)
 
-    wf["2"]["inputs"]["system_prompt"] = rules["song_context_system.txt"]
-    wf["2"]["inputs"]["user_prompt"] = prompt
-    wf["2"]["inputs"]["historical_record"] = ""
-    wf["2"]["inputs"]["conversation_rounds"] = 1
-    wf["2"]["inputs"]["is_memory"] = "disable"
-    wf["2"]["inputs"]["is_locked"] = "disable"
-    wf["2"]["inputs"]["main_brain"] = "enable"
+    planner_inputs = wf["2"].get("inputs", {})
+    planner_inputs["system_prompt"] = rules["song_context_system.txt"]
+    planner_inputs["custom_prompt"] = prompt
     wf["3"]["inputs"]["path"] = str(raw_path)
     return wf
 
@@ -4370,28 +4905,6 @@ def build_instrumental_local_context(verses: List[Dict[str, Any]], previous_vers
     if next_verse_index and 1 <= next_verse_index <= len(verses):
         parts.append(format_verse_context(verses[next_verse_index - 1], "Next verse"))
     return "\n\n".join(parts)
-
-
-def build_current_block_instruction(block: Dict[str, Any], verses: List[Dict[str, Any]]) -> str:
-    directives = block.get("bracket_directives") or []
-    directive_text = ""
-    if directives:
-        directive_text = (
-            "\n\nBRACKET DIRECTIVES, lower priority than actual lyrics:\n"
-            + "\n".join(f"- {x}" for x in directives)
-            + "\nThese are songwriter or generation metadata from bracketed lyric lines. "
-              "Do not treat them as sung lyrics. If they conflict with actual lyrics, lyrics win."
-        )
-
-    if not block_has_lyric_text(block):
-        return (
-            "This is an explicit non-lyrical song block from lyrics.txt. "
-            "It may be instrumental, intro, outro, breakdown, solo, rest, or metadata-only. "
-            "No words are sung in this block. Continue or resolve the surrounding visual scene using the music and bracket directives. "
-            "Do not render lyrics, captions, signs, section labels, or any visible text."
-        ) + directive_text
-
-    return "Current song block text:\n" + str(block.get("text", "")) + directive_text
 
 
 
@@ -4516,23 +5029,41 @@ def resolve_manual_boundary(
     resolved = requested
     reason = "exact_requested_time"
     warning = False
-    if descriptor.get("mode") == "snap_previous":
-        lookback = max(0.0, float(config.get("manual_boundary_snap_max_seconds", 10.0)))
-        valid = sorted({
-            float(value) for value in candidates
-            if allowed_start < float(value) <= requested + 1e-6
-            and requested - float(value) <= lookback + 1e-6
-        })
-        if valid:
-            resolved = valid[-1]
-            reason = "previous_lyric_boundary"
+    snap_mode = descriptor.get("mode")
+    if snap_mode in {"snap_previous", "snap_next"}:
+        radius = max(0.0, float(config.get("manual_boundary_snap_max_seconds", 10.0)))
+        if snap_mode == "snap_previous":
+            valid = sorted({
+                float(value) for value in candidates
+                if allowed_start < float(value) <= requested + 1e-6
+                and requested - float(value) <= radius + 1e-6
+            })
+            if valid:
+                resolved = valid[-1]
+                reason = "previous_lyric_boundary"
+            else:
+                reason = "no_previous_candidate_within_radius"
+                warning = True
+                log(
+                    f"WARNING: {label} {descriptor.get('source')} has no previous lyric boundary within "
+                    f"{radius:.3f}s; using exact requested time {requested:.3f}s"
+                )
         else:
-            reason = "no_previous_candidate_within_radius"
-            warning = True
-            log(
-                f"WARNING: {label} {descriptor.get('source')} has no previous lyric boundary within "
-                f"{lookback:.3f}s; using exact requested time {requested:.3f}s"
-            )
+            valid = sorted({
+                float(value) for value in candidates
+                if requested - 1e-6 <= float(value) < allowed_end
+                and float(value) - requested <= radius + 1e-6
+            })
+            if valid:
+                resolved = valid[0]
+                reason = "next_lyric_boundary"
+            else:
+                reason = "no_next_candidate_within_radius"
+                warning = True
+                log(
+                    f"WARNING: {label} {descriptor.get('source')} has no next lyric boundary within "
+                    f"{radius:.3f}s; using exact requested time {requested:.3f}s"
+                )
 
     result = dict(descriptor)
     result.update({
@@ -4541,10 +5072,11 @@ def resolve_manual_boundary(
         "resolution_reason": reason,
         "warning": warning,
     })
-    if descriptor.get("mode") == "snap_previous" and not warning:
+    if descriptor.get("mode") in {"snap_previous", "snap_next"} and not warning:
+        direction = "previous" if descriptor.get("mode") == "snap_previous" else "next"
         log(
             f"[boundary] {label}: {requested:.3f}s -> {resolved:.3f}s "
-            f"({resolved - requested:+.3f}s, previous lyric boundary)"
+            f"({resolved - requested:+.3f}s, {direction} lyric boundary)"
         )
     return result
 
@@ -4884,8 +5416,6 @@ def build_subranges_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> 
         out.append({
             "block_index": int(block["block_index"]),
             "kind": str(block.get("kind", "verse")),
-            "sub_index": i + 1,
-            "sub_count": count,
             "start": sub_start,
             "end": sub_end,
             "duration": max(0.01, sub_end - sub_start),
@@ -4896,7 +5426,7 @@ def build_subranges_for_block(block: Dict[str, Any], config: Dict[str, Any]) -> 
     return out
 
 
-def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any]) -> str:
+def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any], sub_index: int, sub_count: int) -> str:
     kind = str(block.get("kind", "verse"))
     directives = block.get("bracket_directives") or []
     directive_text = "\n".join(f"- {x}" for x in directives) if directives else "- none"
@@ -4925,7 +5455,7 @@ def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any]) 
         f"SEMANTIC RANGE:\n"
         f"Block index: {int(block['block_index']):03d}\n"
         f"Kind: {kind}\n"
-        f"Subrange: {int(subrange['sub_index'])} of {int(subrange['sub_count'])}\n"
+        f"Subrange index: {int(sub_index)} (count {int(sub_count)})\n"
         f"Time: {float(subrange['start']):.3f}s..{float(subrange['end']):.3f}s\n\n"
         f"BRACKET DIRECTIVES, metadata for the whole semantic range:\n{directive_text}\n\n"
         f"FULL SEMANTIC RANGE LYRICS / RANGE TEXT:\n{full_text}\n\n"
@@ -5062,21 +5592,6 @@ def render_audio_for_timeline(full_mix: Path, out_dir: Path, ffmpeg: str, audio_
         ])
     return render
 
-
-def instrumental_gap_threshold(verses: List[Dict[str, Any]], config: Dict[str, Any]) -> float:
-    durations = [float(v.get("duration", 0.0)) for v in verses if float(v.get("duration", 0.0)) > 0.01]
-    median_duration = statistics.median(durations) if durations else 0.0
-    return max(
-        float(config["instrumental_gap_min_seconds"]),
-        median_duration * float(config["instrumental_gap_min_ratio_of_median_verse"]),
-    )
-
-
-
-
-def should_create_silent_gap_block(gap_duration: float, verses: List[Dict[str, Any]], config: Dict[str, Any]) -> bool:
-    return float(gap_duration) >= instrumental_gap_threshold(verses, config)
-
 def make_nonlyrical_block_text(block: Dict[str, Any]) -> str:
     directives = block.get("bracket_directives") or []
     label = ", ".join(str(x) for x in directives) if directives else "empty"
@@ -5115,6 +5630,284 @@ def last_effective_lyric_end_before_explicit_gap(block: Dict[str, Any], default_
         return natural_end
     return default_end
 
+
+def coalesce_short_nonlyrical_blocks(
+    blocks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Fold unusably short musical/meta-only ranges into adjacent visual ranges.
+
+    A block is considered non-lyrical when ``block_has_lyric_text()`` finds no
+    sung text after metadata/control lines are ignored.  Explicit instrumental
+    sections therefore remain standalone when they have a real time span, while
+    zero/near-zero markers can never become an Rxxx that is shorter than
+    ``min_workflow_seconds``.
+
+    This is intentionally a timeline invariant, not a song-specific workaround:
+    it applies to intro/interlude/outro/meta-only/empty blocks for any lyrics.
+    """
+    if not blocks:
+        return []
+
+    min_visual = max(0.01, float(config.get("min_workflow_seconds", 1.0)))
+    normalized: List[Dict[str, Any]] = []
+    pending_prefix: List[Dict[str, Any]] = []
+
+    def marker_from(block: Dict[str, Any], duration: float) -> Dict[str, Any]:
+        return {
+            "kind": block.get("kind"),
+            "start": float(block.get("start", 0.0)),
+            "end": float(block.get("end", 0.0)),
+            "duration": duration,
+            "bracket_directives": list(block.get("bracket_directives", [])),
+            "song_block_index": block.get("song_block_index"),
+            "semantic_boundary_before": block.get("semantic_boundary_before"),
+            "reason": "nonlyrical_range_shorter_than_min_workflow",
+        }
+
+    def refresh_owner(owner: Dict[str, Any]) -> None:
+        owner["duration"] = max(0.01, float(owner["end"]) - float(owner["start"]))
+        verse = owner.get("verse")
+        if isinstance(verse, dict):
+            verse["start"] = float(owner["start"])
+            verse["end"] = float(owner["end"])
+            verse["duration"] = float(owner["duration"])
+
+    for block in blocks:
+        start = float(block.get("start", 0.0))
+        end = float(block.get("end", start))
+        duration = max(0.0, end - start)
+
+        if (not block_has_lyric_text(block)) and duration < min_visual - 1e-6:
+            marker = marker_from(block, duration)
+            if normalized:
+                # Internal/trailing short musical markers belong to the previous
+                # visual range.  This preserves continuity and prevents a
+                # standalone sub-minimum workflow.
+                owner = normalized[-1]
+                owner.setdefault("embedded_nonlyrical_sections", []).append(marker)
+                owner["end"] = max(float(owner["end"]), end)
+                refresh_owner(owner)
+            else:
+                # A short prefix has no previous owner; defer it until the first
+                # renderable range and expand that range backwards.
+                pending_prefix.append(marker)
+
+            log(
+                f"[timeline] fold short non-lyrical marker {duration:.3f}s "
+                f"(< min_workflow_seconds={min_visual:.3f}s) into neighboring range"
+            )
+            continue
+
+        if pending_prefix:
+            block.setdefault("embedded_nonlyrical_sections", []).extend(pending_prefix)
+            block["start"] = min(
+                float(block.get("start", 0.0)),
+                min(float(item["start"]) for item in pending_prefix),
+            )
+            refresh_owner(block)
+            pending_prefix = []
+
+        normalized.append(block)
+
+    if pending_prefix:
+        if normalized:
+            owner = normalized[-1]
+            owner.setdefault("embedded_nonlyrical_sections", []).extend(pending_prefix)
+            owner["end"] = max(
+                float(owner["end"]),
+                max(float(item["end"]) for item in pending_prefix),
+            )
+            refresh_owner(owner)
+        else:
+            # Degenerate all-metadata song: merge the markers into one range
+            # rather than manufacturing several 0.010s ranges.
+            first = blocks[0]
+            start = min(float(item["start"]) for item in pending_prefix)
+            end = max(float(item["end"]) for item in pending_prefix)
+            merged = dict(first)
+            merged["start"] = start
+            merged["end"] = max(start + 0.01, end)
+            merged["duration"] = max(0.01, merged["end"] - merged["start"])
+            merged["embedded_nonlyrical_sections"] = list(pending_prefix)
+            normalized.append(merged)
+
+    for new_index, block in enumerate(normalized):
+        block["block_index"] = new_index
+
+    return normalized
+
+
+def _block_first_word(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    verse = block.get("verse") if isinstance(block.get("verse"), dict) else block
+    for line in verse.get("lines", []) or []:
+        words = line.get("words", []) or []
+        if words:
+            return words[0]
+    return None
+
+
+def _block_last_word(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    verse = block.get("verse") if isinstance(block.get("verse"), dict) else block
+    for line in reversed(verse.get("lines", []) or []):
+        words = line.get("words", []) or []
+        if words:
+            return words[-1]
+    return None
+
+
+def _set_block_last_lyric_end(block: Dict[str, Any], boundary: float) -> None:
+    verse = block.get("verse") if isinstance(block.get("verse"), dict) else block
+    lines = verse.get("lines", []) or []
+    for line in reversed(lines):
+        words = line.get("words", []) or []
+        if not words:
+            continue
+        word = words[-1]
+        ws = float(word.get("start", boundary))
+        word["end"] = max(ws + 0.01, boundary)
+        word["timing_estimated"] = True
+        word["timing_source"] = "semantic_boundary_word_edge_repair"
+        line["end"] = float(word["end"])
+        line["timing_estimated"] = True
+        return
+
+
+def _set_block_first_lyric_start(block: Dict[str, Any], boundary: float) -> None:
+    verse = block.get("verse") if isinstance(block.get("verse"), dict) else block
+    lines = verse.get("lines", []) or []
+    for line in lines:
+        words = line.get("words", []) or []
+        if not words:
+            continue
+        word = words[0]
+        we = float(word.get("end", boundary + 0.01))
+        word["start"] = min(we - 0.01, boundary)
+        word["timing_estimated"] = True
+        word["timing_source"] = "semantic_boundary_word_edge_repair"
+        line["start"] = float(word["start"])
+        line["timing_estimated"] = True
+        return
+
+
+def enforce_word_safe_semantic_boundaries(
+    blocks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Make every R boundary a word edge, never the interior of a lyric word.
+
+    Automatic boundaries are clamped into the safe gap between the final word
+    of the left range and the first word of the right range. If bad alignment
+    makes those word intervals overlap, repair the two edge words first and use
+    one shared boundary. This keeps subtitles, planner ranges and video ranges
+    on the same semantic edge instead of clipping only at render time.
+    """
+    if len(blocks) < 2:
+        return blocks
+
+    min_unit = max(0.01, float(config.get("min_karaoke_unit_seconds", 0.01)))
+    for i in range(len(blocks) - 1):
+        left = blocks[i]
+        right = blocks[i + 1]
+        current = float(left.get("end", right.get("start", 0.0)))
+        left_word = _block_last_word(left) if block_has_lyric_text(left) else None
+        right_word = _block_first_word(right) if block_has_lyric_text(right) else None
+        lower = float(left_word.get("end", current)) if left_word is not None else float(left.get("start", current))
+        upper = float(right_word.get("start", current)) if right_word is not None else float(right.get("end", current))
+
+        if left_word is not None and right_word is not None and lower > upper + 1e-6:
+            # Cross-range word overlap: choose the more credible anchor; if both
+            # are similarly credible, split the overlap. Then make both words end
+            # and start exactly at that repaired boundary.
+            lp = _word_probability(left_word)
+            rp = _word_probability(right_word)
+            if lp + 0.20 < rp:
+                boundary = upper
+            elif rp + 0.20 < lp:
+                boundary = lower
+            else:
+                boundary = (lower + upper) * 0.5
+
+            left_start = float(left_word.get("start", boundary - min_unit))
+            right_end = float(right_word.get("end", boundary + min_unit))
+            boundary = max(left_start + min_unit, min(right_end - min_unit, boundary))
+            _set_block_last_lyric_end(left, boundary)
+            _set_block_first_lyric_start(right, boundary)
+            lower = upper = boundary
+        elif lower <= upper:
+            boundary = min(max(current, lower), upper)
+        else:
+            boundary = current
+
+        left["end"] = boundary
+        left["duration"] = max(0.01, boundary - float(left["start"]))
+        right["start"] = boundary
+        right["duration"] = max(0.01, float(right["end"]) - boundary)
+        left.setdefault("word_safe_boundary_after", {})["time"] = boundary
+        right.setdefault("word_safe_boundary_before", {})["time"] = boundary
+
+    # Reindexing is intentionally independent from timing; both R and S are
+    # zero-based externally and internally.
+    for idx, block in enumerate(blocks):
+        block["block_index"] = idx
+    return blocks
+
+
+def validate_lyrics_inside_semantic_ranges(blocks: List[Dict[str, Any]]) -> None:
+    """Fail loudly if a lyric word still crosses its owning semantic range.
+
+    The only tolerated exception is a tiny overrun of the *final lyric word*
+    beyond the final full-audio boundary.  Vocal stems produced by source
+    separation can be a few frames / encoder samples longer than the original
+    mix even when both files share the same musical timebase.  In that case we
+    clamp the terminal word to the final timeline edge instead of rejecting an
+    otherwise valid alignment.  Internal semantic boundaries remain strict.
+    """
+    eps = 0.012
+    terminal_audio_tail_tolerance = 0.150
+    last_block_index = len(blocks) - 1
+
+    for block_pos, block in enumerate(blocks):
+        if not block_has_lyric_text(block):
+            continue
+        start = float(block["start"])
+        end = float(block["end"])
+        verse = block.get("verse") if isinstance(block.get("verse"), dict) else block
+        terminal_word = _block_last_word(block) if block_pos == last_block_index else None
+
+        for line in verse.get("lines", []) or []:
+            for word in line.get("words", []) or []:
+                ws = float(word.get("start", start))
+                we = float(word.get("end", ws))
+
+                # Source-separated vocals may end a few milliseconds after the
+                # full mix. Only forgive this at the actual song tail, and only
+                # for the final lyric word. Never relax internal R boundaries.
+                if (
+                    word is terminal_word
+                    and we > end + eps
+                    and we - end <= terminal_audio_tail_tolerance
+                    and ws >= end - terminal_audio_tail_tolerance
+                ):
+                    clamped_start = min(ws, end)
+                    word["start"] = clamped_start
+                    word["end"] = end
+                    word["timing_estimated"] = True
+                    word["timing_source"] = "terminal_audio_end_clamp"
+                    line["end"] = end
+                    if float(line.get("start", clamped_start)) > end:
+                        line["start"] = end
+                    line["timing_estimated"] = True
+                    ws = float(word["start"])
+                    we = float(word["end"])
+
+                if ws < start - eps or we > end + eps:
+                    raise RuntimeError(
+                        f"Lyric word crosses semantic range {format_range_id(int(block['block_index']))}: "
+                        f"{word.get('text')!r} {ws:.3f}..{we:.3f} outside {start:.3f}..{end:.3f}"
+                    )
+
+
 def make_timeline_blocks(
     all_verses: List[Dict[str, Any]],
     selected_verses: List[Dict[str, Any]],
@@ -5128,9 +5921,9 @@ def make_timeline_blocks(
     timeline block. Blocks with lyrics use alignment timing; blocks without
     lyrics fill the gap between surrounding explicit blocks or the audio edge.
 
-    AI-11 keeps the legacy `kind` field for the master single-pass planner:
-    lyric blocks are `verse`; non-lyrical blocks become intro/instrumental/outro
-    according to their position.
+    The `kind` field drives planner template selection: lyric blocks are
+    `verse`; non-lyrical blocks become intro/instrumental/outro according to
+    their position.
     """
     source_blocks = selected_verses
     if not source_blocks:
@@ -5304,6 +6097,14 @@ def make_timeline_blocks(
                 verse["start"] = block["start"]
                 verse["end"] = block["end"]
                 verse["duration"] = block["duration"]
+
+    # Enforce the visual-timeline invariant *after* all automatic and manual
+    # semantic-boundary resolution.  This catches both inferred zero-length
+    # musical markers and an explicit boundary that leaves a metadata-only block
+    # too short to render.
+    blocks = coalesce_short_nonlyrical_blocks(blocks, config)
+    blocks = enforce_word_safe_semantic_boundaries(blocks, config)
+    validate_lyrics_inside_semantic_ranges(blocks)
 
     return blocks, audio_end
 
@@ -5683,12 +6484,16 @@ def write_range_debug_files(block: Dict[str, Any], subranges: List[Dict[str, Any
     }
     write_json(rdir / "range_context.json", range_context)
 
-    for subrange in subranges:
-        sub_i = int(subrange["sub_index"])
+    sub_count = len(subranges)
+    for sub_i, subrange in enumerate(subranges):
         pdir = range_part_debug_dir(debug_dir, block_i, sub_i)
         pdir.mkdir(parents=True, exist_ok=True)
         (pdir / "subrange_text.txt").write_text(str(subrange.get("text", "")), encoding="utf-8")
-        write_json(pdir / "subrange_context.json", subrange)
+        write_json(pdir / "subrange_context.json", {
+            "subrange_index": sub_i,
+            "subrange_count": sub_count,
+            "subrange": subrange,
+        })
 
     return rdir
 
@@ -5696,6 +6501,7 @@ def write_range_debug_files(block: Dict[str, Any], subranges: List[Dict[str, Any
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate a ComfyUI music video from input-dir files.")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {RUNNER_BUILD_ID}")
     ap.add_argument("--input-dir", default="input", help="Folder containing all song input files. Defaults to ./input.")
     ap.add_argument("--output-dir", default="output", help="Folder for all generated artifacts. Defaults to ./output.")
     ap.add_argument("--limit", type=int, default=0, help="Use only first N zero-based ranges for testing/final assembly. Example: --limit 3 selects R000..R002.")
@@ -5728,6 +6534,8 @@ def main() -> None:
     ffprobe_cmd = resolve_ffprobe_command(script_dir)
     stable_ts_cmd = resolve_stable_ts_command(script_dir)
 
+    log(f"[runner] version  : {__version__}")
+    log(f"[runner] script   : {Path(__file__).resolve()}")
     log(f"[stage] input dir : {input_dir}")
     log(f"[stage] output dir: {output_root}")
     log(f"[stage] workflows : {workflow_dir}")
@@ -5953,6 +6761,8 @@ def main() -> None:
         )
         write_json(debug_dir / "run_info.json", {
             "run_id": run_id,
+            "runner_version": __version__,
+            "script_path": str(Path(__file__).resolve()),
             "preview_subtitles_only": True,
         })
         print_run_stats(
@@ -5977,6 +6787,8 @@ def main() -> None:
     debug_dir.mkdir(parents=True, exist_ok=True)
     write_json(debug_dir / "run_info.json", {
         "run_id": run_id,
+        "runner_version": __version__,
+        "script_path": str(Path(__file__).resolve()),
         "refresh_alignment": bool(args.refresh_alignment),
     })
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -6070,22 +6882,26 @@ def main() -> None:
         subrange_infos: List[Dict[str, Any]] = []
         previous_subclip: Optional[Path] = None
 
-        for subrange in subranges:
-            sub_i = int(subrange["sub_index"])
-            sub_count = int(subrange["sub_count"])
+        sub_count = len(subranges)
+        for sub_i, subrange in enumerate(subranges):
+            # The subrange list position is the canonical zero-based identity.
+            # There is deliberately no duplicated sub_index/sub_count state in
+            # the subrange object itself.
             sub_duration = max(0.1, float(subrange["duration"]))
             sub_dir = comfy_block_part_subdir(run_id, block_i, sub_i)
             plan_suffix = f"_part_{sub_i:03d}"
             plan_base_name = f"plan_{block_i:03d}{plan_suffix}"
 
-            log(f"  [subrange] {sub_i}/{sub_count} time={float(subrange['start']):.3f}s..{float(subrange['end']):.3f}s duration={sub_duration:.2f}s")
+            log(f"  [subrange] S{sub_i:03d}/{sub_count:03d} time={float(subrange['start']):.3f}s..{float(subrange['end']):.3f}s duration={sub_duration:.2f}s")
 
-            current_instruction = build_subrange_instruction(block, subrange)
+            current_instruction = build_subrange_instruction(block, subrange, sub_i, sub_count)
             part_debug_dir = range_part_debug_dir(debug_dir, block_i, sub_i)
             part_debug_dir.mkdir(parents=True, exist_ok=True)
             write_json(part_debug_dir / "planner_context.json", {
                 "block_index": block_i,
                 "block_kind": kind,
+                "subrange_index": sub_i,
+                "subrange_count": sub_count,
                 "subrange": subrange,
                 "video_style_source": video_style_report.get("blocks", {}).get(str(block_i), video_style_report.get("default", {})),
                 "video_style": block_video_style,
@@ -6120,7 +6936,7 @@ def main() -> None:
             start_image_local = block_frames_dir / f"part_{sub_i:03d}_start.png"
             last_frame_local = block_frames_dir / f"part_{sub_i:03d}_last.png"
 
-            if sub_i == 1:
+            if sub_i == 0:
                 log("  [stage] queue start image")
                 free_comfy_memory(comfy_url, "before image generation", sleep_time=1.0)
                 iwf = patch_image_workflow(
@@ -6195,8 +7011,8 @@ def main() -> None:
             })
 
             subrange_info = {
-                "sub_index": sub_i,
-                "sub_count": sub_count,
+                "subrange_index": sub_i,
+                "subrange_count": sub_count,
                 "start": float(subrange["start"]),
                 "end": float(subrange["end"]),
                 "duration": sub_duration,
@@ -6223,8 +7039,8 @@ def main() -> None:
             "split_parts": len(subrange_infos),
             "subranges": [
                 {
-                    "sub_index": x.get("sub_index"),
-                    "sub_count": x.get("sub_count"),
+                    "subrange_index": x.get("subrange_index"),
+                    "subrange_count": x.get("subrange_count"),
                     "start": x.get("start"),
                     "end": x.get("end"),
                     "duration": x.get("duration"),

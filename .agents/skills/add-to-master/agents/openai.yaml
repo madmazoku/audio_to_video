@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add to Master"
+  short_description: "Create, review, merge, and sync a GitHub PR"
+  default_prompt: "Use $add-to-master to publish the current reviewed changes through a PR into master."
