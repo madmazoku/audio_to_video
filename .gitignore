@@ -3,6 +3,9 @@ input*/
 output*/
 /out/
 
+# Archives
+*.zip
+
 # Python cache
 __pycache__/
 *.pyc

@@ -3193,6 +3193,21 @@ def scan_numbered_input_files(input_dir: Path, prefix: str, suffix: str) -> Dict
     return out
 
 
+def scan_block_start_images(input_dir: Path) -> Dict[int, Path]:
+    """Find optional range first frames, using the same zero-based override ids."""
+    pattern = re.compile(r"start_image_(\d+)\.(png|jpe?g|webp)$", re.IGNORECASE)
+    images: Dict[int, Path] = {}
+    for path in sorted(input_dir.iterdir()):
+        match = pattern.fullmatch(path.name)
+        if not path.is_file() or not match:
+            continue
+        index = int(match.group(1))
+        if index in images:
+            raise RuntimeError(f"Duplicate start image for range {index}: {images[index]} and {path}")
+        images[index] = path
+    return images
+
+
 def load_block_video_styles(input_dir: Path, default_video_style: str, debug_dir: Path) -> Tuple[Dict[int, str], Dict[str, Any]]:
     overrides = scan_numbered_input_files(input_dir, "video_style", ".txt")
     styles: Dict[int, str] = {}
@@ -6574,6 +6589,7 @@ def main() -> None:
     log(f"[stage] llm max ctx: {int(config['llm_max_ctx'])}")
     log(f"[stage] llm max length: {int(config['llm_max_length'])}")
     block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
+    block_start_images = scan_block_start_images(input_dir)
 
     ensure_alignment_artifact(
         input_dir,
@@ -6936,7 +6952,12 @@ def main() -> None:
             start_image_local = block_frames_dir / f"part_{sub_i:03d}_start.png"
             last_frame_local = block_frames_dir / f"part_{sub_i:03d}_last.png"
 
-            if sub_i == 0:
+            if sub_i == 0 and block_i in block_start_images:
+                image_path = block_start_images[block_i]
+                start_image_local = start_image_local.with_suffix(image_path.suffix.lower())
+                log(f"  [stage] copy supplied start image: {image_path}")
+                shutil.copy2(image_path, start_image_local)
+            elif sub_i == 0:
                 log("  [stage] queue start image")
                 free_comfy_memory(comfy_url, "before image generation", sleep_time=1.0)
                 iwf = patch_image_workflow(
