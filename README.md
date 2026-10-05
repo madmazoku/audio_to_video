@@ -506,6 +506,16 @@ same `RNNN` id shown in `subtitle_preview.mp4`, without the `R` prefix. For
 example, `R000` uses `video_style_0.txt`. Adding a new semantic range at the
 start of `lyrics.txt` shifts all following range ids by +1.
 
+Optional `start_image_N.png` (also `.jpg`, `.jpeg`, `.webp`) supplies the first
+frame of the same zero-based range `N`. The runner copies it instead of running
+txt2img; absent files keep normal image generation. Padded ids are accepted,
+but multiple files with the same numeric id are an error, even across extensions.
+Images are copied without resizing or modifying the originals. The existing video
+workflow handles scaling with Lanczos and central cropping to the configured video
+size; it may trim edges when aspect ratios differ. Later subranges still use the
+preceding video's last frame. Existing clip reuse is unchanged: use `--rework N`
+to regenerate an already generated range after adding or changing its image.
+
 Examples:
 
 ```text
