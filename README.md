@@ -126,11 +126,8 @@ The runner default is:
 http://127.0.0.1:8188
 ```
 
-Override it with:
-
-```powershell
-python.exe .\aligned_song_video_runner.py --comfy-url http://127.0.0.1:8188
-```
+Override `comfy_url` in the input folder's `config.json`. The selected
+ComfyUI generators read this connection setting internally.
 
 The runner also needs to find ComfyUI output files. The default value is configured as a sibling repository path:
 
@@ -138,11 +135,8 @@ The runner also needs to find ComfyUI output files. The default value is configu
 G:\Git\ComfyUI\output
 ```
 
-Override it with:
-
-```powershell
-python.exe .\aligned_song_video_runner.py --comfy-output-dir G:\Git\ComfyUI\output
-```
+Override `comfy_output_dir` in the input folder's `config.json`. Relative
+paths are resolved against the project directory by the generator factory.
 
 Install all ComfyUI custom nodes and models required by the workflow JSON files in `workflows/`. If ComfyUI reports an unknown node type, install the missing custom node into `ComfyUI/custom_nodes/` and restart ComfyUI. If it reports a missing model, place the model file where the workflow expects it.
 
@@ -303,18 +297,6 @@ Reuse or lazily build full-song preview subtitles, debug-only `work/subs/preview
 ```
 
 Invalidate `output/work/alignment/` and matching-derived subtitle/preview artifacts, then rebuild them lazily when needed from the current `input/lyrics.txt` and the current alignment source. Use this after editing lyrics to match the actual vocals. With `--preview-subtitles-only`, this lets you validate new karaoke timing and range/subrange boundaries before any visual generation. Existing `clips_unscaled/` files are matched by the same zero-based range id and validated by their actual MP4 duration against the current selected range duration.
-
-```text
---comfy-url URL
-```
-
-ComfyUI server URL. Default: `http://127.0.0.1:8188`.
-
-```text
---comfy-output-dir PATH
-```
-
-ComfyUI output directory used to locate generated image/video files.
 
 ```text
 --lyrics-language LANG
@@ -496,6 +478,160 @@ config.json
 ```
 
 Overrides defaults from `data/config.json`.
+Objects are merged recursively; lists are replaced, so an explicit empty
+`loras` list removes the template's adapters.
+
+#### Generation templates (phase 1)
+
+`data/model_templates.json` contains named image and video recipes. Select
+them in `data/config.json` or in the input folder's `config.json`:
+
+```json
+{
+  "image_generation": {
+    "template": "flux2_dev_current"
+  },
+  "video_generation": {
+    "template": "ltx23_current"
+  },
+  "llm_generation": {
+    "template": "qwen25_14b_current"
+  }
+}
+```
+
+The catalog is indexed by template name under `image_generation`,
+`video_generation`, and `llm_generation`. Each entry contains `type`, `workflow`, model files,
+`loras`, and sampling parameters. The factory selects the generator by
+`type`; FLUX2 and LTX use ComfyUI. Phase 1 supports FLUX2 Dev images and
+LTX 2.3 image-to-video, and the existing llama-cpp Qwen 2.5 14B planner.
+Other generator types fail before generation. The LLM recipe configures the
+checkpoint, `n_ctx`, `max_tokens`, and the `parameters` object (temperature,
+top-k/top-p, penalties and other sampling settings).
+
+Available image recipes:
+
+| Template | Recipe |
+| --- | --- |
+| `flux2_dev_current` | Existing FLUX2 Dev setup, Small Decoder, 30 steps, guidance 3.5, no LoRA |
+| `flux2_dev_full_vae` | Same setup with the full `flux2-vae.safetensors` |
+| `flux2_dev_turbo` | FLUX2 Dev with Turbo LoRA, eight steps and its explicit sigma schedule |
+
+`ltx23_current` preserves the existing two-pass LTX setup and explicitly lists
+its distilled acceleration LoRA at weight 0.7. Both passes receive the ordered
+LoRA chain. These default recipes produce the same patched graphs as the
+previous runner. The default setup and the alternative Turbo/FP8 selection
+were exercised successfully in local user runs. Full VAE and unaccelerated
+LTX remain comparison recipes requiring generation validation.
+
+Available video recipes (all handled by `LtxGenerator`):
+
+| Template | Recipe |
+| --- | --- |
+| `ltx23_current` | Existing LTX 2.3 Dev checkpoint and distilled acceleration LoRA |
+| `ltx23_fp8` | Same recipe with the installed LTX 2.3 Dev FP8 checkpoint |
+| `ltx23_unaccelerated` | Dev checkpoint without LoRA, ordinary sampling and longer refinement; experimental |
+
+All FLUX2 recipes use `Flux2Generator`, including the Turbo schedule. Selecting
+a recipe does not change the command or input file layout. Installed files and
+graph wiring can be checked without generation; alternative recipes still
+need visual validation on the target GPU.
+
+The selected template is loaded first; other fields in the same configuration
+object override it. Global and input configuration objects merge recursively,
+so the input file can change only `steps` and inherit the template selection:
+
+```json
+{
+  "image_generation": {
+    "template": "flux2_dev_current",
+    "checkpoint": "flux2_dev_fp8mixed.safetensors",
+    "steps": 25,
+    "loras": [
+      { "name": "compatible_flux2_style.safetensors", "weight": 0.7 }
+    ]
+  },
+  "video_generation": {
+    "template": "ltx23_unaccelerated",
+    "steps": 35,
+    "refine_steps": 15
+  }
+}
+```
+
+Weights must be compatible with the selected model family. LoRA order is
+preserved. There is no fixed number of LoRA slots: generators insert nodes
+and reconnect explicitly declared inputs. Node IDs and fields live in the
+generator classes in `core/generator.py`, not in a separate mapping file. Graph
+bindings and links are checked before a job is submitted.
+
+Reusable implementation lives under `core/`; executable entry points remain
+separate. `core/generator.py` contains the generator classes, factory,
+requests/results, configuration merging and shared ComfyUI interface.
+`Generator` declares only `generate()` and `metadata()`; it has no workflow,
+connection, or model-loading implementation. `ComfyUIGenerator` owns graph
+loading, binding checks, LoRA chains, and workflow configuration. A future
+AUTOMATIC1111 implementation can implement `Generator` independently.
+`generate(request)` accepts one immutable, keyword-only request containing
+the prompt, seed, output/debug locations and runtime parameters. `ImageRequest`,
+`VideoRequest` and `LlmRequest` inherit independently from `GenerationRequest`.
+Optional dimensions and LLM token limits inherit generator settings when omitted.
+Video length is specified only by the required `seconds` field; optional `fps`
+inherits the recipe. The LTX workflow converts seconds to a valid frame count
+using its existing `8*k+1` rounding rule.
+The current small generator subsystem stays in one module; separate modules
+can be introduced when independent subsystems warrant them.
+The factory configures a service client owned by the generator. Connections,
+workflow submission, input upload, progress, memory cleanup and result lookup
+are implemented in `core/comfyui.py` and called by generators. The runner
+passes local files and requests, not server-specific callbacks or URLs.
+The LLM generator returns response text; song-context construction, prompt
+policy and semantic plan validation remain in the runner. Connection settings
+are configured only through `config.json`.
+
+
+An omitted `loras` field in a catalog entry means no adapters. Omitting a
+local override inherits the recipe's list; explicitly setting `[]` removes
+it. The `role: "acceleration"` marker identifies a recipe's speed adapter.
+FLUX2 Turbo requires this adapter and its schedule; for no LoRA select a
+standard recipe. LTX recipes explicitly select `sampling: "distilled"` or
+`sampling: "full"`. Removing the required accelerator from a distilled
+recipe is an error; select `ltx23_unaccelerated` for no LoRA. Its candidate
+settings are 30 steps / CFG 3 and a 12-step refinement. Override them directly
+in `video_generation` using `steps`, `cfg`, `refine_steps`, `refine_cfg`,
+`sampler`, and `refine_sampler`. Unaccelerated generation is slower and needs
+visual validation. No alternate sampling recipe is inferred by the code.
+
+The resolved config requires `image_generation.template` and
+`video_generation.template`, plus `llm_generation.template`; defaults are
+defined only in `data/config.json`.
+The runner does not infer a template when these selections are missing.
+Workflow files must use the current bindings and contain no built-in LoRA
+nodes; generators add all adapters from the recipe.
+
+Global `video_width`, `video_height`, and `video_fps` override recipe defaults.
+An explicit image override may set a different `width`/`height`; the existing
+video workflow then resizes that generated image. Dimensions must be positive
+integers divisible by eight. Video dimensions/fps must match the global video
+settings; change those global settings to change the video output.
+
+Supplied `start_image_N.*` files still bypass image generation entirely.
+Continuation still uses the previous final frame in phase 1; video-prefix
+overlap is planned for phase 2.
+
+Debug output records resolved settings and graph signatures in
+`generation_settings.json`, plus per-generated-part `image_generator.json`
+and `video_generator.json`. Unscaled range clips also have a
+`.generation.json` sidecar. Reuse keeps the existing clip: a warning identifies
+changed generator settings. Reuse requires this metadata sidecar; old clips
+without it must be regenerated. Use `--rework N` to apply new settings to an
+existing range; `--rebuild-final` does not regenerate it.
+
+Offline configuration and graph checks:
+
+```powershell
+python -m unittest discover -s tests -v
+```
 
 ```text
 video_style_N.txt
@@ -908,8 +1044,15 @@ Default technical/timeline configuration:
   "alignment_match_similarity_threshold": 0.72,
   "alignment_match_warn_ratio": 0.2,
   "alignment_match_max_extra_ratio": 0.5,
-  "llm_max_ctx": 12288,
-  "llm_max_length": 4096
+  "image_generation": {
+    "template": "flux2_dev_current"
+  },
+  "video_generation": {
+    "template": "ltx23_current"
+  },
+  "llm_generation": {
+    "template": "qwen25_14b_current"
+  }
 }
 ```
 
@@ -923,13 +1066,20 @@ input/config.json
 
 `local_context_radius` controls how many neighboring verses are passed to the block planner as local context. For normal verse blocks, `2` means up to two previous and two next verses. For intro, the runner passes the first `radius` verses as early-song context. For outro, it passes the last `radius` verses as final-song context.
 
-`llm_max_ctx` is applied to `llama_cpp_model_loader.n_ctx`. `llm_max_length` is applied to `llama_cpp_parameters.max_tokens`; the installed llama-cpp-vlm node accepts at most 4096 generated tokens. Sampling controls such as temperature and repetition penalties live together in the planner workflow.
-
-Large input styles can override the context size in `input/config.json`. For example, a roughly 30 KB style plus song and block context can use:
+The LLM recipe's `n_ctx` sets the context window and `max_tokens` sets the
+response limit. Sampling controls are read from the recipe's `parameters`.
+Override these settings in `input/config.json`, for example:
 
 ```json
 {
-  "llm_max_ctx": 32768
+  "llm_generation": {
+    "template": "qwen25_14b_current",
+    "n_ctx": 32768,
+    "max_tokens": 4096,
+    "parameters": {
+      "temperature": 0.18
+    }
+  }
 }
 ```
 
