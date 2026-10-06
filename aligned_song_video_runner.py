@@ -13,11 +13,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import requests
 import random
-import websocket
 
-__version__ = "1.7.3"
+from core.generator import ImageRequest, VideoRequest, LlmRequest, create_generator, merge_config
+
+__version__ = "1.8.0"
 RUNNER_BUILD_ID = __version__
 
 # Rendering-only gap between adjacent identical karaoke lines.
@@ -30,28 +30,6 @@ KARAOKE_REPEAT_RESET_SECONDS = 0.08
 # final lyric word before a terminal metadata-only/non-lyrical tail.
 TERMINAL_SONG_WORD_MIN_KARAOKE_SECONDS = 1.10
 TERMINAL_SONG_WORD_MAX_EXTRA_SECONDS = 0.55
-
-IMAGE_N = {
-    "image_prompt": "1004",
-    "image_latent": "1007",
-    "image_scheduler": "1024",
-    "image_noise": "1022",
-    "image_save": "1011",
-}
-
-VIDEO_N = {
-    "start_image": "9000",
-    "video_prompt": "393",
-    "video_negative": "328",
-    "video_seconds": "322",
-    "video_fps": "304",
-    "video_width": "261",
-    "video_height": "299",
-    "video_noise": "259",
-    "video_refine_noise": "283",
-    "video_save": "327",
-}
-
 
 def log_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -68,26 +46,6 @@ def log(msg: str) -> None:
             print(f"{log_timestamp()}  {line.lstrip()}", flush=True)
         else:
             print("", flush=True)
-
-
-def fmt_elapsed(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    if seconds < 100.0:
-        return f"{seconds:.1f}s"
-    return f"{seconds:.0f}s"
-
-
-def log_comfy(msg: str, workflow_start: Optional[float] = None, node_start: Optional[float] = None) -> None:
-    parts = []
-    now = time.perf_counter()
-    if workflow_start is not None:
-        parts.append(f"t+{fmt_elapsed(now - workflow_start)}")
-    if node_start is not None:
-        parts.append(f"node+{fmt_elapsed(now - node_start)}")
-    if parts:
-        log(f"[comfy] {' '.join(parts)} | {msg}")
-    else:
-        log(f"[comfy] {msg}")
 
 
 def remove_path(path: Path) -> None:
@@ -416,380 +374,12 @@ def save_prompt_debug(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-
-
-
 def make_run_id() -> str:
     return time.strftime("run_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
 
 
 def random_seed() -> int:
     return random.SystemRandom().randint(1, 2**31 - 1)
-
-
-def queue_prompt(workflow: Dict[str, Any], comfy_url: str, client_id: Optional[str] = None) -> Tuple[str, str]:
-    if client_id is None:
-        client_id = str(uuid.uuid4())
-
-    r = requests.post(
-        comfy_url.rstrip("/") + "/prompt",
-        json={"prompt": workflow, "client_id": client_id},
-        timeout=60,
-    )
-    try:
-        r.raise_for_status()
-    except Exception:
-        log("ComfyUI /prompt error:")
-        log(r.text[:4000])
-        raise
-
-    data = r.json()
-    if "prompt_id" not in data:
-        raise RuntimeError(f"Unexpected /prompt response: {data}")
-
-    return str(data["prompt_id"]), client_id
-
-
-
-
-def query_vram_mb() -> Optional[Tuple[int, int]]:
-    """Return (used_mb, total_mb) for the first NVIDIA GPU, or None."""
-    try:
-        cp = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-            check=True,
-        )
-    except Exception:
-        return None
-
-    for line in cp.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) >= 2:
-            try:
-                return int(float(parts[0])), int(float(parts[1]))
-            except ValueError:
-                continue
-    return None
-
-
-def format_vram(vram: Optional[Tuple[int, int]]) -> str:
-    if vram is None:
-        return "vram unavailable"
-    used_mb, total_mb = vram
-    return f"{used_mb} / {total_mb}"
-
-
-def wait_after_free_memory(wait_seconds: float, poll_interval: float = 0.5, report_vram: bool = True) -> None:
-    wait_seconds = max(0.0, float(wait_seconds))
-    poll_interval = max(0.1, float(poll_interval))
-    if wait_seconds <= 0.0:
-        return
-
-    elapsed = 0.0
-    while elapsed + 1e-9 < wait_seconds:
-        step = min(poll_interval, wait_seconds - elapsed)
-        time.sleep(step)
-        elapsed += step
-        if report_vram:
-            vram = query_vram_mb()
-            if vram is not None:
-                log_comfy(f"waiting {elapsed:.1f}s: {format_vram(vram)}")
-
-
-def free_comfy_memory(comfy_url: str, reason: str = "", sleep_time: Optional[float] = None) -> None:
-    """Best-effort ComfyUI VRAM/cache cleanup.
-
-    This only asks the ComfyUI server process to unload models/free memory.
-    It is intentionally non-fatal: unsupported endpoints or transient errors
-    should not stop generation.
-    When sleep_time is provided, wait that many seconds after a successful
-    free-memory request and log VRAM during that wait.
-    """
-    payload = {"unload_models": True, "free_memory": True}
-    base = comfy_url.rstrip("/")
-    label = f" ({reason})" if reason else ""
-    before_vram = query_vram_mb()
-    report_wait_vram = before_vram is not None
-
-    for path in ("/free", "/api/free"):
-        url = base + path
-        try:
-            r = requests.post(url, json=payload, timeout=60)
-            if r.status_code == 404:
-                continue
-            r.raise_for_status()
-            log_comfy(f"free memory {format_vram(before_vram)} ok{label}: {path}")
-            if sleep_time is not None:
-                wait_after_free_memory(float(sleep_time), poll_interval=0.5, report_vram=report_wait_vram)
-            return
-        except Exception as exc:
-            log_comfy(f"free memory {format_vram(before_vram)} failed{label}: {path}: {exc}")
-    log_comfy(f"free memory {format_vram(before_vram)} failed/non-fatal{label}")
-
-def comfy_ws_url(comfy_url: str, client_id: str) -> str:
-    base = comfy_url.rstrip("/")
-    if base.startswith("https://"):
-        base = "wss://" + base[len("https://"):]
-    elif base.startswith("http://"):
-        base = "ws://" + base[len("http://"):]
-    elif base.startswith("ws://") or base.startswith("wss://"):
-        pass
-    else:
-        base = "ws://" + base
-    return f"{base}/ws?clientId={client_id}"
-
-
-def workflow_node_label(workflow: Dict[str, Any], node_id: Optional[str]) -> str:
-    if node_id is None:
-        return "unknown"
-
-    node = workflow.get(str(node_id), {})
-    if not isinstance(node, dict):
-        return str(node_id)
-
-    meta = node.get("_meta", {})
-    title = ""
-    if isinstance(meta, dict):
-        title = str(meta.get("title", "")).strip()
-
-    class_type = str(node.get("class_type", "")).strip()
-
-    # Keep progress logs compact: node id + visible title/name only.
-    if title:
-        return f"{node_id} {title}"
-    if class_type:
-        return f"{node_id} {class_type}"
-    return str(node_id)
-
-
-def format_progress(value: Any, maximum: Any) -> str:
-    try:
-        v = float(value)
-        m = float(maximum)
-        if m > 0:
-            pct = v * 100.0 / m
-            if float(value).is_integer() and float(maximum).is_integer():
-                return f"{int(v)}/{int(m)} ({pct:.1f}%)"
-            return f"{v:.2f}/{m:.2f} ({pct:.1f}%)"
-    except Exception:
-        pass
-
-    if value is not None and maximum is not None:
-        return f"{value}/{maximum}"
-    if value is not None:
-        return str(value)
-    return ""
-
-
-def wait_history_ws(
-    prompt_id: str,
-    client_id: str,
-    workflow: Dict[str, Any],
-    comfy_url: str,
-    report_seconds: float = 5.0,
-) -> Dict[str, Any]:
-    ws_url = comfy_ws_url(comfy_url, client_id)
-    history_url = comfy_url.rstrip("/") + f"/history/{prompt_id}"
-
-    start = time.perf_counter()
-    last_report = 0.0
-    current_node: Optional[str] = None
-    current_node_start: Optional[float] = None
-    node_start_by_id: Dict[str, float] = {}
-    current_progress = ""
-    last_node_label = ""
-    finished_by_ws = False
-
-    ws = websocket.WebSocket()
-    ws.connect(ws_url, timeout=60)
-
-    try:
-        while True:
-            elapsed = time.perf_counter() - start
-
-            try:
-                raw = ws.recv()
-            except websocket.WebSocketTimeoutException:
-                raw = None
-
-            if raw:
-                if isinstance(raw, bytes):
-                    # Binary preview data can be sent by ComfyUI; ignore it for progress logging.
-                    pass
-                else:
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        msg = {}
-
-                    msg_type = msg.get("type")
-                    data = msg.get("data", {})
-                    if not isinstance(data, dict):
-                        data = {}
-
-                    msg_prompt_id = data.get("prompt_id")
-                    if msg_prompt_id and msg_prompt_id != prompt_id:
-                        continue
-
-                    if msg_type == "execution_start":
-                        log_comfy(f"execution started prompt_id={prompt_id}", workflow_start=start)
-
-                    elif msg_type == "executing":
-                        node = data.get("node")
-                        if node is None:
-                            # ComfyUI commonly sends node=None when the prompt is done.
-                            finished_by_ws = True
-                            break
-
-                        current_node = str(node)
-                        current_node_start = time.perf_counter()
-                        node_start_by_id[current_node] = current_node_start
-                        current_progress = ""
-                        node_label = workflow_node_label(workflow, current_node)
-                        if node_label != last_node_label:
-                            last_node_label = node_label
-                            log_comfy(f"node: {node_label}", workflow_start=start)
-
-                    elif msg_type == "progress":
-                        current_progress = format_progress(data.get("value"), data.get("max"))
-
-                    elif msg_type == "executed":
-                        node = data.get("node")
-                        if node is not None:
-                            node_id = str(node)
-                            log_comfy(
-                                f"executed: {workflow_node_label(workflow, node_id)}",
-                                workflow_start=start,
-                                node_start=node_start_by_id.get(node_id),
-                            )
-
-                    elif msg_type == "execution_error":
-                        node = data.get("node_id") or data.get("node")
-                        message = data.get("exception_message") or data.get("message") or ""
-                        log_comfy(
-                            f"execution error at {workflow_node_label(workflow, str(node) if node is not None else None)}: {message}",
-                            workflow_start=start,
-                            node_start=current_node_start,
-                        )
-                        finished_by_ws = True
-                        break
-
-                    elif msg_type in {"execution_success", "execution_cached"}:
-                        # Wait for history below; this event only tells us execution state.
-                        pass
-
-            elapsed = time.perf_counter() - start
-            if elapsed - last_report >= report_seconds:
-                last_report = elapsed
-                node_label = workflow_node_label(workflow, current_node)
-                if current_progress:
-                    log_comfy(f"running... | {node_label} | progress {current_progress}", workflow_start=start, node_start=current_node_start)
-                else:
-                    log_comfy(f"running... | {node_label}", workflow_start=start, node_start=current_node_start)
-
-            if finished_by_ws:
-                break
-
-        # After websocket completion/error signal, fetch authoritative history.
-        deadline = time.perf_counter() + 60.0
-        while True:
-            r = requests.get(history_url, timeout=60)
-            r.raise_for_status()
-            h = r.json()
-            if prompt_id in h:
-                elapsed = time.perf_counter() - start
-                log_comfy(f"finished after {fmt_elapsed(elapsed)}", workflow_start=start)
-                return h[prompt_id]
-
-            if time.perf_counter() > deadline:
-                raise RuntimeError(f"ComfyUI history did not appear for prompt_id={prompt_id}")
-
-            time.sleep(0.5)
-
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
-
-def wait_history(
-    prompt_id: str,
-    comfy_url: str,
-    workflow: Dict[str, Any],
-    client_id: str,
-) -> Dict[str, Any]:
-    return wait_history_ws(prompt_id, client_id, workflow, comfy_url)
-
-
-def check_history_status(history_item: Dict[str, Any], debug_path: Path) -> None:
-    debug_path.parent.mkdir(parents=True, exist_ok=True)
-    debug_path.write_text(json.dumps(history_item, ensure_ascii=False, indent=2), encoding="utf-8")
-    status = history_item.get("status", {})
-    status_str = status.get("status_str")
-    if status_str and status_str != "success":
-        raise RuntimeError(
-            "ComfyUI prompt did not finish successfully.\n"
-            f"status={status_str}\n"
-            f"Debug history saved to: {debug_path}\n"
-            f"messages={json.dumps(status.get('messages', []), ensure_ascii=False)[:3000]}"
-        )
-
-
-def history_files(history_item: Dict[str, Any]) -> List[str]:
-    files: List[str] = []
-    for _, out in history_item.get("outputs", {}).items():
-        for key in ("videos", "gifs", "images", "audio", "files"):
-            items = out.get(key)
-            if not items:
-                continue
-            if isinstance(items, dict):
-                items = [items]
-            for item in items:
-                if isinstance(item, dict) and item.get("filename"):
-                    sub = item.get("subfolder") or ""
-                    rel = str(Path(sub) / item["filename"]) if sub else item["filename"]
-                    files.append(rel)
-    return files
-
-
-
-def find_result_file(
-    history_item: Dict[str, Any],
-    output_dir: Path,
-    expected_subdir: str,
-    prefix: str,
-    suffixes: set[str],
-) -> Optional[Path]:
-    expected_subdir_norm = expected_subdir.replace("\\", "/").strip("/")
-
-    for rel in history_files(history_item):
-        rel_norm = rel.replace("\\", "/").strip("/")
-        p = output_dir / rel
-        if not p.exists() or p.suffix.lower() not in suffixes:
-            continue
-        if not p.name.lower().startswith(prefix):
-            continue
-        if expected_subdir_norm and not rel_norm.startswith(expected_subdir_norm + "/") and rel_norm != expected_subdir_norm:
-            continue
-        return p
-
-    expected_dir = output_dir / expected_subdir
-    found: List[Path] = []
-    for suffix in suffixes:
-        found.extend(expected_dir.glob(f"{prefix}*{suffix}"))
-        found.extend(expected_dir.glob(f"*{suffix}"))
-    found = [p for p in found if p.is_file() and p.suffix.lower() in suffixes]
-    if found:
-        return max(found, key=lambda p: p.stat().st_mtime)
-    return None
 
 
 def ffprobe_duration(path: Path, ffprobe_bin: str) -> float:
@@ -809,7 +399,7 @@ def run_cmd(cmd: List[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-APOSTROPHE_CHARS = "'’‘ʼ`´"
+APOSTROPHE_CHARS = "'â€™â€˜Ê¼`Â´"
 WORD_JOIN_CHARS = "-" + APOSTROPHE_CHARS
 
 
@@ -823,13 +413,11 @@ def norm_word(s: str) -> str:
 
 def lyric_words(text: str) -> List[str]:
     # Keep contractions as a single display token. Stable-ts often returns
-    # words such as should’ve / shouldn’t as one word; splitting lyrics on
+    # words such as shouldâ€™ve / shouldnâ€™t as one word; splitting lyrics on
     # curly apostrophes made subtitles render them as "should ve".
     joiners = re.escape(WORD_JOIN_CHARS)
     pattern = rf"\w+(?:[{joiners}]\w+)*"
     return [w for w in re.findall(pattern, text, flags=re.U) if norm_word(w)]
-
-
 
 
 LYRICS_SEPARATOR_SPLIT_RE = re.compile(
@@ -988,7 +576,6 @@ def words_are_match(a: str, b: str, base_threshold: float) -> Tuple[bool, float,
     return False, sim, "mismatch"
 
 
-
 def next_lyric_line_words(verse_line_words: List[List[List[str]]], verse_index: int, line_index: int) -> List[str]:
     """Return the next actual lyric line after a block/line, skipping non-lyrical blocks."""
     current_lines = verse_line_words[verse_index] if 0 <= verse_index < len(verse_line_words) else []
@@ -1061,7 +648,6 @@ def synthesize_word_timing(
         "synthetic_timing": True,
         "similarity": 0.0,
     }
-
 
 
 def analyze_matched_line_timing(
@@ -1997,7 +1583,6 @@ def repair_uncertain_terminal_lines_before_nonlyrical_blocks(
         }
 
 
-
 def repair_final_song_word_release_before_terminal_nonlyrical_tail(
     verses: List[Dict[str, Any]],
 ) -> None:
@@ -2181,7 +1766,6 @@ def refresh_line_and_verse_bounds(verses: List[Dict[str, Any]]) -> None:
 
 def actual_word_duration(word: Dict[str, Any]) -> float:
     return max(0.0, float(word.get("end", 0.0)) - float(word.get("start", 0.0)))
-
 
 
 def line_timing_bounds_from_words(words: List[Dict[str, Any]], default_start: float = 0.0) -> Tuple[float, float]:
@@ -3117,12 +2701,11 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         override = load_json(override_path)
         if not isinstance(override, dict):
             raise RuntimeError(f"Config override must be a JSON object: {override_path}")
-        config.update(override)
+        config = merge_config(config, override)
         source = str(override_path)
 
     required = {
-        "comfy_url": str,
-        "comfy_output_dir": str,
+
         "video_width": int,
         "video_height": int,
         "video_fps": int,
@@ -3139,8 +2722,9 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         "alignment_match_similarity_threshold": (int, float),
         "alignment_match_warn_ratio": (int, float),
         "alignment_match_max_extra_ratio": (int, float),
-        "llm_max_ctx": int,
-        "llm_max_length": int,
+        "llm_generation": dict,
+        "image_generation": dict,
+        "video_generation": dict,
     }
 
     for key, expected_type in required.items():
@@ -3149,14 +2733,15 @@ def load_config(input_dir: Path, data_dir: Path) -> Dict[str, Any]:
         if not isinstance(config[key], expected_type):
             raise RuntimeError(f"Bad config key {key}: expected {expected_type}, got {type(config[key]).__name__}")
 
-    config["comfy_url"] = str(config["comfy_url"])
-    config["comfy_output_dir"] = str(config["comfy_output_dir"])
+    for key in ("image_generation", "video_generation", "llm_generation"):
+        template = config[key].get("template")
+        if not isinstance(template, str) or not template:
+            raise RuntimeError(f"{key}.template must name a generation template")
+
     config["video_width"] = int(config["video_width"])
     config["video_height"] = int(config["video_height"])
     config["video_fps"] = int(config["video_fps"])
     config["clip_duration_tolerance_ratio"] = float(config["clip_duration_tolerance_ratio"])
-    config["llm_max_ctx"] = max(1024, int(config["llm_max_ctx"]))
-    config["llm_max_length"] = max(128, int(config["llm_max_length"]))
     config["min_workflow_seconds"] = float(config["min_workflow_seconds"])
     config["recommended_workflow_seconds"] = float(config["recommended_workflow_seconds"])
     config["max_workflow_seconds"] = float(config["max_workflow_seconds"])
@@ -3393,7 +2978,6 @@ def extract_json_words(data: Any) -> List[Dict[str, Any]]:
     return words
 
 
-
 def run_stable_ts_alignment(
     input_dir: Path,
     out_dir: Path,
@@ -3436,7 +3020,6 @@ def run_stable_ts_alignment(
     if not out_json.exists():
         raise RuntimeError(f"stable-ts did not create alignment JSON: {out_json}")
     return out_json
-
 
 
 def build_verses_from_lrc_and_lyrics(
@@ -3711,8 +3294,6 @@ def resolve_command(candidates: List[Path], fallback: str) -> str:
     return found or fallback
 
 
-
-
 def resolve_config_path(path_value: str, script_dir: Path) -> Path:
     raw = str(path_value).strip()
     if not raw:
@@ -3824,8 +3405,7 @@ def build_karaoke_delay(duration: float) -> str:
     """
     if duration <= 0:
         return ""
-    return r"{\alpha&HFF&\k" + str(centiseconds(duration)) + "}​" + r"{\alpha&H00&}"
-
+    return r"{\alpha&HFF&\k" + str(centiseconds(duration)) + "}\u200b" + r"{\alpha&H00&}"
 
 
 def is_karaoke_timed_char(ch: str) -> bool:
@@ -3917,7 +3497,6 @@ def build_word_karaoke_line(
 
     line_duration = max(min_unit, float(line["end"]) - float(line["start"]))
     return build_char_karaoke_text(str(line["text"]), line_duration, min_unit)
-
 
 
 def parse_ass_styles_section(path: Path) -> Tuple[str, Dict[str, str]]:
@@ -4235,7 +3814,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             "karaoke_repeat_reset_constant_seconds": repeat_reset_seconds,
             "events": timing_report,
         })
-
 
 
 def ass_draw_rect(x: int, y: int, w: int, h: int, color: str, alpha: str = "&H00&") -> str:
@@ -4563,41 +4141,6 @@ def render_subtitle_preview(
     ])
 
 
-def apply_llm_workflow_config(
-    template: Dict[str, Any],
-    llm_max_ctx: int,
-    llm_max_length: int,
-) -> Dict[str, Any]:
-    """Apply config limits to the llama-cpp-vlm planner workflow.
-
-    data/config.json (or input/config.json override) remains the source of truth.
-    llm_max_ctx maps to the model loader's n_ctx, while llm_max_length maps to
-    the parameter node's max_tokens. Sampling settings remain in the workflow.
-    """
-    wf = json.loads(json.dumps(template))
-    patched_ctx_nodes: List[str] = []
-    patched_length_nodes: List[str] = []
-
-    for node_id, node in wf.items():
-        inputs = node.get("inputs") if isinstance(node, dict) else None
-        if not isinstance(inputs, dict):
-            continue
-
-        if "n_ctx" in inputs:
-            inputs["n_ctx"] = int(llm_max_ctx)
-            patched_ctx_nodes.append(str(node_id))
-
-        if "max_tokens" in inputs:
-            inputs["max_tokens"] = int(llm_max_length)
-            patched_length_nodes.append(str(node_id))
-
-    if not patched_ctx_nodes:
-        raise RuntimeError("LLM workflow config error: no workflow node exposes n_ctx")
-    if not patched_length_nodes:
-        raise RuntimeError("LLM workflow config error: no workflow node exposes max_tokens")
-    return wf
-
-
 def strip_llm_wrappers(text: str) -> str:
     """Remove common wrapper text around a JSON object without repairing JSON syntax."""
     cleaned = text.strip()
@@ -4674,46 +4217,8 @@ def build_planner_user_prompt(
     return prompt, template_name
 
 
-def patch_planner_workflow(
-    template: Dict[str, Any],
-    rules: Dict[str, str],
-    video_style: str,
-    song_context: Dict[str, Any],
-    local_context: str,
-    current_block: str,
-    plan_path: Path,
-    continuity: List[Dict[str, str]],
-    block_kind: str,
-    block_index: int,
-    request_path: Optional[Path] = None,
-) -> Dict[str, Any]:
-    wf = json.loads(json.dumps(template))
-    if "2" not in wf or "3" not in wf:
-        raise RuntimeError("Planner workflow must contain nodes 2=LLM planner and 3=PathSaveStringFile")
-
-    user_prompt, template_name = build_planner_user_prompt(
-        rules=rules,
-        video_style=video_style,
-        song_context=song_context,
-        local_context=local_context,
-        current_block=current_block,
-        continuity=continuity,
-        block_kind=block_kind,
-        block_index=block_index,
-    )
-
-    if request_path is not None:
-        save_prompt_debug(request_path, user_prompt)
-
-    planner_inputs = wf["2"].get("inputs", {})
-    planner_inputs["system_prompt"] = rules["block_planner_system.txt"]
-    planner_inputs["custom_prompt"] = user_prompt
-    wf["3"]["inputs"]["path"] = str(plan_path)
-    return wf
-
-
-def run_comfy_planner(
-    planner_template: Dict[str, Any],
+def run_visual_planner(
+    llm_generator,
     rules: Dict[str, str],
     video_style: str,
     song_context: Dict[str, Any],
@@ -4721,7 +4226,6 @@ def run_comfy_planner(
     current_block: str,
     index: int,
     block_kind: str,
-    comfy_url: str,
     plans_dir: Path,
     continuity: List[Dict[str, str]],
     plan_suffix: str = "",
@@ -4748,30 +4252,15 @@ def run_comfy_planner(
         "continuity": continuity[-5:],
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    log("  [stage] ComfyUI LLM planner")
-    free_comfy_memory(comfy_url, "before LLM planner", sleep_time=1.0)
-    wf = patch_planner_workflow(
-        planner_template,
-        rules,
-        video_style,
-        song_context,
-        local_context,
-        current_block,
-        raw_path,
-        continuity,
-        block_kind,
-        index,
-        request_path=request_path,
-    )
-    pid, client_id = queue_prompt(wf, comfy_url)
-    log(f"  [planner] prompt_id={pid}")
-    h = wait_history(pid, comfy_url, wf, client_id)
-    check_history_status(h, plans_dir / f"{base_name}_history.json")
-
-    if not raw_path.exists():
-        raise RuntimeError(f"Planner did not write plan file: {raw_path}")
-
-    raw_text = raw_path.read_text(encoding="utf-8").strip()
+    log("  [stage] LLM planner")
+    user_prompt, _ = build_planner_user_prompt(rules, video_style, song_context, local_context,
+                                               current_block, continuity, block_kind, index)
+    save_prompt_debug(request_path, user_prompt)
+    result = llm_generator.generate(LlmRequest(
+        system_prompt=rules["block_planner_system.txt"], prompt=user_prompt, seed=0,
+        response_path=raw_path, sub_dir=base_name, debug_dir=plans_dir,
+    ))
+    raw_text = result.text
     plan = extract_json_object(raw_text)
     required = ["scene_summary", "image_prompt", "video_prompt", "negative_prompt"]
     missing = [k for k in required if not str(plan.get(k, "")).strip()]
@@ -4786,7 +4275,6 @@ def run_comfy_planner(
     return parsed
 
 
-
 def build_song_context_prompt(rules: Dict[str, str], video_style: str, verses: List[Dict[str, Any]]) -> str:
     lyrics_text = "\n***\n".join(str(v.get("text", "")) for v in verses)
     return render_template(
@@ -4799,34 +4287,11 @@ def build_song_context_prompt(rules: Dict[str, str], video_style: str, verses: L
     )
 
 
-def patch_song_context_workflow(
-    template: Dict[str, Any],
-    rules: Dict[str, str],
-    video_style: str,
-    verses: List[Dict[str, Any]],
-    raw_path: Path,
-    request_path: Path,
-) -> Dict[str, Any]:
-    wf = json.loads(json.dumps(template))
-    if "2" not in wf or "3" not in wf:
-        raise RuntimeError("Planner workflow must contain nodes 2=LLM planner and 3=PathSaveStringFile")
-
-    prompt = build_song_context_prompt(rules, video_style, verses)
-    save_prompt_debug(request_path, prompt)
-
-    planner_inputs = wf["2"].get("inputs", {})
-    planner_inputs["system_prompt"] = rules["song_context_system.txt"]
-    planner_inputs["custom_prompt"] = prompt
-    wf["3"]["inputs"]["path"] = str(raw_path)
-    return wf
-
-
 def get_or_create_song_context(
-    planner_template: Dict[str, Any],
+    llm_generator,
     rules: Dict[str, str],
     video_style: str,
     verses: List[Dict[str, Any]],
-    comfy_url: str,
     plans_dir: Path,
 ) -> Dict[str, Any]:
     """Load cached song_context.json or build it when visual generation needs it."""
@@ -4836,7 +4301,9 @@ def get_or_create_song_context(
     response_json_path = plans_dir / "song_context_response.json"
     request_path = plans_dir / "song_context_request.txt"
 
-    if clean_path.exists():
+    generator_path = plans_dir / "song_context_generator.json"
+    same_generator = generator_path.exists() and load_json(generator_path).get("signature") == llm_generator.metadata()["signature"]
+    if clean_path.exists() and same_generator:
         log(f"[stage] use cached song context: {clean_path}")
         return load_json(clean_path)
 
@@ -4844,23 +4311,13 @@ def get_or_create_song_context(
     if raw_path.exists():
         raw_path.unlink()
 
-    wf = patch_song_context_workflow(
-        planner_template,
-        rules,
-        video_style,
-        verses,
-        raw_path,
-        request_path,
-    )
-    pid, client_id = queue_prompt(wf, comfy_url)
-    log(f"[song-context] prompt_id={pid}")
-    h = wait_history(pid, comfy_url, wf, client_id)
-    check_history_status(h, plans_dir / "song_context_history.json")
-
-    if not raw_path.exists():
-        raise RuntimeError(f"Song-context planner did not write file: {raw_path}")
-
-    raw_text = raw_path.read_text(encoding="utf-8").strip()
+    prompt = build_song_context_prompt(rules, video_style, verses)
+    save_prompt_debug(request_path, prompt)
+    result = llm_generator.generate(LlmRequest(
+        system_prompt=rules["song_context_system.txt"], prompt=prompt, seed=0,
+        response_path=raw_path, sub_dir="song_context", debug_dir=plans_dir,
+    ))
+    raw_text = result.text
     ctx = extract_json_object(raw_text)
     defaults = {
         "song_summary": "",
@@ -4922,9 +4379,7 @@ def build_instrumental_local_context(verses: List[Dict[str, Any]], previous_vers
     return "\n\n".join(parts)
 
 
-
-
-def comfy_block_part_subdir(run_id: str, block_index: int, sub_index: int) -> str:
+def generation_part_subdir(run_id: str, block_index: int, sub_index: int) -> str:
     return f"aligned_song/{run_id}/block_{block_index:03d}/part_{sub_index:03d}"
 
 
@@ -4940,34 +4395,6 @@ def extract_last_frame(video_path: Path, out_png: Path, ffmpeg: str) -> None:
     ])
     if not out_png.exists() or out_png.stat().st_size <= 0:
         raise RuntimeError(f"Failed to extract last frame: {out_png}")
-
-
-def upload_image_to_comfy(image_path: Path, comfy_url: str, subfolder: str) -> str:
-    if not image_path.exists():
-        raise FileNotFoundError(f"Image to upload not found: {image_path}")
-
-    with image_path.open("rb") as f:
-        r = requests.post(
-            comfy_url.rstrip("/") + "/upload/image",
-            files={"image": (image_path.name, f, "image/png")},
-            data={"subfolder": subfolder, "overwrite": "true", "type": "input"},
-            timeout=120,
-        )
-    try:
-        r.raise_for_status()
-    except Exception:
-        log("ComfyUI /upload/image error:")
-        log(r.text[:4000])
-        raise
-
-    data = r.json()
-    name = data.get("name") or image_path.name
-    returned_subfolder = data.get("subfolder")
-    if returned_subfolder:
-        return f"{returned_subfolder}/{name}".replace("\\", "/")
-    if subfolder:
-        return f"{subfolder}/{name}".replace("\\", "/")
-    return str(name)
 
 
 def timed_line_segments_for_block(block: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -5455,14 +4882,14 @@ def build_subrange_instruction(block: Dict[str, Any], subrange: Dict[str, Any], 
         )
     elif sub_text:
         subrange_section = (
-            "CURRENT SUBRANGE TEXT — HIGHEST FACTUAL PRIORITY:\n"
+            "CURRENT SUBRANGE TEXT \u2014 HIGHEST FACTUAL PRIORITY:\n"
             + sub_text
             + "\n\nDepict this current subrange as the main action. "
               "Use the full semantic range only for continuity and meaning."
         )
     else:
         subrange_section = (
-            "CURRENT SUBRANGE — HIGHEST FACTUAL PRIORITY:\n"
+            "CURRENT SUBRANGE \u2014 HIGHEST FACTUAL PRIORITY:\n"
             "No lyrics are sung in this subrange. Continue the visual motion of this semantic range."
         )
 
@@ -5492,77 +4919,6 @@ def concat_or_copy_subclips(subclips: List[Path], out_path: Path, ffmpeg: str) -
         shutil.copy2(subclips[0], out_path)
         return
     concat_videos(subclips, out_path, ffmpeg)
-
-
-def patch_image_workflow(
-    template: Dict[str, Any],
-    image_prompt: str,
-    block_index: int,
-    sub_index: int,
-    run_id: str,
-    image_seed: int,
-    config: Dict[str, Any],
-) -> Dict[str, Any]:
-    wf = json.loads(json.dumps(template))
-    width = int(config["video_width"])
-    height = int(config["video_height"])
-    segment_dir = comfy_block_part_subdir(run_id, block_index, sub_index)
-
-    wf[IMAGE_N["image_prompt"]]["inputs"]["text"] = image_prompt
-    wf[IMAGE_N["image_latent"]]["inputs"]["width"] = width
-    wf[IMAGE_N["image_latent"]]["inputs"]["height"] = height
-    wf[IMAGE_N["image_scheduler"]]["inputs"]["width"] = width
-    wf[IMAGE_N["image_scheduler"]]["inputs"]["height"] = height
-    wf[IMAGE_N["image_noise"]]["inputs"]["noise_seed"] = int(image_seed)
-    wf[IMAGE_N["image_save"]]["inputs"]["filename_prefix"] = f"{segment_dir}/start_image"
-    return wf
-
-
-def patch_video_from_image_workflow(
-    template: Dict[str, Any],
-    start_image_name: str,
-    visual_plan: Dict[str, str],
-    duration: float,
-    block_index: int,
-    sub_index: int,
-    run_id: str,
-    seeds: Dict[str, int],
-    config: Dict[str, Any],
-) -> Dict[str, Any]:
-    wf = json.loads(json.dumps(template))
-    width = int(config["video_width"])
-    height = int(config["video_height"])
-    fps = float(config["video_fps"])
-    recommended_seconds = float(config["recommended_workflow_seconds"])
-    max_seconds = float(config["max_workflow_seconds"])
-    seconds = max(0.001, float(duration))
-
-    if duration > max_seconds:
-        raise RuntimeError(
-            f"{format_range_id(block_index)} part {sub_index:03d} duration is {duration:.2f}s, "
-            f"but this video workflow hard-limits at {max_seconds:.2f}s."
-        )
-    if duration > recommended_seconds:
-        log(
-            f"  [warn] {format_range_id(block_index)} part {sub_index:03d} duration is {duration:.2f}s; "
-            f"workflow is optimized for <= {recommended_seconds:.2f}s and quality may degrade."
-        )
-
-    segment_dir = comfy_block_part_subdir(run_id, block_index, sub_index)
-
-    wf[VIDEO_N["start_image"]]["inputs"]["image"] = start_image_name
-    wf[VIDEO_N["video_prompt"]]["inputs"]["value"] = visual_plan["video_prompt"]
-    if VIDEO_N["video_negative"] in wf:
-        wf[VIDEO_N["video_negative"]]["inputs"]["text"] = visual_plan.get("negative_prompt", "")
-    wf[VIDEO_N["video_seconds"]]["inputs"]["value"] = seconds
-    wf[VIDEO_N["video_fps"]]["inputs"]["value"] = fps
-    wf[VIDEO_N["video_width"]]["inputs"]["value"] = width
-    wf[VIDEO_N["video_height"]]["inputs"]["value"] = height
-    wf[VIDEO_N["video_noise"]]["inputs"]["noise_seed"] = int(seeds["video_seed"])
-    wf[VIDEO_N["video_refine_noise"]]["inputs"]["noise_seed"] = int(seeds["video_refine_seed"])
-    wf[VIDEO_N["video_save"]]["inputs"]["filename_prefix"] = f"{segment_dir}/video"
-    return wf
-
 
 
 def get_audio_duration(path: Path, ffprobe: str) -> float:
@@ -6181,8 +5537,6 @@ def validate_unscaled_clip_for_timeline(
     return info
 
 
-
-
 def load_continuity_from_plans(plans_dir: Path, before_block_index: int) -> List[Dict[str, str]]:
     """Load previous saved scene summaries for visual continuity."""
     out: List[Dict[str, str]] = []
@@ -6332,7 +5686,6 @@ def write_alignment_match_report(verses: List[Dict[str, Any]], out_path: Path) -
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-
 def write_timeline_manifest(
     out_path: Path,
     output_root: Path,
@@ -6391,7 +5744,6 @@ def write_timeline_manifest(
     write_json(out_path, manifest)
 
 
-
 def write_preview_manifest(
     out_path: Path,
     output_root: Path,
@@ -6442,7 +5794,6 @@ def write_preview_manifest(
         "blocks": items,
     }
     write_json(out_path, manifest)
-
 
 
 def copy_file_if_exists(src_path: Path, dst_path: Path) -> None:
@@ -6513,7 +5864,6 @@ def write_range_debug_files(block: Dict[str, Any], subranges: List[Dict[str, Any
     return rdir
 
 
-
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate a ComfyUI music video from input-dir files.")
     ap.add_argument("--version", action="version", version=f"%(prog)s {RUNNER_BUILD_ID}")
@@ -6524,8 +5874,6 @@ def main() -> None:
     ap.add_argument("--rebuild-final", action="store_true", help="Do not generate video; reuse existing unscaled clips and rebuild scaled clips/final only.")
     ap.add_argument("--refresh-alignment", action="store_true", help="Invalidate alignment/matching/subtitle/preview caches; missing artifacts are recreated lazily.")
     ap.add_argument("--preview-subtitles-only", action="store_true", help="Reuse or lazily build karaoke subtitles and subtitle_preview.mp4, then stop before any ComfyUI LLM/image/video generation.")
-    ap.add_argument("--comfy-url", default=None, help="Override comfy_url from config.json.")
-    ap.add_argument("--comfy-output-dir", default=None, help="Override comfy_output_dir from config.json.")
     ap.add_argument("--lyrics-language", default="en", help="Language code for stable-ts alignment. Default: en.")
     args = ap.parse_args()
 
@@ -6574,20 +5922,18 @@ def main() -> None:
     config = load_config(input_dir, data_dir)
     width = int(config["video_width"])
     height = int(config["video_height"])
-    comfy_url = args.comfy_url or str(config["comfy_url"])
-    output_dir = Path(args.comfy_output_dir).resolve() if args.comfy_output_dir else resolve_config_path(str(config["comfy_output_dir"]), script_dir)
-    planner_template = apply_llm_workflow_config(
-        load_json(workflow_dir / "planner_visual_prompts_api.json"),
-        int(config["llm_max_ctx"]),
-        int(config["llm_max_length"]),
-    )
-    image_template = load_json(workflow_dir / "image_from_prompt_api.json")
-    video_template = load_json(workflow_dir / "video_from_image_api.json")
+    model_catalog = load_json(data_dir / "model_templates.json")
+    llm_generator = create_generator("llm", model_catalog, config, workflow_dir)
+    image_generator = create_generator("image", model_catalog, config, workflow_dir)
+    video_generator = create_generator("video", model_catalog, config, workflow_dir)
+    generation_settings = {"llm": llm_generator.metadata(), "image": image_generator.metadata(), "video": video_generator.metadata()}
+    write_json(debug_dir / "generation_settings.json", generation_settings)
+    log(f"[stage] LLM template: {llm_generator.name}")
+    log(f"[stage] image template: {image_generator.name}")
+    log(f"[stage] video template: {video_generator.name}")
+    if video_generator.full_sampling:
+        log("[warn] LTX uses unaccelerated sampling; this recipe requires visual validation")
     write_json(debug_dir / "config_used.json", config)
-    log(f"[stage] comfy url : {comfy_url}")
-    log(f"[stage] comfy out : {output_dir}")
-    log(f"[stage] llm max ctx: {int(config['llm_max_ctx'])}")
-    log(f"[stage] llm max length: {int(config['llm_max_length'])}")
     block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
     block_start_images = scan_block_start_images(input_dir)
 
@@ -6822,11 +6168,10 @@ def main() -> None:
     if blocks_to_generate:
         stats_start(stats, "song_context")
         song_context = get_or_create_song_context(
-            planner_template,
+            llm_generator,
             rules,
             video_style,
             verses,
-            comfy_url,
             plans_dir,
         )
         write_json(debug_dir / "song_context_used.json", {
@@ -6859,11 +6204,18 @@ def main() -> None:
                     "Run full generation first, or include this block in --rework."
                 )
             log(f"  [stage] reuse unscaled clip: {unscaled_clip}")
+            generation_record = unscaled_clip.with_suffix(".generation.json")
+            if not generation_record.exists():
+                raise FileNotFoundError(f"Generation metadata required for reuse: {generation_record}. Regenerate this range with --rework.")
+            reused_settings = load_json(generation_record)
+            if any(reused_settings.get(k, {}).get("signature") != generation_settings[k]["signature"] for k in ("llm", "image", "video")):
+                log("  [warn] reused clip has different generator settings; include this range in --rework to apply the new template")
             generation_info[block_i] = {
                 "run_id": run_id,
                 "segment_subdir": None,
                 "seeds": None,
                 "generated_in_this_run": False,
+                "generation_settings": reused_settings,
             }
             clips_reused += 1
             continue
@@ -6904,7 +6256,7 @@ def main() -> None:
             # There is deliberately no duplicated sub_index/sub_count state in
             # the subrange object itself.
             sub_duration = max(0.1, float(subrange["duration"]))
-            sub_dir = comfy_block_part_subdir(run_id, block_i, sub_i)
+            sub_dir = generation_part_subdir(run_id, block_i, sub_i)
             plan_suffix = f"_part_{sub_i:03d}"
             plan_base_name = f"plan_{block_i:03d}{plan_suffix}"
 
@@ -6927,8 +6279,8 @@ def main() -> None:
                 "continuity": part_continuity[-5:],
             })
 
-            plan = run_comfy_planner(
-                planner_template,
+            plan = run_visual_planner(
+                llm_generator,
                 rules,
                 block_video_style,
                 song_context,
@@ -6936,7 +6288,6 @@ def main() -> None:
                 current_instruction,
                 block_i,
                 kind,
-                comfy_url,
                 plans_dir,
                 part_continuity,
                 plan_suffix=plan_suffix,
@@ -6959,24 +6310,12 @@ def main() -> None:
                 shutil.copy2(image_path, start_image_local)
             elif sub_i == 0:
                 log("  [stage] queue start image")
-                free_comfy_memory(comfy_url, "before image generation", sleep_time=1.0)
-                iwf = patch_image_workflow(
-                    image_template,
-                    plan["image_prompt"],
-                    block_i,
-                    sub_i,
-                    run_id,
-                    seeds["image_seed"],
-                    config,
-                )
-                write_json(part_debug_dir / "image_patched.json", iwf)
-                pid, client_id = queue_prompt(iwf, comfy_url)
-                log(f"  [image] prompt_id={pid}")
-                ih = wait_history(pid, comfy_url, iwf, client_id)
-                check_history_status(ih, part_debug_dir / "image_history.json")
-                image_path = find_result_file(ih, output_dir, sub_dir, "start_image", {".png", ".jpg", ".jpeg", ".webp"})
-                if not image_path:
-                    raise RuntimeError(f"Start image result not found for {format_range_id(block_i)} part {sub_i:03d}")
+                image_result = image_generator.generate(ImageRequest(
+                    prompt=plan["image_prompt"], seed=seeds["image_seed"],
+                    output_prefix=f"{sub_dir}/start_image", sub_dir=sub_dir, debug_dir=part_debug_dir,
+                ))
+                image_path = image_result.path
+                write_json(part_debug_dir / "image_generator.json", image_result.metadata)
                 shutil.copy2(image_path, start_image_local)
             else:
                 if previous_subclip is None:
@@ -6984,36 +6323,20 @@ def main() -> None:
                 log("  [stage] extract previous last frame as next start image")
                 extract_last_frame(previous_subclip, start_image_local, ffmpeg_cmd)
 
-            comfy_input_name = upload_image_to_comfy(
-                start_image_local,
-                comfy_url,
-                f"aligned_song_inputs/{run_id}/block_{block_i:03d}",
-            )
-
             log("  [stage] patch video-from-image workflow")
             log(f"  [seeds] image={seeds['image_seed']} video={seeds['video_seed']} refine={seeds['video_refine_seed']}")
-            vwf = patch_video_from_image_workflow(
-                video_template,
-                comfy_input_name,
-                plan,
-                sub_duration,
-                block_i,
-                sub_i,
-                run_id,
-                seeds,
-                config,
-            )
-            write_json(part_debug_dir / "video_patched.json", vwf)
-
-            log("  [stage] queue video")
-            free_comfy_memory(comfy_url, "before video generation", sleep_time=1.0)
-            pid, client_id = queue_prompt(vwf, comfy_url)
-            log(f"  [video] prompt_id={pid}")
-            vh = wait_history(pid, comfy_url, vwf, client_id)
-            check_history_status(vh, part_debug_dir / "video_history.json")
-            video_path = find_result_file(vh, output_dir, sub_dir, "video", {".mp4", ".mov", ".webm", ".mkv"})
-            if not video_path:
-                raise RuntimeError(f"Video result not found for {format_range_id(block_i)} part {sub_i:03d}")
+            if sub_duration > float(config["max_workflow_seconds"]):
+                raise RuntimeError(f"{format_range_id(block_i)} part {sub_i:03d} exceeds max_workflow_seconds")
+            if sub_duration > float(config["recommended_workflow_seconds"]):
+                log(f"  [warn] subrange exceeds recommended_workflow_seconds: {sub_duration:.2f}s")
+            video_result = video_generator.generate(VideoRequest(
+                start_image=start_image_local, prompt=plan["video_prompt"],
+                negative_prompt=plan.get("negative_prompt", ""), seconds=sub_duration,
+                seed=seeds["video_seed"], refine_seed=seeds["video_refine_seed"],
+                output_prefix=f"{sub_dir}/video", sub_dir=sub_dir, debug_dir=part_debug_dir,
+            ))
+            video_path = video_result.path
+            write_json(part_debug_dir / "video_generator.json", video_result.metadata)
 
             raw_part = block_subclips_raw_dir / f"part_{sub_i:03d}{video_path.suffix}"
             shutil.copy2(video_path, raw_part)
@@ -7032,6 +6355,7 @@ def main() -> None:
             })
 
             subrange_info = {
+                "generation_settings": generation_settings,
                 "subrange_index": sub_i,
                 "subrange_count": sub_count,
                 "start": float(subrange["start"]),
@@ -7040,7 +6364,7 @@ def main() -> None:
                 "text": str(subrange.get("text", "")),
                 "text_mode": str(subrange.get("text_mode", "")),
                 "scene_summary": scene_summary,
-                "comfy_subdir": sub_dir,
+                "generation_subdir": sub_dir,
                 "start_image": str(start_image_local.relative_to(output_root)) if start_image_local.is_relative_to(output_root) else str(start_image_local),
                 "last_frame": str(last_frame_local.relative_to(output_root)) if last_frame_local.is_relative_to(output_root) else str(last_frame_local),
                 "subclip": str(subclip_local.relative_to(output_root)) if subclip_local.is_relative_to(output_root) else str(subclip_local),
@@ -7052,6 +6376,7 @@ def main() -> None:
 
         log("  [stage] assemble unscaled semantic clip from generated subclips")
         concat_or_copy_subclips(subclip_paths, unscaled_clip, ffmpeg_cmd)
+        write_json(unscaled_clip.with_suffix(".generation.json"), generation_settings)
         scene_summary = " / ".join(x.get("scene_summary", "") for x in subrange_infos if x.get("scene_summary"))
         if not scene_summary:
             scene_summary = f"{format_range_id(block_i)}, rendered as {len(subrange_infos)} internal subrange(s)"
@@ -7077,6 +6402,7 @@ def main() -> None:
             "run_id": run_id,
             "segment_subdir": f"aligned_song/{run_id}/block_{block_i:03d}",
             "generated_in_this_run": True,
+            "generation_settings": generation_settings,
             "range_debug": relpath_or_abs(range_dir, output_root),
             "unscaled_clip": relpath_or_abs(unscaled_clip, output_root),
             "subranges": subrange_infos,

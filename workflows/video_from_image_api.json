@@ -218,7 +218,7 @@
     "inputs": {
       "cfg": 1,
       "model": [
-        "294",
+        "269",
         0
       ],
       "positive": [
@@ -343,20 +343,6 @@
     "class_type": "Any Switch (rgthree)",
     "_meta": {
       "title": "Switch Latent"
-    }
-  },
-  "294": {
-    "inputs": {
-      "lora_name": "ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors",
-      "strength_model": 0.7,
-      "model": [
-        "269",
-        0
-      ]
-    },
-    "class_type": "LoraLoaderModelOnly",
-    "_meta": {
-      "title": "Load LoRA"
     }
   },
   "297": {
@@ -615,7 +601,7 @@
         0
       ],
       "model": [
-        "349",
+        "269",
         0
       ],
       "positive": [
@@ -686,20 +672,6 @@
     "class_type": "DualCLIPLoader",
     "_meta": {
       "title": "DualCLIPLoader"
-    }
-  },
-  "349": {
-    "inputs": {
-      "lora_name": "ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors",
-      "strength_model": 0.7,
-      "model": [
-        "269",
-        0
-      ]
-    },
-    "class_type": "LoraLoaderModelOnly",
-    "_meta": {
-      "title": "Load LoRA"
     }
   },
   "362": {

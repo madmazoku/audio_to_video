@@ -1,0 +1,149 @@
+{
+  "image_generation": {
+    "flux2_dev_current": {
+      "type": "flux2",
+      "workflow": "image_from_prompt_api.json",
+      "checkpoint": "flux2_dev_fp8mixed.safetensors",
+      "text_encoder": "mistral_3_small_flux2_bf16.safetensors",
+      "vae": "full_encoder_small_decoder.safetensors",
+      "loras": [],
+      "steps": 30,
+      "guidance": 3.5,
+      "sampler": "euler",
+      "sampling": "standard"
+    },
+    "flux2_dev_full_vae": {
+      "type": "flux2",
+      "workflow": "image_from_prompt_api.json",
+      "checkpoint": "flux2_dev_fp8mixed.safetensors",
+      "text_encoder": "mistral_3_small_flux2_bf16.safetensors",
+      "vae": "flux2-vae.safetensors",
+      "loras": [],
+      "steps": 30,
+      "guidance": 3.5,
+      "sampler": "euler",
+      "sampling": "standard"
+    },
+    "flux2_dev_turbo": {
+      "type": "flux2",
+      "workflow": "image_from_prompt_api.json",
+      "checkpoint": "flux2_dev_fp8mixed.safetensors",
+      "text_encoder": "mistral_3_small_flux2_bf16.safetensors",
+      "vae": "full_encoder_small_decoder.safetensors",
+      "loras": [
+        {
+          "name": "Flux_2-Turbo-LoRA_comfyui.safetensors",
+          "weight": 1.0,
+          "role": "acceleration"
+        }
+      ],
+      "steps": 8,
+      "guidance": 2.5,
+      "sampler": "euler",
+      "sampling": "turbo",
+      "sigmas": [
+        1.0,
+        0.6509,
+        0.4374,
+        0.2932,
+        0.1893,
+        0.1108,
+        0.0495,
+        0.00031,
+        0.0
+      ]
+    }
+  },
+  "video_generation": {
+    "ltx23_current": {
+      "type": "ltx",
+      "workflow": "video_from_image_api.json",
+      "checkpoint": "ltx-2.3-22b-dev.safetensors",
+      "text_encoder": "gemma_3_12B_it.safetensors",
+      "text_encoder_projection": "ltx-2-3-22b-text_encoder.safetensors",
+      "vae": "ltx-2-3-22b-VAE.safetensors",
+      "audio_vae": "ltx-2-3-22b-audio_vae.safetensors",
+      "upscaler": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+      "loras": [
+        {
+          "name": "ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors",
+          "weight": 0.7,
+          "role": "acceleration"
+        }
+      ],
+      "steps": 25,
+      "cfg": 1,
+      "refine_cfg": 1,
+      "sampler": "euler_ancestral",
+      "refine_sampler": "gradient_estimation",
+      "refine_sigmas": "0.909375, 0.725, 0.421875, 0.0",
+      "sampling": "distilled"
+    },
+    "ltx23_fp8": {
+      "type": "ltx",
+      "workflow": "video_from_image_api.json",
+      "checkpoint": "ltx-2.3-22b-dev-fp8.safetensors",
+      "text_encoder": "gemma_3_12B_it.safetensors",
+      "text_encoder_projection": "ltx-2-3-22b-text_encoder.safetensors",
+      "vae": "ltx-2-3-22b-VAE.safetensors",
+      "audio_vae": "ltx-2-3-22b-audio_vae.safetensors",
+      "upscaler": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+      "loras": [
+        {
+          "name": "ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors",
+          "weight": 0.7,
+          "role": "acceleration"
+        }
+      ],
+      "steps": 25,
+      "cfg": 1,
+      "refine_cfg": 1,
+      "sampler": "euler_ancestral",
+      "refine_sampler": "gradient_estimation",
+      "refine_sigmas": "0.909375, 0.725, 0.421875, 0.0",
+      "sampling": "distilled"
+    },
+    "ltx23_unaccelerated": {
+      "type": "ltx",
+      "workflow": "video_from_image_api.json",
+      "checkpoint": "ltx-2.3-22b-dev.safetensors",
+      "text_encoder": "gemma_3_12B_it.safetensors",
+      "text_encoder_projection": "ltx-2-3-22b-text_encoder.safetensors",
+      "vae": "ltx-2-3-22b-VAE.safetensors",
+      "audio_vae": "ltx-2-3-22b-audio_vae.safetensors",
+      "upscaler": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+      "loras": [],
+      "steps": 30,
+      "cfg": 3.0,
+      "refine_cfg": 3.0,
+      "sampler": "euler",
+      "refine_sampler": "euler",
+      "refine_sigmas": "0.909375, 0.725, 0.421875, 0.0",
+      "sampling": "full",
+      "refine_steps": 12
+    }
+  },
+  "llm_generation": {
+    "qwen25_14b_current": {
+      "type": "llama_cpp",
+      "workflow": "planner_visual_prompts_api.json",
+      "checkpoint": "Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+      "n_ctx": 12288,
+      "max_tokens": 4096,
+      "parameters": {
+        "top_k": 40,
+        "top_p": 0.9,
+        "min_p": 0.05,
+        "typical_p": 1.0,
+        "temperature": 0.18,
+        "repeat_penalty": 1.1,
+        "frequency_penalty": 0.0,
+        "present_penalty": 0.0,
+        "mirostat_mode": 0,
+        "mirostat_eta": 0.1,
+        "mirostat_tau": 5.0,
+        "state_uid": -1
+      }
+    }
+  }
+}
