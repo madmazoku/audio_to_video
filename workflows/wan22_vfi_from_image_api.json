@@ -1,0 +1,208 @@
+{
+  "clip_loader": {
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader"
+  },
+  "vae_loader": {
+    "inputs": {
+      "vae_name": "wan_2.1_vae.safetensors"
+    },
+    "class_type": "VAELoader"
+  },
+  "unet_high": {
+    "inputs": {
+      "unet_name": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader"
+  },
+  "unet_low": {
+    "inputs": {
+      "unet_name": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader"
+  },
+  "sampling_high": {
+    "inputs": {
+      "model": [
+        "unet_high",
+        0
+      ],
+      "shift": 5.0
+    },
+    "class_type": "ModelSamplingSD3"
+  },
+  "sampling_low": {
+    "inputs": {
+      "model": [
+        "unet_low",
+        0
+      ],
+      "shift": 5.0
+    },
+    "class_type": "ModelSamplingSD3"
+  },
+  "start_image": {
+    "inputs": {
+      "image": "__START_IMAGE__"
+    },
+    "class_type": "LoadImage"
+  },
+  "positive_cond": {
+    "inputs": {
+      "clip": [
+        "clip_loader",
+        0
+      ],
+      "text": "__PROMPT__"
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "negative_cond": {
+    "inputs": {
+      "clip": [
+        "clip_loader",
+        0
+      ],
+      "text": ""
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "wan_i2v": {
+    "inputs": {
+      "positive": [
+        "positive_cond",
+        0
+      ],
+      "negative": [
+        "negative_cond",
+        0
+      ],
+      "vae": [
+        "vae_loader",
+        0
+      ],
+      "start_image": [
+        "start_image",
+        0
+      ],
+      "width": 832,
+      "height": 480,
+      "length": 81,
+      "batch_size": 1
+    },
+    "class_type": "WanImageToVideo"
+  },
+  "sampler_stage1": {
+    "inputs": {
+      "model": [
+        "sampling_high",
+        0
+      ],
+      "positive": [
+        "wan_i2v",
+        0
+      ],
+      "negative": [
+        "wan_i2v",
+        1
+      ],
+      "latent_image": [
+        "wan_i2v",
+        2
+      ],
+      "add_noise": "enable",
+      "noise_seed": 0,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 0,
+      "end_at_step": 2,
+      "return_with_leftover_noise": "enable"
+    },
+    "class_type": "KSamplerAdvanced"
+  },
+  "sampler_stage2": {
+    "inputs": {
+      "model": [
+        "sampling_low",
+        0
+      ],
+      "positive": [
+        "wan_i2v",
+        0
+      ],
+      "negative": [
+        "wan_i2v",
+        1
+      ],
+      "latent_image": [
+        "sampler_stage1",
+        0
+      ],
+      "add_noise": "disable",
+      "noise_seed": 0,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 2,
+      "end_at_step": 4,
+      "return_with_leftover_noise": "disable"
+    },
+    "class_type": "KSamplerAdvanced"
+  },
+  "vae_decode": {
+    "inputs": {
+      "samples": [
+        "sampler_stage2",
+        0
+      ],
+      "vae": [
+        "vae_loader",
+        0
+      ]
+    },
+    "class_type": "VAEDecode"
+  },
+  "create_video": {
+    "inputs": {
+      "images": [
+        "vfi",
+        0
+      ],
+      "fps": 16
+    },
+    "class_type": "CreateVideo"
+  },
+  "save_video": {
+    "inputs": {
+      "video": [
+        "create_video",
+        0
+      ],
+      "filename_prefix": "__OUTPUT_PREFIX__",
+      "format": "mp4",
+      "codec": "h264"
+    },
+    "class_type": "SaveVideo"
+  },
+  "vfi": {
+    "class_type": "FILM VFI",
+    "inputs": {
+      "frames": [
+        "vae_decode",
+        0
+      ],
+      "ckpt_name": "film_net_fp32.pt",
+      "multiplier": 2,
+      "clear_cache_after_n_frames": 10
+    }
+  }
+}

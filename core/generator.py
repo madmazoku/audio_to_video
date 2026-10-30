@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .comfyui import ComfyUIClient
+from .automatic1111 import Automatic1111Client
 
 
 def merge_config(base: dict, override: dict) -> dict:
@@ -32,6 +33,7 @@ class GenerationRequest:
 @dataclass(frozen=True, kw_only=True)
 class ImageRequest(GenerationRequest):
     output_prefix: str
+    negative_prompt: str = ""
     width: int | None = None
     height: int | None = None
 
@@ -257,6 +259,257 @@ class Flux2Generator(ComfyUIGenerator):
         return graph
 
 
+class Flux1Generator(ComfyUIGenerator):
+    kind = "image"
+    extensions = {".png", ".jpg", ".jpeg", ".webp"}
+
+    def validate_settings(self) -> None:
+        super().validate_settings()
+        for key in ("text_encoder_2", "sampler", "scheduler"):
+            if not isinstance(self.settings.get(key), str) or not self.settings[key]:
+                raise ValueError(f"FLUX1 requires {key}")
+        number(self.settings.get("steps"), "steps", 1)
+        if not isinstance(self.settings["steps"], int):
+            raise ValueError("steps must be an integer")
+        number(self.settings.get("guidance"), "guidance", 0)
+        number(self.settings.get("cfg"), "cfg", 0)
+
+    def configure(self, graph: dict) -> dict:
+        s = self.settings
+        for node, cls, key, value in (
+            ("unet_loader", "UNETLoader", "unet_name", s["checkpoint"]),
+            ("clip_loader", "DualCLIPLoader", "clip_name1", s["text_encoder"]),
+            ("clip_loader", "DualCLIPLoader", "clip_name2", s["text_encoder_2"]),
+            ("vae_loader", "VAELoader", "vae_name", s["vae"]),
+            ("guidance", "FluxGuidance", "guidance", s["guidance"]),
+            ("ksampler", "KSampler", "steps", s["steps"]),
+            ("ksampler", "KSampler", "cfg", s["cfg"]),
+            ("ksampler", "KSampler", "sampler_name", s["sampler"]),
+            ("ksampler", "KSampler", "scheduler", s["scheduler"]),
+            ("empty_latent", "EmptySD3LatentImage", "width", s["width"]),
+            ("empty_latent", "EmptySD3LatentImage", "height", s["height"]),
+        ):
+            self.field(graph, node, cls, key, value)
+        model, clip = ["unet_loader", 0], ["clip_loader", 0]
+        for i, lora in enumerate(s["loras"]):
+            node_id = f"generation_lora_{i}"
+            if node_id in graph:
+                raise ValueError(f"LoRA node ID collision: {node_id}")
+            graph[node_id] = {"class_type": "LoraLoader", "inputs": {
+                "model": model, "clip": clip, "lora_name": lora["name"],
+                "strength_model": lora["weight"], "strength_clip": lora["weight"]}}
+            model, clip = [node_id, 0], [node_id, 1]
+        self.field(graph, "ksampler", "KSampler", "model", model)
+        self.field(graph, "positive_text", "CLIPTextEncode", "clip", clip)
+        return graph
+
+    def build_workflow(self, request: ImageRequest) -> dict:
+        graph = deepcopy(self.configured_graph)
+        for key in ("width", "height"):
+            value = self.settings[key] if getattr(request, key) is None else getattr(request, key)
+            number(value, key, 1)
+            if not isinstance(value, int) or value % 16:
+                raise ValueError(f"FLUX1 {key} must be an integer divisible by 16")
+            self.field(graph, "empty_latent", "EmptySD3LatentImage", key, value)
+        self.field(graph, "positive_text", "CLIPTextEncode", "text", request.prompt)
+        self.field(graph, "ksampler", "KSampler", "seed", request.seed)
+        self.field(graph, "save_image", "SaveImage", "filename_prefix", request.output_prefix)
+        return graph
+
+
+class SdxlGenerator(Generator):
+    service = "automatic1111"
+    kind = "image"
+
+    def __init__(self, name: str, settings: dict, client: Automatic1111Client):
+        self.name, self.settings, self.client = name, deepcopy(settings), client
+        if not isinstance(self.settings.get("checkpoint"), str) or not self.settings["checkpoint"]:
+            raise ValueError("SDXL requires checkpoint")
+        for key in ("sampler", "scheduler", "vae"):
+            if not isinstance(self.settings.get(key), str) or not self.settings[key]:
+                raise ValueError(f"SDXL requires {key}")
+        number(self.settings.get("steps"), "steps", 1)
+        if not isinstance(self.settings["steps"], int):
+            raise ValueError("steps must be an integer")
+        number(self.settings.get("cfg"), "cfg", 0)
+        loras = self.settings.setdefault("loras", [])
+        if not isinstance(loras, list):
+            raise ValueError("loras must be a list")
+        for lora in loras:
+            if not isinstance(lora, dict) or not isinstance(lora.get("name"), str) or not lora["name"]:
+                raise ValueError("Each LoRA requires a name")
+            if any(c in lora["name"] for c in "<>:\n\r"):
+                raise ValueError("SDXL LoRA name must not contain prompt-tag delimiters")
+            number(lora.get("weight"), "LoRA weight")
+        self.build_payload(ImageRequest(prompt="", seed=0, output_prefix="probe/start_image", sub_dir="probe", debug_dir=Path(".")))
+
+    def metadata(self) -> dict:
+        signature = hashlib.sha256(json.dumps(self.settings, sort_keys=True).encode()).hexdigest()
+        return {"template": self.name, "type": self.settings["type"], "service": self.service,
+                "settings": deepcopy(self.settings), "signature": signature}
+
+    def build_payload(self, request: ImageRequest) -> dict:
+        dimensions = {}
+        for key in ("width", "height"):
+            value = self.settings[key] if getattr(request, key) is None else getattr(request, key)
+            number(value, key, 1)
+            if not isinstance(value, int) or value % 8:
+                raise ValueError(f"SDXL {key} must be an integer divisible by 8")
+            dimensions[key] = value
+        tags = []
+        for lora in self.settings["loras"]:
+            name = lora["name"].replace("\\", "/").rsplit("/", 1)[-1]
+            if name.endswith(".safetensors"):
+                name = name[:-12]
+            tags.append(f"<lora:{name}:{lora['weight']}>")
+        return {"prompt": " ".join([request.prompt] + tags),
+                "negative_prompt": request.negative_prompt, "seed": request.seed,
+                "steps": self.settings["steps"], "cfg_scale": self.settings["cfg"],
+                "sampler_name": self.settings["sampler"], "scheduler": self.settings["scheduler"], **dimensions,
+                "batch_size": 1, "n_iter": 1, "save_images": False,
+                "override_settings": {"sd_model_checkpoint": self.settings["checkpoint"],
+                                      "sd_vae": self.settings["vae"], "samples_format": "png"},
+                "override_settings_restore_afterwards": False}
+
+    def generate(self, request: ImageRequest) -> GenerationResult:
+        payload = self.build_payload(request)
+        return GenerationResult(self.client.generate(payload, request.output_prefix, request.debug_dir), self.metadata())
+
+
+class WanGenerator(ComfyUIGenerator):
+    kind = "video"
+    extensions = {".mp4", ".mov", ".webm", ".mkv"}
+
+    def validate_settings(self) -> None:
+        super().validate_settings()
+        s = self.settings
+        for key in ("checkpoint_low", "sampler", "scheduler"):
+            if not isinstance(s.get(key), str) or not s[key]:
+                raise ValueError(f"Wan requires {key}")
+        for key in ("steps", "split_step"):
+            number(s.get(key), key, 1)
+            if not isinstance(s[key], int):
+                raise ValueError(f"{key} must be an integer")
+        if s["split_step"] >= s["steps"]:
+            raise ValueError("Wan split_step must be smaller than steps")
+        for key in ("fps", "cfg", "shift"):
+            number(s.get(key), key, .001)
+        if s.get("sampling") not in {"standard", "distilled"}:
+            raise ValueError("Wan sampling must be standard or distilled")
+        for lora in s["loras"]:
+            if lora.get("stage") not in {"high", "low", "both"}:
+                raise ValueError("Each Wan LoRA requires stage: high, low or both")
+        if s["sampling"] == "distilled":
+            for stage in ("high", "low"):
+                if not any(l.get("role") == "acceleration" and l["stage"] in {stage, "both"} for l in s["loras"]):
+                    raise ValueError(f"Distilled Wan requires an acceleration LoRA for {stage}")
+
+    def configure(self, graph: dict) -> dict:
+        s = self.settings
+        for node, cls, key, value in (
+            ("unet_high", "UNETLoader", "unet_name", s["checkpoint"]),
+            ("unet_low", "UNETLoader", "unet_name", s["checkpoint_low"]),
+            ("clip_loader", "CLIPLoader", "clip_name", s["text_encoder"]),
+            ("vae_loader", "VAELoader", "vae_name", s["vae"]),
+        ):
+            self.field(graph, node, cls, key, value)
+        for stage, start, end, add_noise, leftover in (
+            ("high", 0, s["split_step"], "enable", "enable"),
+            ("low", s["split_step"], s["steps"], "disable", "disable"),
+        ):
+            self.field(graph, f"sampling_{stage}", "ModelSamplingSD3", "shift", s["shift"])
+            self.attach_loras(graph, [f"unet_{stage}", 0],
+                [l for l in s["loras"] if l["stage"] in {stage, "both"}],
+                [(f"sampling_{stage}", "model")], f"generation_lora_{stage}")
+            node = "sampler_stage1" if stage == "high" else "sampler_stage2"
+            for key, value in {"steps": s["steps"], "cfg": s["cfg"], "sampler_name": s["sampler"],
+                               "scheduler": s["scheduler"], "start_at_step": start, "end_at_step": end,
+                               "add_noise": add_noise, "return_with_leftover_noise": leftover}.items():
+                self.field(graph, node, "KSamplerAdvanced", key, value)
+        return graph
+
+    def build_workflow(self, request: VideoRequest) -> dict:
+        number(request.seconds, "video duration", .001)
+        fps = self.settings["fps"] if request.fps is None else request.fps
+        number(fps, "fps", .001)
+        graph = deepcopy(self.configured_graph)
+        for key in ("width", "height"):
+            value = self.settings[key] if getattr(request, key) is None else getattr(request, key)
+            number(value, key, 1)
+            if not isinstance(value, int) or value % 16:
+                raise ValueError(f"Wan {key} must be an integer divisible by 16")
+            self.field(graph, "wan_i2v", "WanImageToVideo", key, value)
+        frames = max(5, math.ceil((request.seconds * fps - 1) / 4) * 4 + 1)
+        for node, cls, key, value in (
+            ("wan_i2v", "WanImageToVideo", "length", frames),
+            ("start_image", "LoadImage", "image", str(request.start_image)),
+            ("positive_cond", "CLIPTextEncode", "text", request.prompt),
+            ("negative_cond", "CLIPTextEncode", "text", request.negative_prompt),
+            ("sampler_stage1", "KSamplerAdvanced", "noise_seed", request.seed),
+            ("sampler_stage2", "KSamplerAdvanced", "noise_seed", request.seed),
+            ("create_video", "CreateVideo", "fps", fps),
+            ("save_video", "SaveVideo", "filename_prefix", request.output_prefix),
+        ):
+            self.field(graph, node, cls, key, value)
+        return graph
+
+
+class WanVfiGenerator(WanGenerator):
+    """Wan at half the requested fps, followed by pairwise interpolation x2."""
+
+    def validate_settings(self) -> None:
+        super().validate_settings()
+        vfi = self.settings.get("interpolation")
+        if not isinstance(vfi, dict) or vfi.get("type") not in {"film", "rife"}:
+            raise ValueError("Wan VFI requires interpolation.type: film or rife")
+        if not isinstance(vfi.get("checkpoint"), str) or not vfi["checkpoint"]:
+            raise ValueError("Wan VFI requires an interpolation checkpoint")
+        cache = vfi.get("clear_cache_after_n_frames")
+        number(cache, "clear_cache_after_n_frames", 1)
+        if not isinstance(cache, int) or cache > 1000:
+            raise ValueError("clear_cache_after_n_frames must be an integer from 1 to 1000")
+        if vfi["type"] == "rife":
+            for key in ("fast_mode", "ensemble", "torch_compile"):
+                if not isinstance(vfi.get(key), bool):
+                    raise ValueError(f"RIFE requires boolean {key}")
+            if vfi.get("dtype") not in {"float32", "float16", "bfloat16"}:
+                raise ValueError("Invalid RIFE dtype")
+            number(vfi.get("scale_factor"), "RIFE scale_factor", .001)
+            if vfi["scale_factor"] not in {.25, .5, 1, 2, 4}:
+                raise ValueError("Invalid RIFE scale_factor")
+            batch = vfi.get("batch_size")
+            number(batch, "RIFE batch_size", 1)
+            if not isinstance(batch, int) or batch > 64:
+                raise ValueError("RIFE batch_size must be an integer from 1 to 64")
+
+    def configure(self, graph: dict) -> dict:
+        graph = super().configure(graph)
+        # Both algorithms use the same fixed graph boundary. Only the VFI node
+        # implementation and its algorithm-specific settings change.
+        self.field(graph, "vfi", "FILM VFI", "frames", ["vae_decode", 0])
+        self.field(graph, "create_video", "CreateVideo", "images", ["vfi", 0])
+        vfi = self.settings["interpolation"]
+        inputs = {"frames": ["vae_decode", 0], "ckpt_name": vfi["checkpoint"],
+                  "multiplier": 2, "clear_cache_after_n_frames": vfi["clear_cache_after_n_frames"]}
+        if vfi["type"] == "rife":
+            inputs.update({key: vfi[key] for key in
+                ("fast_mode", "ensemble", "scale_factor", "dtype", "torch_compile", "batch_size")})
+        graph["vfi"] = {"class_type": "FILM VFI" if vfi["type"] == "film" else "RIFE VFI", "inputs": inputs}
+        return graph
+
+    def build_workflow(self, request: VideoRequest) -> dict:
+        fps = self.settings["fps"] if request.fps is None else request.fps
+        number(fps, "fps", .001)
+        graph = super().build_workflow(replace(request, fps=fps / 2))
+        # VFI returns 2*N-1 frames, so merely halving fps can undershoot the
+        # requested duration by one output frame. Round up before Wan's 4*k+1.
+        required = math.ceil((math.ceil(request.seconds * fps) + 1) / 2)
+        frames = max(5, math.ceil((required - 1) / 4) * 4 + 1)
+        self.field(graph, "wan_i2v", "WanImageToVideo", "length", frames)
+        self.field(graph, "create_video", "CreateVideo", "fps", fps)
+        return graph
+
+
 class LtxGenerator(ComfyUIGenerator):
     kind = "video"
     extensions = {".mp4", ".mov", ".webm", ".mkv"}
@@ -423,14 +676,25 @@ def create_generator(kind: str, catalog: dict, config: dict, workflow_dir: Path)
     for key, config_key in dimensions:
         if key not in override and config_key in config:
             settings[key] = config[config_key]
-    registry = {"image": {"flux2": Flux2Generator}, "video": {"ltx": LtxGenerator}, "llm": {"llama_cpp": LlamaCppGenerator}}
+    registry = {"image": {"flux1": Flux1Generator, "flux2": Flux2Generator, "sdxl": SdxlGenerator},
+                "video": {"ltx": LtxGenerator, "wan": WanGenerator, "wan_vfi": WanVfiGenerator}, "llm": {"llama_cpp": LlamaCppGenerator}}
     cls = registry.get(kind, {}).get(settings.get("type"))
     if cls is None:
         raise ValueError(f"Unsupported {kind} generator type: {settings.get('type')}")
     if kind == "video" and (settings["width"], settings["height"], settings["fps"]) != (config["video_width"], config["video_height"], config["video_fps"]):
         raise ValueError("Video generator width/height/fps must match video_width/video_height/video_fps; set those global options")
-    output_dir = Path(config["comfy_output_dir"])
-    if not output_dir.is_absolute():
-        output_dir = workflow_dir.resolve().parent / output_dir
-    client = ComfyUIClient(config["comfy_url"], output_dir.resolve())
+    def service_output_dir(key):
+        output_dir = Path(config[key])
+        if not output_dir.is_absolute():
+            output_dir = workflow_dir.resolve().parent / output_dir
+        return output_dir.resolve()
+    client = ComfyUIClient(config["comfy_url"], service_output_dir("comfy_output_dir"), config["comfy_generation_timeout_seconds"])
+    image_selection = config.get("image_generation", {})
+    image_recipe = catalog.get("image_generation", {}).get(image_selection.get("template"), {})
+    if image_selection.get("type", image_recipe.get("type")) == "sdxl":
+        automatic = Automatic1111Client(config["a1111_url"],
+            service_output_dir("a1111_output_dir"), client.release_memory)
+        client.before_generate = automatic.release_memory
+    if cls.service == "automatic1111":
+        return cls(name, settings, automatic)
     return cls(name, settings, workflow_dir, client)

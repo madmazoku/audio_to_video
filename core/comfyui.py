@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import mimetypes
 import subprocess
 import time
@@ -216,11 +217,14 @@ def wait_history_ws(
     workflow: Dict[str, Any],
     comfy_url: str,
     report_seconds: float = 5.0,
+    timeout_seconds: float = 3600.0,
 ) -> Dict[str, Any]:
     ws_url = comfy_ws_url(comfy_url, client_id)
     history_url = comfy_url.rstrip("/") + f"/history/{prompt_id}"
 
     start = time.perf_counter()
+    deadline = start + timeout_seconds
+    last_history_check = start
     last_report = 0.0
     current_node: Optional[str] = None
     current_node_start: Optional[float] = None
@@ -231,15 +235,26 @@ def wait_history_ws(
 
     ws = websocket.WebSocket()
     ws.connect(ws_url, timeout=60)
+    ws.settimeout(5.0)
 
     try:
         while True:
             elapsed = time.perf_counter() - start
+            if time.perf_counter() >= deadline:
+                raise RuntimeError(
+                    f"ComfyUI generation exceeded {timeout_seconds:g}s: prompt_id={prompt_id}, "
+                    f"last node={workflow_node_label(workflow, current_node)}. "
+                    "Check the ComfyUI console; its worker may have failed. "
+                    "The server job has not been cancelled automatically.")
 
             try:
                 raw = ws.recv()
             except websocket.WebSocketTimeoutException:
                 raw = None
+            except websocket.WebSocketConnectionClosedException as exc:
+                raise RuntimeError(f"ComfyUI connection closed while waiting for prompt_id={prompt_id}") from exc
+            if raw == "":
+                raise RuntimeError(f"ComfyUI connection closed while waiting for prompt_id={prompt_id}")
 
             if raw:
                 if isinstance(raw, bytes):
@@ -292,7 +307,7 @@ def wait_history_ws(
                                 node_start=node_start_by_id.get(node_id),
                             )
 
-                    elif msg_type == "execution_error":
+                    elif msg_type in {"execution_error", "execution_interrupted"}:
                         node = data.get("node_id") or data.get("node")
                         message = data.get("exception_message") or data.get("message") or ""
                         log_comfy(
@@ -300,14 +315,27 @@ def wait_history_ws(
                             workflow_start=start,
                             node_start=current_node_start,
                         )
-                        finished_by_ws = True
-                        break
+                        # Cleanup can itself crash before history is recorded.
+                        # Preserve the received error event instead of waiting for it.
+                        return {"source": "websocket", "prompt_id": prompt_id, "outputs": {},
+                                "status": {"status_str": "error", "completed": False,
+                                           "messages": [[msg_type, data]]}}
 
                     elif msg_type in {"execution_success", "execution_cached"}:
                         # Wait for history below; this event only tells us execution state.
                         pass
 
             elapsed = time.perf_counter() - start
+            if time.perf_counter() - last_history_check >= 5.0:
+                last_history_check = time.perf_counter()
+                try:
+                    response = requests.get(history_url, timeout=10)
+                    response.raise_for_status()
+                    history = response.json()
+                except requests.RequestException as exc:
+                    raise RuntimeError(f"ComfyUI API unavailable while waiting for prompt_id={prompt_id}") from exc
+                if prompt_id in history:
+                    return history[prompt_id]
             if elapsed - last_report >= report_seconds:
                 last_report = elapsed
                 node_label = workflow_node_label(workflow, current_node)
@@ -347,8 +375,9 @@ def wait_history(
     comfy_url: str,
     workflow: Dict[str, Any],
     client_id: str,
+    timeout_seconds: float = 3600.0,
 ) -> Dict[str, Any]:
-    return wait_history_ws(prompt_id, client_id, workflow, comfy_url)
+    return wait_history_ws(prompt_id, client_id, workflow, comfy_url, timeout_seconds=timeout_seconds)
 
 
 def check_history_status(history_item: Dict[str, Any], debug_path: Path) -> None:
@@ -432,19 +461,39 @@ def upload_image_to_comfy(image_path: Path, comfy_url: str, subfolder: str) -> s
 
 
 class ComfyUIClient:
-    def __init__(self, url: str, output_dir: Path):
+    def __init__(self, url: str, output_dir: Path, timeout_seconds: float = 3600.0):
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             raise ValueError("ComfyUI URL must be an HTTP(S) URL")
         self.url = url
         self.output_dir = output_dir
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("ComfyUI generation timeout must be a positive finite number of seconds")
+        self.timeout_seconds = timeout_seconds
+        self.before_generate = None
+
+    def release_memory(self) -> None:
+        """Release resident models before handing the GPU to another service."""
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.post(self.url.rstrip("/") + "/free",
+                json={"unload_models": True, "free_memory": True}, timeout=120)
+            response.raise_for_status()
 
     def run(self, workflow: dict, graph_path: Path, history_path: Path, reason: str) -> dict:
         graph_path.parent.mkdir(parents=True, exist_ok=True)
         graph_path.write_text(json.dumps(workflow, ensure_ascii=False, indent=2), encoding="utf-8")
+        if self.before_generate is not None:
+            self.before_generate()
         free_comfy_memory(self.url, reason, sleep_time=1.0)
         prompt_id, client_id = queue_prompt(workflow, self.url)
         log(f"  [{reason}] prompt_id={prompt_id}")
-        history = wait_history(prompt_id, self.url, workflow, client_id)
+        try:
+            history = wait_history(prompt_id, self.url, workflow, client_id, self.timeout_seconds)
+        except Exception as exc:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            history_path.write_text(json.dumps({"source": "runner", "prompt_id": prompt_id,
+                "error": type(exc).__name__, "message": str(exc)}, indent=2), encoding="utf-8")
+            raise RuntimeError(f"ComfyUI wait failed: {exc}\nDebug saved to: {history_path}") from exc
         check_history_status(history, history_path)
         return history
 
