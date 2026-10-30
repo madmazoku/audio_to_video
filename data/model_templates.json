@@ -52,6 +52,54 @@
         0.00031,
         0.0
       ]
+    },
+    "flux1_dev": {
+      "type": "flux1",
+      "workflow": "flux1_from_prompt_api.json",
+      "checkpoint": "flux1-dev.safetensors",
+      "text_encoder": "clip_l.safetensors",
+      "text_encoder_2": "t5xxl_fp16.safetensors",
+      "vae": "ae.safetensors",
+      "loras": [],
+      "steps": 28,
+      "cfg": 1.0,
+      "guidance": 3.5,
+      "sampler": "euler",
+      "scheduler": "simple"
+    },
+    "flux1_krea": {
+      "type": "flux1",
+      "workflow": "flux1_from_prompt_api.json",
+      "checkpoint": "flux1-krea-dev_fp8_scaled.safetensors",
+      "text_encoder": "clip_l.safetensors",
+      "text_encoder_2": "t5xxl_fp16.safetensors",
+      "vae": "ae.safetensors",
+      "loras": [],
+      "steps": 28,
+      "cfg": 1.0,
+      "guidance": 3.5,
+      "sampler": "euler",
+      "scheduler": "simple"
+    },
+    "sdxl_cyberrealistic": {
+      "type": "sdxl",
+      "checkpoint": "cyberrealisticXL_v100.safetensors",
+      "vae": "Automatic",
+      "loras": [],
+      "steps": 40,
+      "cfg": 7.0,
+      "sampler": "DPM++ 2M",
+      "scheduler": "Karras"
+    },
+    "sdxl_comix_b3": {
+      "type": "sdxl",
+      "checkpoint": "comix_b3.safetensors",
+      "vae": "Automatic",
+      "loras": [],
+      "steps": 40,
+      "cfg": 7.0,
+      "sampler": "DPM++ 2M",
+      "scheduler": "Karras"
     }
   },
   "video_generation": {
@@ -121,6 +169,125 @@
       "refine_sigmas": "0.909375, 0.725, 0.421875, 0.0",
       "sampling": "full",
       "refine_steps": 12
+    },
+    "wan22_i2v_lightx2v": {
+      "type": "wan",
+      "workflow": "wan22_from_image_api.json",
+      "checkpoint": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+      "checkpoint_low": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+      "text_encoder": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "vae": "wan_2.1_vae.safetensors",
+      "loras": [
+        {
+          "name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+          "weight": 1.0,
+          "role": "acceleration",
+          "stage": "high"
+        },
+        {
+          "name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+          "weight": 1.0,
+          "role": "acceleration",
+          "stage": "low"
+        }
+      ],
+      "steps": 4,
+      "split_step": 2,
+      "cfg": 1.0,
+      "shift": 5.0,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "sampling": "distilled"
+    },
+    "wan22_i2v_standard": {
+      "type": "wan",
+      "workflow": "wan22_from_image_api.json",
+      "checkpoint": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+      "checkpoint_low": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+      "text_encoder": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "vae": "wan_2.1_vae.safetensors",
+      "loras": [],
+      "steps": 40,
+      "split_step": 20,
+      "cfg": 3.5,
+      "shift": 5.0,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "sampling": "standard"
+    },
+    "wan22_i2v_lightx2v_film_x2": {
+      "type": "wan_vfi",
+      "workflow": "wan22_vfi_from_image_api.json",
+      "checkpoint": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+      "checkpoint_low": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+      "text_encoder": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "vae": "wan_2.1_vae.safetensors",
+      "loras": [
+        {
+          "name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+          "weight": 1.0,
+          "role": "acceleration",
+          "stage": "high"
+        },
+        {
+          "name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+          "weight": 1.0,
+          "role": "acceleration",
+          "stage": "low"
+        }
+      ],
+      "steps": 4,
+      "split_step": 2,
+      "cfg": 1.0,
+      "shift": 5.0,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "sampling": "distilled",
+      "interpolation": {
+        "type": "film",
+        "checkpoint": "film_net_fp32.pt",
+        "clear_cache_after_n_frames": 10
+      }
+    },
+    "wan22_i2v_lightx2v_rife_x2": {
+      "type": "wan_vfi",
+      "workflow": "wan22_vfi_from_image_api.json",
+      "checkpoint": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+      "checkpoint_low": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+      "text_encoder": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "vae": "wan_2.1_vae.safetensors",
+      "loras": [
+        {
+          "name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+          "weight": 1.0,
+          "role": "acceleration",
+          "stage": "high"
+        },
+        {
+          "name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+          "weight": 1.0,
+          "role": "acceleration",
+          "stage": "low"
+        }
+      ],
+      "steps": 4,
+      "split_step": 2,
+      "cfg": 1.0,
+      "shift": 5.0,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "sampling": "distilled",
+      "interpolation": {
+        "type": "rife",
+        "checkpoint": "rife47.pth",
+        "clear_cache_after_n_frames": 10,
+        "fast_mode": true,
+        "ensemble": false,
+        "scale_factor": 1.0,
+        "dtype": "float32",
+        "torch_compile": false,
+        "batch_size": 1
+      }
     }
   },
   "llm_generation": {

@@ -1,6 +1,9 @@
 {
   "comfy_url": "http://127.0.0.1:8188",
   "comfy_output_dir": "..\\ComfyUI\\output",
+  "comfy_generation_timeout_seconds": 3600,
+  "a1111_url": "http://127.0.0.1:7860",
+  "a1111_output_dir": "output-a1111/images",
   "video_width": 1280,
   "video_height": 720,
   "video_fps": 24,

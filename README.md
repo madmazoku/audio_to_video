@@ -2,7 +2,7 @@
 
 Generate a stylized music video from prepared song audio, lyrics, lyric timing, and ComfyUI workflows.
 
-Current runner version: **1.7.3** (`aligned_song_video_runner.py --version`).
+Current runner version: **1.9.0** (`aligned_song_video_runner.py --version`).
 
 This repository contains the orchestration code and versioned prompt/workflow templates. Song-specific files live in `input/`, and generated artifacts live in `output/`. The default `.gitignore` excludes `input*/` and `output*/` so the repository can be used as code/config while keeping large media files outside git.
 ## 1. What this project does
@@ -481,7 +481,7 @@ Overrides defaults from `data/config.json`.
 Objects are merged recursively; lists are replaced, so an explicit empty
 `loras` list removes the template's adapters.
 
-#### Generation templates (phase 1)
+#### Generation templates (phases 1–2)
 
 `data/model_templates.json` contains named image and video recipes. Select
 them in `data/config.json` or in the input folder's `config.json`:
@@ -501,10 +501,11 @@ them in `data/config.json` or in the input folder's `config.json`:
 ```
 
 The catalog is indexed by template name under `image_generation`,
-`video_generation`, and `llm_generation`. Each entry contains `type`, `workflow`, model files,
+`video_generation`, and `llm_generation`. Each entry contains `type`, model files,
 `loras`, and sampling parameters. The factory selects the generator by
-`type`; FLUX2 and LTX use ComfyUI. Phase 1 supports FLUX2 Dev images and
-LTX 2.3 image-to-video, and the existing llama-cpp Qwen 2.5 14B planner.
+`type`; FLUX1, FLUX2, Wan and LTX use ComfyUI workflows, while SDXL uses
+AUTOMATIC1111's API without a workflow file. The existing llama-cpp Qwen 2.5
+14B planner also uses ComfyUI.
 Other generator types fail before generation. The LLM recipe configures the
 checkpoint, `n_ctx`, `max_tokens`, and the `parameters` object (temperature,
 top-k/top-p, penalties and other sampling settings).
@@ -516,6 +517,10 @@ Available image recipes:
 | `flux2_dev_current` | Existing FLUX2 Dev setup, Small Decoder, 30 steps, guidance 3.5, no LoRA |
 | `flux2_dev_full_vae` | Same setup with the full `flux2-vae.safetensors` |
 | `flux2_dev_turbo` | FLUX2 Dev with Turbo LoRA, eight steps and its explicit sigma schedule |
+| `flux1_dev` | FLUX1 Dev, CLIP-L + T5, standard VAE, 28 steps, no LoRA |
+| `flux1_krea` | Same FLUX1 workflow with the installed Krea Dev FP8 checkpoint |
+| `sdxl_cyberrealistic` | AUTOMATIC1111, CyberRealistic XL v10.0 for realistic frames, 40 steps, CFG 7, DPM++ 2M / Karras, no LoRA |
+| `sdxl_comix_b3` | Same SDXL API settings with Comix B3 for cartoon/comic frames |
 
 `ltx23_current` preserves the existing two-pass LTX setup and explicitly lists
 its distilled acceleration LoRA at weight 0.7. Both passes receive the ordered
@@ -524,13 +529,96 @@ previous runner. The default setup and the alternative Turbo/FP8 selection
 were exercised successfully in local user runs. Full VAE and unaccelerated
 LTX remain comparison recipes requiring generation validation.
 
-Available video recipes (all handled by `LtxGenerator`):
+Available video recipes:
 
 | Template | Recipe |
 | --- | --- |
 | `ltx23_current` | Existing LTX 2.3 Dev checkpoint and distilled acceleration LoRA |
 | `ltx23_fp8` | Same recipe with the installed LTX 2.3 Dev FP8 checkpoint |
 | `ltx23_unaccelerated` | Dev checkpoint without LoRA, ordinary sampling and longer refinement; experimental |
+| `wan22_i2v_lightx2v` | Wan 2.2 I2V 14B FP8, high/low checkpoints and their LightX2V adapters, four steps split 2/2 |
+| `wan22_i2v_standard` | Same Wan checkpoints without LoRA, 40 steps split 20/20, CFG 3.5 |
+| `wan22_i2v_lightx2v_film_x2` | Four-step Wan at half the output fps, then FILM interpolation ×2 |
+| `wan22_i2v_lightx2v_rife_x2` | Four-step Wan at half the output fps, then RIFE 4.7 interpolation ×2 |
+
+The two VFI recipes use `WanVfiGenerator`, derived from `WanGenerator`, and
+`wan22_vfi_from_image_api.json`. They preserve the Wan checkpoint/LoRA/sampling
+configuration and add interpolation after VAE decoding, before saving video.
+The final fps, dimensions and duration remain the generator's public request;
+internally the frame budget uses half the final fps. For example, 7.64 seconds
+at final 24 fps uses 93 Wan frames instead of 185, then returns 185 interpolated
+frames. Pairwise VFI produces `2*N-1` frames; rounding accounts for this and
+Wan's `4*k+1` requirement so the clip covers the requested duration. Existing
+timeline trimming remains unchanged. This does not condition Wan's motion on
+a new fps input; it changes the generated frame count and playback timing.
+
+Select a VFI recipe through `video_generation.template`, for example
+`wan22_i2v_lightx2v_film_x2`. The `interpolation` object in the recipe specifies
+`type`, `checkpoint` and `clear_cache_after_n_frames`. RIFE additionally specifies
+`fast_mode`, `ensemble`, `scale_factor`, `dtype`, `torch_compile` and `batch_size`;
+these can be overridden in the same configuration object. Its initial settings
+use float32, batch size 1, no ensemble and no compilation. VFI multiplier is
+fixed at two for these half-fps generators. ComfyUI-Frame-Interpolation and
+the corresponding FILM/RIFE weights must be installed. Interpolation adds a
+postprocessing cost and may distort faces, hands or occlusions; overall speed,
+peak VRAM and visual quality still require GPU validation. It does not repair
+incorrect subjects in the starting image.
+
+New phase-two recipes have passed offline tests and checks against the local
+services' node/API schemas and installed weights. Their actual image/video
+quality and GPU memory use require a local generation run.
+
+For example, select SDXL and Wan in the input's `config.json`:
+
+```json
+{
+  "image_generation": { "template": "sdxl_comix_b3" },
+  "video_generation": { "template": "wan22_i2v_lightx2v" }
+}
+```
+
+Use `flux1_dev` or `flux1_krea` in `image_generation.template` to test FLUX1.
+The runner command stays the same. AUTOMATIC1111 must be started with `--api`;
+`a1111_url` defaults to `http://127.0.0.1:7860`. Its returned PNG is saved under
+`a1111_output_dir` (default `output-a1111/images`, excluded from Git), using
+the run/range output prefix. Relative service output paths resolve from the
+repository root. ComfyUI keeps using `comfy_url` and `comfy_output_dir`.
+
+Wan 14B memory use grows with resolution and frame count. A 15.28-second
+1280×720 request at 24 fps means 369 frames, far more than a short 81-frame
+I2V clip; this configuration exhausted VRAM in the local 32 GB test. For the
+initial Wan test, use shorter subranges (for example `min_workflow_seconds: 1`,
+`recommended_workflow_seconds: 3`, `max_workflow_seconds: 4`); lower global
+resolution/fps if necessary. This is a test starting point, not a guaranteed
+memory budget. Fewer sampling steps do not reduce the number of video frames.
+
+ComfyUI error/interruption events terminate the wait immediately and are
+saved to the job's history debug JSON, even if server cleanup fails before
+history is recorded. The runner also checks history during quiet websocket
+periods and reports disconnected services. `comfy_generation_timeout_seconds`
+limits waiting for each ComfyUI job (default 3600 seconds); this limit does
+not cancel the server job. A CUDA failure that also kills the queue worker
+can leave the HTTP service alive, so restart ComfyUI before retrying.
+
+SDXL checks the selected checkpoint, sampler, scheduler and LoRA names against the API
+before loading a model. It releases ComfyUI's resident models before image
+generation, explicitly reloads the selected checkpoint onto the GPU, and
+moves it back to CPU after generation, including failed jobs. Checkpoint and
+VAE selections remain active in AUTOMATIC1111. When SDXL is selected, ComfyUI
+planner/video jobs also unload AUTOMATIC1111 first, covering a model left on
+the GPU by a manual session or service startup. Request/response diagnostics
+are saved in `image_request.json` and `image_response.json`; image base64 data
+is excluded from debug JSON. Output must be PNG with the requested dimensions.
+
+FLUX1 chains both the diffusion model and CLIP through ordered `LoraLoader`
+nodes. Wan chains model-only adapters independently in its high/low branches.
+Each Wan LoRA needs `stage: "high"`, `"low"` or `"both"`; `both` requires an
+adapter compatible with both checkpoints. The accelerated recipe requires
+an adapter marked `role: "acceleration"` in each branch. For no adapters,
+select `wan22_i2v_standard`, rather than removing required LightX2V adapters.
+SDXL uses ordered `<lora:name:weight>` prompt tags; its LoRA names must match
+installed AUTOMATIC1111 names or aliases. Compatibility is the recipe author's
+responsibility; an existing filename alone does not establish compatibility.
 
 All FLUX2 recipes use `Flux2Generator`, including the Turbo schedule. Selecting
 a recipe does not change the command or input file layout. Installed files and
@@ -570,15 +658,17 @@ separate. `core/generator.py` contains the generator classes, factory,
 requests/results, configuration merging and shared ComfyUI interface.
 `Generator` declares only `generate()` and `metadata()`; it has no workflow,
 connection, or model-loading implementation. `ComfyUIGenerator` owns graph
-loading, binding checks, LoRA chains, and workflow configuration. A future
-AUTOMATIC1111 implementation can implement `Generator` independently.
+loading, binding checks, LoRA chains, and workflow configuration.
+`SdxlGenerator` implements `Generator` independently, using
+`core/automatic1111.py` for its API transport and service lifecycle.
 `generate(request)` accepts one immutable, keyword-only request containing
 the prompt, seed, output/debug locations and runtime parameters. `ImageRequest`,
 `VideoRequest` and `LlmRequest` inherit independently from `GenerationRequest`.
 Optional dimensions and LLM token limits inherit generator settings when omitted.
 Video length is specified only by the required `seconds` field; optional `fps`
 inherits the recipe. The LTX workflow converts seconds to a valid frame count
-using its existing `8*k+1` rounding rule.
+using its existing `8*k+1` rounding rule. Wan rounds up to `4*k+1` frames
+(at least five); the existing runner trims surplus duration to the timeline.
 The current small generator subsystem stays in one module; separate modules
 can be introduced when independent subsystems warrant them.
 The factory configures a service client owned by the generator. Connections,
@@ -612,12 +702,22 @@ nodes; generators add all adapters from the recipe.
 Global `video_width`, `video_height`, and `video_fps` override recipe defaults.
 An explicit image override may set a different `width`/`height`; the existing
 video workflow then resizes that generated image. Dimensions must be positive
-integers divisible by eight. Video dimensions/fps must match the global video
+integers divisible by eight; FLUX1 and Wan require multiples of sixteen.
+Video dimensions/fps must match the global video
 settings; change those global settings to change the video output.
 
 Supplied `start_image_N.*` files still bypass image generation entirely.
-Continuation still uses the previous final frame in phase 1; video-prefix
-overlap is planned for phase 2.
+Continuation still uses the previous final frame. The revised roadmap is:
+
+1. Template catalog, generator contracts and current FLUX2/LTX/LLM — complete.
+2. SDXL/AUTOMATIC1111, Wan/ComfyUI and FLUX1 — implemented, awaiting user generation checks.
+3. True video-prefix overlap, initially LTX and then compatible Wan workflows,
+   with exact lyric timing, short-subrange handling and generation-window limits.
+3.5. Optional boundary keyframes and image-to-image identity preservation.
+4. Per-range template selection.
+
+Each phase starts from the accepted `master`; publishing/merging follows user
+validation and acceptance.
 
 Debug output records resolved settings and graph signatures in
 `generation_settings.json`, plus per-generated-part `image_generator.json`
@@ -626,6 +726,16 @@ and `video_generator.json`. Unscaled range clips also have a
 changed generator settings. Reuse requires this metadata sidecar; old clips
 without it must be regenerated. Use `--rework N` to apply new settings to an
 existing range; `--rebuild-final` does not regenerate it.
+
+Every runner invocation also writes a combined UTF-8 console log under
+`work/debug/runner.log`, while preserving live terminal output. The
+file is flushed as output arrives and contains runner/generator messages,
+forwarded child-process stdout/stderr (including alignment and FFmpeg),
+and an unhandled exception traceback or interruption. Each invocation
+overwrites this log to match the current debug artifacts. The ComfyUI server's own console is a
+separate process; only its API/progress/error messages received by the runner
+appear here. Logging starts after command-line parsing; an already running
+process needs a new invocation to use this feature.
 
 Offline configuration and graph checks:
 

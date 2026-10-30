@@ -7,6 +7,7 @@ import math
 import re
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 import uuid
@@ -16,8 +17,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import random
 
 from core.generator import ImageRequest, VideoRequest, LlmRequest, create_generator, merge_config
+from core.run_log import mirror_console
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 RUNNER_BUILD_ID = __version__
 
 # Rendering-only gap between adjacent identical karaoke lines.
@@ -396,7 +398,16 @@ def ffprobe_duration(path: Path, ffprobe_bin: str) -> float:
 
 def run_cmd(cmd: List[str]) -> None:
     log("  " + " ".join(f'"{x}"' if " " in str(x) else str(x) for x in cmd))
-    subprocess.run(cmd, check=True)
+    # Child processes inherit OS handles, bypassing Python's mirrored streams.
+    # Forward their combined output as it arrives to preserve the complete log.
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, encoding="utf-8", errors="replace", bufsize=1) as process:
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        return_code = process.wait()
+        if return_code:
+            raise subprocess.CalledProcessError(return_code, cmd)
 
 
 APOSTROPHE_CHARS = "'â€™â€˜Ê¼`Â´"
@@ -5877,10 +5888,18 @@ def main() -> None:
     ap.add_argument("--lyrics-language", default="en", help="Language code for stable-ts alignment. Default: en.")
     args = ap.parse_args()
 
+    run_id = make_run_id()
+    log_path = Path(args.output_dir).resolve() / "work" / "debug" / "runner.log"
+    with mirror_console(log_path):
+        log(f"[stage] console log: {log_path}")
+        run_pipeline(args, run_id)
+
+
+def run_pipeline(args: argparse.Namespace, run_id: str) -> None:
+
     stats: Dict[str, float] = {"_run_start": time.perf_counter()}
     clips_generated = 0
     clips_reused = 0
-    run_id = make_run_id()
     generation_info: Dict[int, Dict[str, Any]] = {}
     rework_indices = set(args.rework or [])
 
@@ -5931,8 +5950,6 @@ def main() -> None:
     log(f"[stage] LLM template: {llm_generator.name}")
     log(f"[stage] image template: {image_generator.name}")
     log(f"[stage] video template: {video_generator.name}")
-    if video_generator.full_sampling:
-        log("[warn] LTX uses unaccelerated sampling; this recipe requires visual validation")
     write_json(debug_dir / "config_used.json", config)
     block_video_styles, video_style_report = load_block_video_styles(input_dir, video_style, debug_dir)
     block_start_images = scan_block_start_images(input_dir)
@@ -6312,6 +6329,7 @@ def main() -> None:
                 log("  [stage] queue start image")
                 image_result = image_generator.generate(ImageRequest(
                     prompt=plan["image_prompt"], seed=seeds["image_seed"],
+                    negative_prompt=plan.get("negative_prompt", ""),
                     output_prefix=f"{sub_dir}/start_image", sub_dir=sub_dir, debug_dir=part_debug_dir,
                 ))
                 image_path = image_result.path
