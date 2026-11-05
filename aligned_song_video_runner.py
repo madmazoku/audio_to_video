@@ -18,6 +18,10 @@ import random
 
 from core.generator import ImageRequest, VideoRequest, LlmRequest, create_generator, merge_config
 from core.run_log import mirror_console
+from core.video_processing import (
+    VideoProcessing, VISUALIZATION_MODES, check_processing_support,
+    preview_signature, preview_cache_matches, render_processed_video,
+)
 
 __version__ = "1.9.0"
 RUNNER_BUILD_ID = __version__
@@ -72,6 +76,7 @@ def invalidate_alignment_related_artifacts(output_root: Path) -> None:
         work / "subs" / "preview_karaoke.ass",
         work / "subs" / "preview_debug.ass",
         output_root / "subtitle_preview.mp4",
+        output_root / "subtitle_preview.render.json",
         output_root / "final_video.mp4",
         output_root / "manifest.json",
     ]:
@@ -244,6 +249,7 @@ def invalidate_timeline_derived_artifacts(output_root: Path) -> None:
         work / "subs" / "preview_karaoke.ass",
         work / "subs" / "preview_debug.ass",
         output_root / "subtitle_preview.mp4",
+        output_root / "subtitle_preview.render.json",
         output_root / "final_video.mp4",
         output_root / "manifest.json",
     ]:
@@ -4096,24 +4102,11 @@ def retime_video_copy(
     }
 
 
-def final_mux(video_in: Path, audio_in: Path, ass_path: Path, out: Path, ffmpeg: str, fps: int) -> None:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    sub_arg = ffmpeg_sub_path(ass_path)
-    run_cmd([
-        ffmpeg, "-y",
-        "-i", str(video_in),
-        "-i", str(audio_in),
-        "-vf", f"fps={int(fps)},subtitles='{sub_arg}'",
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-shortest",
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
-        str(out),
-    ])
+def final_mux(video_in: Path, audio_in: Path, ass_path: Path, out: Path, ffmpeg: str, fps: int,
+              width: int, height: int, processing: VideoProcessing = VideoProcessing()) -> None:
+    render_processed_video(video=video_in, audio=audio_in, subtitles=[ass_path],
+                           output=out, width=width, height=height, fps=fps,
+                           settings=processing, ffmpeg=ffmpeg, run=run_cmd)
 
 
 def render_subtitle_preview(
@@ -4126,30 +4119,15 @@ def render_subtitle_preview(
     fps: int,
     ffmpeg: str,
     debug_ass_path: Optional[Path] = None,
+    processing: VideoProcessing = VideoProcessing(),
 ) -> None:
     """Render a quick black-screen karaoke preview with final audio and debug range markers."""
-    out.parent.mkdir(parents=True, exist_ok=True)
-    sub_arg = ffmpeg_sub_path(ass_path)
-    vf = f"subtitles='{sub_arg}'"
+    subtitles = [ass_path]
     if debug_ass_path is not None:
-        debug_sub_arg = ffmpeg_sub_path(debug_ass_path)
-        vf += f",subtitles='{debug_sub_arg}'"
-    run_cmd([
-        ffmpeg, "-y",
-        "-f", "lavfi",
-        "-i", f"color=c=black:s={width}x{height}:r={fps}:d={duration:.3f}",
-        "-i", str(audio_in),
-        "-vf", vf,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-shortest",
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
-        str(out),
-    ])
+        subtitles.append(debug_ass_path)
+    render_processed_video(video=None, audio=audio_in, subtitles=subtitles,
+                           output=out, width=width, height=height, fps=fps,
+                           duration=duration, settings=processing, ffmpeg=ffmpeg, run=run_cmd)
 
 
 def strip_llm_wrappers(text: str) -> str:
@@ -5712,6 +5690,7 @@ def write_timeline_manifest(
     rework: Optional[List[int]],
     run_id: str,
     generation_info: Optional[Dict[int, Dict[str, Any]]] = None,
+    video_processing: Optional[Dict[str, Any]] = None,
 ) -> None:
     generation_info = generation_info or {}
     items: List[Dict[str, Any]] = []
@@ -5750,6 +5729,7 @@ def write_timeline_manifest(
             else (str(subtitle_preview_path) if subtitle_preview_path is not None else None)
         ),
         "final": str(final_path.relative_to(output_root)) if final_path.is_relative_to(output_root) else str(final_path),
+        "video_processing": video_processing,
         "blocks": items,
     }
     write_json(out_path, manifest)
@@ -5767,6 +5747,7 @@ def write_preview_manifest(
     limit: int,
     rework: Optional[List[int]],
     run_id: str,
+    video_processing: Optional[Dict[str, Any]] = None,
 ) -> None:
     items: List[Dict[str, Any]] = []
     for block in blocks:
@@ -5802,6 +5783,7 @@ def write_preview_manifest(
         "subtitles": str(ass_path.relative_to(output_root)) if ass_path.is_relative_to(output_root) else str(ass_path),
         "subtitle_preview": str(subtitle_preview_path.relative_to(output_root)) if subtitle_preview_path.is_relative_to(output_root) else str(subtitle_preview_path),
         "final": None,
+        "video_processing": video_processing,
         "blocks": items,
     }
     write_json(out_path, manifest)
@@ -5885,6 +5867,8 @@ def main() -> None:
     ap.add_argument("--rebuild-final", action="store_true", help="Do not generate video; reuse existing unscaled clips and rebuild scaled clips/final only.")
     ap.add_argument("--refresh-alignment", action="store_true", help="Invalidate alignment/matching/subtitle/preview caches; missing artifacts are recreated lazily.")
     ap.add_argument("--preview-subtitles-only", action="store_true", help="Reuse or lazily build karaoke subtitles and subtitle_preview.mp4, then stop before any ComfyUI LLM/image/video generation.")
+    ap.add_argument("--audio-visualization", choices=VISUALIZATION_MODES, default="no",
+                    help="Side stereo spectrum in preview and final: no, bar, or bar-bloom. Default: no.")
     ap.add_argument("--lyrics-language", default="en", help="Language code for stable-ts alignment. Default: en.")
     args = ap.parse_args()
 
@@ -5941,6 +5925,10 @@ def run_pipeline(args: argparse.Namespace, run_id: str) -> None:
     config = load_config(input_dir, data_dir)
     width = int(config["video_width"])
     height = int(config["video_height"])
+    processing = VideoProcessing(args.audio_visualization)
+    processing_info = processing.metadata(width, height, int(config["video_fps"]))
+    check_processing_support(ffmpeg_cmd, processing)
+    log(f"[stage] video processing: {json.dumps(processing_info)}")
     model_catalog = load_json(data_dir / "model_templates.json")
     llm_generator = create_generator("llm", model_catalog, config, workflow_dir)
     image_generator = create_generator("image", model_catalog, config, workflow_dir)
@@ -6105,11 +6093,20 @@ def run_pipeline(args: argparse.Namespace, run_id: str) -> None:
         log(f"[stage] preview subtitles: {preview_ass_path} (cached)")
         log(f"[stage] preview debug subtitles: {preview_debug_ass} (cached)")
 
-    if subtitle_preview.exists():
+    preview_render_signature = preview_signature(
+        processing, width, height, int(config["video_fps"]), audio_duration,
+        # full_mix is rebuilt each run; fingerprint its original sources so an
+        # unchanged song can still reuse the rendered preview.
+        [audio_a, *([audio_b] if audio_b is not None else []), preview_ass_path, preview_debug_ass],
+    )
+    if preview_cache_matches(subtitle_preview, preview_render_signature):
         log(f"[stage] subtitle preview: {subtitle_preview} (cached)")
     else:
         log("[stage] render subtitle preview")
         stats_start(stats, "subtitle_preview")
+        # A failed replacement must not retain a valid signature for the old
+        # mode alongside a partially overwritten video.
+        subtitle_preview.with_suffix(".render.json").unlink(missing_ok=True)
         render_subtitle_preview(
             full_mix,
             preview_ass_path,
@@ -6120,7 +6117,9 @@ def run_pipeline(args: argparse.Namespace, run_id: str) -> None:
             int(config["video_fps"]),
             ffmpeg_cmd,
             preview_debug_ass,
+            processing,
         )
+        write_json(subtitle_preview.with_suffix(".render.json"), preview_render_signature)
         log(f"[stage] subtitle preview: {subtitle_preview}")
         stats_end(stats, "subtitle_preview")
 
@@ -6137,6 +6136,7 @@ def run_pipeline(args: argparse.Namespace, run_id: str) -> None:
             args.limit,
             sorted(rework_indices) if rework_indices else [],
             run_id,
+            video_processing=processing_info,
         )
         write_json(debug_dir / "run_info.json", {
             "run_id": run_id,
@@ -6472,7 +6472,17 @@ def run_pipeline(args: argparse.Namespace, run_id: str) -> None:
     log("[stage] final mux audio + burn subtitles")
     stats_start(stats, "final_mux")
     final = output_root / "final_video.mp4"
-    final_mux(video_only, final_audio, ass_path, final, ffmpeg_cmd, int(config["video_fps"]))
+    # Generators may round requested dimensions to model-compatible multiples.
+    # Fit the spectrum to the actual image, retaining its original resolution.
+    video_stream = json.loads(subprocess.check_output([
+        ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "json", str(video_only),
+    ], text=True))["streams"][0]
+    final_width, final_height = int(video_stream["width"]), int(video_stream["height"])
+    processing_info = processing.metadata(final_width, final_height, int(config["video_fps"]))
+    log(f"[stage] final video processing: {json.dumps(processing_info)}")
+    final_mux(video_only, final_audio, ass_path, final, ffmpeg_cmd, int(config["video_fps"]),
+              final_width, final_height, processing)
     stats_end(stats, "final_mux")
 
     write_timeline_manifest(
@@ -6490,6 +6500,7 @@ def run_pipeline(args: argparse.Namespace, run_id: str) -> None:
         sorted(rework_indices) if rework_indices else [],
         run_id,
         generation_info,
+        video_processing=processing_info,
     )
 
     print_run_stats(

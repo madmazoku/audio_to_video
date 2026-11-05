@@ -293,6 +293,47 @@ Do not run LLM/image/video generation. Reuse existing unscaled semantic clips fr
 Reuse or lazily build full-song preview subtitles, debug-only `work/subs/preview_debug.ass`, and `subtitle_preview.mp4`, then stop before any ComfyUI song-context/planner/image/video work. The preview is always full song, regardless of `--limit`; `--limit` only affects visual generation/final assembly. This is the fastest way to check voice/subtitle alignment, karaoke timing, and semantic range/subrange boundaries.
 
 ```text
+--audio-visualization {no,bar,bar-bloom}
+```
+
+Optional stereo spectrum in both `subtitle_preview.mp4` and `final_video.mp4`.
+Default: `no`. `bar` draws a dense cyan spectrum along each side: the left
+audio channel on the left, the right channel on the right. Bars grow inward,
+with bass at the bottom on both sides. `bar-bloom` adds a cyan glow emitted
+from the opaque tips, independently of the bar body opacity. The light mask is
+widened by 3 pixels before an 8-pixel Gaussian blur to keep the halo visible.
+Bar bodies have 25% opacity, with opaque 2-pixel tips at the
+inward ends, so the picture remains visible underneath. Subtitles and preview
+debug graphics are drawn last.
+
+The current preset uses a logarithmic frequency axis, a 4096-sample FFT,
+logarithmic amplitude scaling, averaging of 3, and a maximum bar width of
+5% of the frame width on each side. Silence is transparent. Mono audio is
+displayed on both sides. The sound itself is unchanged by visualization.
+Rendering uses the installed FFmpeg filters in the existing encoding pass;
+there is no intermediate visualization video, PNG sequence, or Python frame
+exchange. Missing required filters produce an error naming the FFmpeg executable.
+
+```powershell
+python aligned_song_video_runner.py --preview-subtitles-only --audio-visualization bar
+python aligned_song_video_runner.py --rebuild-final --audio-visualization bar-bloom
+```
+
+Preview reuse is checked against `subtitle_preview.render.json`: processing
+version/preset, dimensions, FPS, duration, and source audio/subtitle file sizes
+and modification times. Changing modes (including returning to `no`) rebuilds
+the preview without invalidating alignment or regenerating scenes. An old
+preview without this sidecar is rebuilt once. Render graphs are saved as
+`work/debug/subtitle_preview_filters.txt` and `work/debug/final_video_filters.txt`;
+the selected processing settings are also recorded in `manifest.json` and logs.
+
+`core/video_processing.py` separates source selection, image processing,
+subtitle overlays and encoding. Further FFmpeg effects belong in the image
+processing stage. A future full-frame Python processor can replace that stage
+with decode/process/encode pipes while keeping source/settings handling and
+the subtitle tail; no such frame transport is implemented yet.
+
+```text
 --refresh-alignment
 ```
 
@@ -994,7 +1035,7 @@ For lyric ranges, `range_visual_preroll_seconds` lets the semantic clip start sl
 
 Word-level karaoke is gap-aware: gaps between word timestamps are preserved instead of compressing all words together. Silent gaps inside the karaoke overlay are consumed without making the next word highlight early.
 
-Subtitle artifacts are lazy. `work/subs/karaoke.ass` is the full-song release subtitle file used by final rendering, `work/subs/preview_karaoke.ass` is the full-song preview karaoke subtitle file, `work/subs/preview_debug.ass` is the debug overlay, and `subtitle_preview.mp4` is a black-screen full-song preview video with audio, preview subtitles, and debug overlay. Existing files are reused until deleted or invalidated by `--refresh-alignment`. The preview is independent of `--limit`; a limited final render naturally burns only release subtitle events that fall inside the limited video/audio duration. The debug overlay is vector-drawn ASS graphics with three progress bars: full song progress with range/subrange boundary ticks, current range progress, and current subrange progress. Range labels use compact zero-based `Rnumber/count` labels without the range kind. `count` is always the total full-song range count, independent of `--limit`; this total is the maximum useful value for `--limit`. For example, `R000/027` through `R026/027` means `--limit 27` selects the whole song. Subranges use `Snumber/count`. `preview_debug.ass` is never used for the final video. This happens before song-context LLM, planner LLM, image generation, or video generation. Use `--preview-subtitles-only` to stop after this file is created.
+Subtitle artifacts are lazy. `work/subs/karaoke.ass` is the full-song release subtitle file used by final rendering, `work/subs/preview_karaoke.ass` is the full-song preview karaoke subtitle file, `work/subs/preview_debug.ass` is the debug overlay, and `subtitle_preview.mp4` is a black-screen full-song preview video with audio, preview subtitles, and debug overlay. Existing subtitle files are reused until deleted or invalidated by `--refresh-alignment`. Preview video reuse also checks the render signature described above. The preview is independent of `--limit`; a limited final render naturally burns only release subtitle events that fall inside the limited video/audio duration. The debug overlay is vector-drawn ASS graphics with three progress bars: full song progress with range/subrange boundary ticks, current range progress, and current subrange progress. Range labels use compact zero-based `Rnumber/count` labels without the range kind. `count` is always the total full-song range count, independent of `--limit`; this total is the maximum useful value for `--limit`. For example, `R000/027` through `R026/027` means `--limit 27` selects the whole song. Subranges use `Snumber/count`. `preview_debug.ass` is never used for the final video. This happens before song-context LLM, planner LLM, image generation, or video generation. Use `--preview-subtitles-only` to stop after this file is created.
 
 Silent gaps do not create public ranges implicitly. Add an empty `***` segment
 with an optional bracket directive such as `[Instrumental]` when a gap must be a
