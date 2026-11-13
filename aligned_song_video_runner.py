@@ -23,7 +23,7 @@ from core.video_processing import (
     preview_signature, preview_cache_matches, render_processed_video,
 )
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 RUNNER_BUILD_ID = __version__
 
 # Rendering-only gap between adjacent identical karaoke lines.
@@ -105,6 +105,7 @@ def ensure_alignment_artifact(
     alignment_dir: Path,
     stable_ts_cmd: str,
     lyrics_language: str,
+    config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Create the alignment artifact if it is missing.
 
@@ -126,6 +127,7 @@ def ensure_alignment_artifact(
             debug_dir,
             stable_ts_cmd,
             lyrics_language,
+            config,
         )
     elif align_kind == "lrc":
         target_lrc = alignment_dir / "alignment.lrc"
@@ -428,13 +430,120 @@ def norm_word(s: str) -> str:
     return s
 
 
+WORD_ANCHOR_RE = re.compile(
+    r"<@?(?P<time>(?:\d+:)?\d+:\d{2}(?:\.\d+)?|\d+(?:\.\d+)?)>"
+)
+
+
+def strip_word_anchors(text: str) -> str:
+    return WORD_ANCHOR_RE.sub("", text)
+
+
+def parse_line_word_anchors(line_text: str) -> Dict[int, float]:
+    """Extract zero-based word index to forced timestamp mapping from line text.
+
+    Supports words prefixed or suffixed with <@HH:MM:SS.mmm>, <@MM:SS.mmm>, or <@SS.sss>.
+    Examples:
+      "<@02:31.000>King Xande bargained..." -> {0: 151.0}
+      "King<@02:31.000> Xande bargained..." -> {0: 151.0}
+    """
+    anchors: Dict[int, float] = {}
+    tokens = str(line_text or "").split()
+    word_index = 0
+    for token in tokens:
+        match = WORD_ANCHOR_RE.search(token)
+        clean_token = WORD_ANCHOR_RE.sub("", token)
+        words_in_token = [w for w in re.findall(rf"\w+(?:[{re.escape(WORD_JOIN_CHARS)}]\w+)*", clean_token, flags=re.U) if norm_word(w)]
+        if match and words_in_token:
+            try:
+                t = parse_manual_timestamp(match.group("time"))
+                anchors[word_index] = t
+            except Exception:
+                pass
+        word_index += len(words_in_token)
+    return anchors
+
+
+def apply_word_timestamp_anchors(
+    matched_words: List[Dict[str, Any]],
+    anchors: Dict[int, float],
+    default_start: float = 0.0,
+) -> List[Dict[str, Any]]:
+    if not anchors or not matched_words:
+        return matched_words
+
+    n = len(matched_words)
+    for idx, forced_t in sorted(anchors.items()):
+        if 0 <= idx < n:
+            w = matched_words[idx]
+            w["start"] = float(forced_t)
+            lexical = _lexical_word_duration(str(w.get("text", "")))
+            w["end"] = float(forced_t) + lexical
+            w["timing_source"] = "manual_word_anchor"
+            w["forced_anchor"] = True
+            w["probability"] = 1.0
+
+    for i in range(1, n):
+        curr = matched_words[i]
+        if not curr.get("forced_anchor"):
+            continue
+        curr_start = float(curr["start"])
+        j = i - 1
+        while j >= 0 and float(matched_words[j].get("end", curr_start)) > curr_start - 0.01:
+            prev = matched_words[j]
+            lexical_prev = _lexical_word_duration(str(prev.get("text", "")))
+            prev["end"] = curr_start
+            prev["start"] = max(0.0, prev["end"] - lexical_prev)
+            prev["timing_source"] = "anchor_backward_projection"
+            prev["timing_estimated"] = True
+            curr_start = float(prev["start"])
+            j -= 1
+
+    for i in range(n - 1):
+        curr = matched_words[i]
+        curr_end = float(curr.get("end", curr.get("start", 0.0)))
+        nxt = matched_words[i + 1]
+        nxt_start = float(nxt.get("start", curr_end))
+        if nxt_start < curr_end + 0.01:
+            k = i + 1
+            while k < n and float(matched_words[k].get("start", 0.0)) < curr_end + 0.01 and not matched_words[k].get("forced_anchor"):
+                k += 1
+
+            if k < n and float(matched_words[k].get("start", 0.0)) > curr_end + 0.05:
+                target_next = float(matched_words[k]["start"])
+                available = max(0.02 * (k - i - 1), target_next - curr_end)
+                unanchored = matched_words[i + 1:k]
+                weights = [_lexical_word_duration(str(w.get("text", ""))) for w in unanchored]
+                tot_weight = max(0.01, sum(weights))
+                cursor = curr_end
+                for u_idx, w in enumerate(unanchored):
+                    part = available * (weights[u_idx] / tot_weight)
+                    w["start"] = cursor
+                    w["end"] = target_next if u_idx == len(unanchored) - 1 else cursor + part
+                    w["timing_source"] = "anchor_interval_redistribution"
+                    w["timing_estimated"] = True
+                    cursor = float(w["end"])
+            else:
+                cursor = curr_end
+                for m in range(i + 1, n):
+                    if matched_words[m].get("forced_anchor"):
+                        break
+                    m_w = matched_words[m]
+                    lex = _lexical_word_duration(str(m_w.get("text", "")))
+                    m_w["start"] = cursor
+                    m_w["end"] = cursor + lex
+                    m_w["timing_source"] = "anchor_forward_push"
+                    m_w["timing_estimated"] = True
+                    cursor = float(m_w["end"])
+
+    return matched_words
+
+
 def lyric_words(text: str) -> List[str]:
-    # Keep contractions as a single display token. Stable-ts often returns
-    # words such as shouldâ€™ve / shouldnâ€™t as one word; splitting lyrics on
-    # curly apostrophes made subtitles render them as "should ve".
+    clean = strip_word_anchors(text)
     joiners = re.escape(WORD_JOIN_CHARS)
     pattern = rf"\w+(?:[{joiners}]\w+)*"
-    return [w for w in re.findall(pattern, text, flags=re.U) if norm_word(w)]
+    return [w for w in re.findall(pattern, clean, flags=re.U) if norm_word(w)]
 
 
 LYRICS_SEPARATOR_SPLIT_RE = re.compile(
@@ -448,7 +557,9 @@ LYRICS_SEPARATOR_RE = re.compile(
 
 def parse_manual_timestamp(value: str) -> float:
     parts = str(value).split(":")
-    if len(parts) == 2:
+    if len(parts) == 1:
+        return float(parts[0])
+    elif len(parts) == 2:
         hours = 0
         minutes_text, seconds_text = parts
         minutes_must_fit_hour = False
@@ -526,7 +637,7 @@ def clean_lyrics_for_alignment_text(lyrics_text: str) -> str:
             continue
         if is_bracket_directive_line(line):
             continue
-        out.append(line)
+        out.append(strip_word_anchors(line))
     text = "\n".join(out)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text + "\n" if text else ""
@@ -799,10 +910,12 @@ def analyze_matched_line_timing(
         sparse_gap_limit = float(config.get("alignment_line_sparse_gap_seconds", 3.5))
         sparse_extreme_limit = float(config.get("alignment_line_extreme_gap_seconds", 8.0))
         sparse_low_confidence = float(config.get("alignment_line_sparse_max_mean_probability", 0.20))
+        has_border_low_confidence = any(p <= 0.08 for p in probabilities) if probabilities else False
         sparse = max_internal_gap >= sparse_gap_limit and (
             max_internal_gap >= sparse_extreme_limit
             or mean_probability is None
             or mean_probability <= sparse_low_confidence
+            or has_border_low_confidence
         )
         if sparse:
             reliable = False
@@ -1795,7 +1908,7 @@ def line_timing_bounds_from_words(words: List[Dict[str, Any]], default_start: fl
     return default_start, default_start + 0.01
 
 
-def sanitize_matched_line_word_timings(line_text: str, words: List[Dict[str, Any]]) -> Dict[str, Any]:
+def sanitize_matched_line_word_timings(line_text: str, words: List[Dict[str, Any]], default_start: float = 0.0) -> Dict[str, Any]:
     """Repair unusable word anchors without changing normal stable-ts timings.
 
     stable-ts remains the timing source. This pass only rewrites words that are
@@ -1812,6 +1925,64 @@ def sanitize_matched_line_word_timings(line_text: str, words: List[Dict[str, Any
     }
     if len(words) < 2:
         return report
+
+    # Phase 1: Repair leading ghost prefix words pulled by Whisper into preceding silence.
+    # Pattern: words 0..k-1 have very low probability (<= 0.12) and are separated from
+    # word k (the first confident word) by a large gap (>= 2.0s).
+    first_confident_idx = None
+    for idx in range(1, len(words)):
+        prob = _word_probability(words[idx])
+        dur = max(0.0, float(words[idx].get("end", 0.0)) - float(words[idx].get("start", 0.0)))
+        if prob >= 0.35 or dur >= 0.20:
+            first_confident_idx = idx
+            break
+
+    if first_confident_idx is not None and first_confident_idx >= 1:
+        prefix_slice = words[:first_confident_idx]
+        all_prefix_weak = all(
+            _word_probability(w) <= 0.12 for w in prefix_slice
+        )
+        try:
+            prev_prefix_end = max(float(w.get("end", w.get("start", 0.0))) for w in prefix_slice)
+            target_confident_start = float(words[first_confident_idx].get("start", prev_prefix_end))
+            prefix_gap = target_confident_start - prev_prefix_end
+        except Exception:
+            prefix_gap = 0.0
+
+        if all_prefix_weak and prefix_gap >= 2.0:
+            prefix_durations = [_lexical_word_duration(str(w.get("text", ""))) for w in prefix_slice]
+            total_prefix_needed = sum(prefix_durations)
+            min_start = max(0.0, target_confident_start - total_prefix_needed)
+            if default_start is not None and default_start > 0:
+                min_start = max(float(default_start), min_start)
+            available = max(0.05 * len(prefix_slice), target_confident_start - min_start)
+
+            cursor = min_start
+            for offset, w in enumerate(prefix_slice):
+                w_weight = prefix_durations[offset] / max(0.01, total_prefix_needed)
+                w_dur = available * w_weight
+                new_s = cursor
+                new_e = target_confident_start if offset == len(prefix_slice) - 1 else cursor + w_dur
+                new_e = max(new_s + 0.05, new_e)
+
+                w["original_start"] = w.get("start")
+                w["original_end"] = w.get("end")
+                w["original_probability"] = w.get("probability")
+                w["start"] = new_s
+                w["end"] = new_e
+                w["timing_sanitized"] = True
+                w["timing_source"] = "sanitized_ghost_prefix"
+                w["timing_sanitizer_reason"] = f"ghost_prefix_gap={prefix_gap:.3f}s_before_confident_word"
+                report["repaired_words"].append({
+                    "word_index": offset,
+                    "text": w.get("text"),
+                    "original_start": w["original_start"],
+                    "original_end": w["original_end"],
+                    "new_start": new_s,
+                    "new_end": new_e,
+                    "gap": prefix_gap,
+                })
+                cursor = new_e
 
     far_gap_seconds = 2.75
     far_gap_without_probability_seconds = 7.50
@@ -2431,7 +2602,8 @@ def build_line_aware_verses_from_json_words(
             continue
 
         line_reports: List[Dict[str, Any]] = []
-        for li, line_text in enumerate(ly.get("lines_text", []), 1):
+        for li, raw_line in enumerate(ly.get("lines_text", []), 1):
+            line_text = strip_word_anchors(raw_line)
             expected_line_words = verse_line_words[vi][li - 1]
             next_expected = next_lyric_line_words(verse_line_words, vi, li - 1)
 
@@ -2456,23 +2628,26 @@ def build_line_aware_verses_from_json_words(
             else:
                 default_line_start = 0.0
 
+            word_anchors = parse_line_word_anchors(raw_line)
+            if word_anchors:
+                matched_words = apply_word_timestamp_anchors(matched_words, word_anchors, default_line_start)
+
             raw_line_start, raw_line_end = line_timing_bounds_from_words(matched_words, default_line_start)
             raw_diag = analyze_matched_line_timing(line_text, matched_words, config)
 
             # Preserve whole-line evidence for sparse/collapsed/low-support lines.
             # Sanitizing an isolated word is useful for cases like a single
-            # low-confidence "fight" jumping several seconds forward, but doing
-            # that to an already-unreliable line destroys the evidence needed to
-            # place the whole phrase near the correct neighboring anchor.
+            # low-confidence "fight" jumping several seconds forward, or a ghost prefix.
             sanitizer_report = {"line_text": line_text, "repaired_words": [], "checked_words": len(matched_words)}
-            if bool(raw_diag.get("timing_reliable", False)):
-                sanitizer_report = sanitize_matched_line_word_timings(line_text, matched_words)
+            if bool(raw_diag.get("timing_reliable", False)) or str(raw_diag.get("status", "")).startswith("SPARSE") or bool(word_anchors):
+                sanitizer_report = sanitize_matched_line_word_timings(line_text, matched_words, default_line_start)
 
             line_start, line_end = line_timing_bounds_from_words(matched_words, raw_line_start)
             diag = analyze_matched_line_timing(line_text, matched_words, config)
-            if not bool(raw_diag.get("timing_reliable", False)):
+            if not bool(raw_diag.get("timing_reliable", False)) and not sanitizer_report.get("repaired_words") and not bool(word_anchors):
                 # Do not let a later post-sanitizer analysis accidentally promote
-                # a line whose raw forced timing was structurally untrustworthy.
+                # a line whose raw forced timing was structurally untrustworthy,
+                # unless sanitization or manual anchors resolved the defect.
                 diag["timing_reliable"] = False
                 raw_status = str(raw_diag.get("status", "UNRELIABLE"))
                 if str(diag.get("status", "GOOD")) == "GOOD":
@@ -3001,8 +3176,10 @@ def run_stable_ts_alignment(
     debug_dir: Path,
     stable_ts_cmd: str,
     language: str,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Run stable-ts using vocals and a cleaned sung-only lyric file."""
+    config = config or {}
     source_kind, align_audio, _ = detect_alignment_source(input_dir)
     if source_kind != "vocals":
         raise RuntimeError("stable-ts alignment requires input/vocals.*")
@@ -3016,8 +3193,13 @@ def run_stable_ts_alignment(
         str(align_audio),
         "--align", str(clean_lyrics),
         "--language", str(language),
+        "--suppress_silence", "true",
         "-o", str(out_json),
     ]
+    if bool(config.get("stable_ts_vad", False)):
+        cmd.extend(["--vad", "true"])
+    if config.get("stable_ts_min_silence_dur") is not None:
+        cmd.extend(["--min_silence_dur", str(config["stable_ts_min_silence_dur"])])
 
     log("[stage] align vocals with stable-ts")
     log(f"  [align] audio : {align_audio}")
@@ -5175,7 +5357,23 @@ def enforce_word_safe_semantic_boundaries(
         lower = float(left_word.get("end", current)) if left_word is not None else float(left.get("start", current))
         upper = float(right_word.get("start", current)) if right_word is not None else float(right.get("end", current))
 
-        if left_word is not None and right_word is not None and lower > upper + 1e-6:
+        has_exact_manual_boundary = (
+            isinstance(right.get("resolved_semantic_boundary_before"), dict)
+            and right["resolved_semantic_boundary_before"].get("mode") == "exact"
+        )
+
+        if has_exact_manual_boundary:
+            # User specified an exact boundary with *** @ timestamp.
+            # Treat this explicit directive as authoritative over low-confidence or drifting words.
+            if right_word is not None and upper < current:
+                _set_block_first_lyric_start(right, current)
+                upper = current
+            if left_word is not None and lower > current:
+                if _word_probability(left_word) <= 0.25 or (lower - current) <= 0.50:
+                    _set_block_last_lyric_end(left, current)
+                    lower = current
+            boundary = current
+        elif left_word is not None and right_word is not None and lower > upper + 1e-6:
             # Cross-range word overlap: choose the more credible anchor; if both
             # are similarly credible, split the overlap. Then make both words end
             # and start exactly at that repaired boundary.
@@ -5949,6 +6147,7 @@ def run_pipeline(args: argparse.Namespace, run_id: str) -> None:
         alignment_dir,
         stable_ts_cmd,
         args.lyrics_language,
+        config,
     )
 
     log("[stage] parse alignment")
