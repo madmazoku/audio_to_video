@@ -2,7 +2,7 @@
 
 Generate a stylized music video from prepared song audio, lyrics, lyric timing, and ComfyUI workflows.
 
-Current runner version: **1.9.0** (`aligned_song_video_runner.py --version`).
+Current runner version: **1.10.0** (`aligned_song_video_runner.py --version`).
 
 This repository contains the orchestration code and versioned prompt/workflow templates. Song-specific files live in `input/`, and generated artifacts live in `output/`. The default `.gitignore` excludes `input*/` and `output*/` so the repository can be used as code/config while keeping large media files outside git.
 ## 1. What this project does
@@ -502,6 +502,19 @@ Last sung line
 semantic ranges. Use `--refresh-alignment --preview-subtitles-only` after
 changing manual boundaries; once the preview is accepted, normal runs reuse the
 cached matched alignment.
+
+#### Word-Level Forced Timestamp Anchors
+
+To pin a specific sung word that suffers from timing drift or premature onset, prefix or suffix the word in `lyrics.txt` with an inline anchor `<@HH:MM:SS.mmm>`, `<@MM:SS.mmm>`, or `<@SS.sss>`:
+
+```text
+[Verse]
+<@02:30.760>King Xande bargained with the dark,
+```
+
+- Word anchors are extracted during parsing and stripped from subtitle display.
+- Anchored words are locked to the forced timestamp (`timing_source: "manual_word_anchor"`), with prior and subsequent unanchored words automatically redistributed monotonically via backward projection and interval redistribution to preserve natural cadence and prevent boundary collisions.
+- Authoritative range boundaries (`*** @ timestamp`) cleanly sanitize trailing or leading low-confidence drift words.
 
 Lines in square brackets are metadata/directives, not sung lyrics. They:
 
